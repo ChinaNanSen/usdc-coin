@@ -123,8 +123,10 @@ class TerminalStatusPanel:
         for order in orders:
             parts.append(
                 (
-                    f"{self._translate_side(order.side)}:{order.price} "
-                    f"剩余={self._fmt_dec(order.remaining_size)} "
+                    f"{self._translate_side(order.side)}单 "
+                    f"价格={self._fmt_dec(order.price)} "
+                    f"数量={self._fmt_dec(order.remaining_size)} "
+                    f"约={self._fmt_dec(order.remaining_size * order.price)}U "
                     f"排队前手={self._fmt_dec(order.queue_ahead_size)} "
                     f"年龄毫秒={max(now_ms() - order.created_at_ms, 0)}"
                 )
@@ -136,20 +138,29 @@ class TerminalStatusPanel:
         if not trade:
             return "无"
         age_ms = max(now_ms() - trade.last_update_ms, 0)
-        return (
-            f"方向={self._translate_side(trade.side)} 价格={self._fmt_dec(trade.price)} "
-            f"数量={self._fmt_dec(trade.size)} 年龄毫秒={age_ms}"
-        )
+        parts = [
+            f"方向={self._translate_side(trade.side)}",
+            f"委托价={self._fmt_dec(trade.order_price) if trade.order_price is not None else '-'}",
+            f"成交价={self._fmt_dec(trade.price)}",
+            f"数量={self._fmt_dec(trade.size)}",
+        ]
+        if trade.trade_id:
+            parts.append(f"订单号={trade.trade_id}")
+        parts.append(f"年龄毫秒={age_ms}")
+        return " ".join(parts)
 
     def _fmt_intent(self, intent) -> str:
         if intent is None:
             return "-"
         if intent.base_size is not None:
             return (
-                f"{self._translate_side(intent.side)} {intent.price} "
+                f"{self._translate_side(intent.side)}单 价格={self._fmt_dec(intent.price)} "
                 f"数量={self._fmt_dec(intent.base_size)} 约{self._fmt_dec(intent.quote_notional)}U"
             )
-        return f"{self._translate_side(intent.side)} {intent.price}@{decimal_to_str(intent.quote_notional)}"
+        return (
+            f"{self._translate_side(intent.side)}单 价格={self._fmt_dec(intent.price)} "
+            f"目标金额={self._fmt_dec(intent.quote_notional)}U"
+        )
 
     @staticmethod
     def _fmt_dec(value: Decimal | None) -> str:

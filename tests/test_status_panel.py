@@ -80,8 +80,9 @@ def test_status_panel_builds_readable_snapshot():
     assert "原因=双边报价" in text
     assert "成交次数=3" in text
     assert "已实现(U)=+1.25" in text
-    assert "买:0.9999" in text
-    assert "最近成交 | 方向=卖 价格=1" in text
+    assert "买单 价格=0.9999 数量=10000" in text
+    assert "买单 价格=0.9999 目标金额=10000U" in text
+    assert "最近成交 | 方向=卖 委托价=- 成交价=1 数量=100" in text
 
 
 def test_status_panel_marks_demo_live_mode_in_chinese():
@@ -196,3 +197,4 @@ def test_status_panel_shows_live_realized_and_unrealized_pnl():
     assert "库存浮盈(U)=+0.5" in text
     assert "待回补仓位(USDC)=+10000" in text
     assert "成交后回补，只挂卖单" in text
+    assert f"最近成交 | 方向=买 委托价=1 成交价=1 数量=10000 订单号={buy_id}" in text

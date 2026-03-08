@@ -98,6 +98,9 @@ def test_live_pnl_tracks_realized_and_unrealized_from_managed_fills():
     assert state.strategy_position_base() == Decimal("10000")
     assert state.live_realized_pnl_quote == Decimal("0")
     assert state.live_unrealized_pnl_quote() == Decimal("0.5")
+    assert state.last_trade is not None
+    assert state.last_trade.order_price == Decimal("1")
+    assert state.last_trade.price == Decimal("1")
 
     sell_id = build_cl_ord_id("bot6", "sell")
     state.apply_order_update(
@@ -120,3 +123,6 @@ def test_live_pnl_tracks_realized_and_unrealized_from_managed_fills():
     assert state.strategy_position_base() == Decimal("0")
     assert state.live_realized_pnl_quote == Decimal("1")
     assert state.live_unrealized_pnl_quote() == Decimal("0")
+    assert state.last_trade is not None
+    assert state.last_trade.order_price == Decimal("1.0001")
+    assert state.last_trade.price == Decimal("1.0001")

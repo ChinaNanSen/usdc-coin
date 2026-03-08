@@ -71,6 +71,7 @@ class TradeTick:
     side: str
     received_ms: int | None = None
     trade_id: str | None = None
+    order_price: Decimal | None = None
 
     @property
     def last_update_ms(self) -> int:

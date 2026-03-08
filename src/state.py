@@ -121,6 +121,7 @@ class BotState:
                         fill_price=fill_price,
                         fill_ts_ms=order.updated_at_ms,
                         cl_ord_id=cl_ord_id,
+                        order_price=order.price,
                     )
         if state == "filled":
             self.last_fill_ms = order.updated_at_ms
@@ -200,7 +201,15 @@ class BotState:
         order.updated_at_ms = fill_ts_ms
         order.queue_ahead_size = Decimal("0")
         self.last_fill_ms = fill_ts_ms
-        self.last_trade = TradeTick(ts_ms=fill_ts_ms, received_ms=fill_ts_ms, price=fill_price, size=fill_size, side=order.side, trade_id=order.cl_ord_id)
+        self.last_trade = TradeTick(
+            ts_ms=fill_ts_ms,
+            received_ms=fill_ts_ms,
+            price=fill_price,
+            size=fill_size,
+            side=order.side,
+            trade_id=order.cl_ord_id,
+            order_price=order.price,
+        )
         self.shadow_fill_count += 1
         self.shadow_fill_volume_quote += quote_amount
 
@@ -441,6 +450,7 @@ class BotState:
         fill_price: Decimal,
         fill_ts_ms: int,
         cl_ord_id: str,
+        order_price: Decimal,
     ) -> None:
         if fill_size <= 0 or fill_price <= 0:
             return
@@ -476,4 +486,12 @@ class BotState:
             raise ValueError(f"unsupported side for live fill: {side}")
 
         self.last_fill_ms = fill_ts_ms
-        self.last_trade = TradeTick(ts_ms=fill_ts_ms, received_ms=fill_ts_ms, price=fill_price, size=fill_size, side=side, trade_id=cl_ord_id)
+        self.last_trade = TradeTick(
+            ts_ms=fill_ts_ms,
+            received_ms=fill_ts_ms,
+            price=fill_price,
+            size=fill_size,
+            side=side,
+            trade_id=cl_ord_id,
+            order_price=order_price,
+        )
