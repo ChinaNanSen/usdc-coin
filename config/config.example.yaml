@@ -17,6 +17,7 @@ trading:
   base_ccy: USDC
   quote_ccy: USDT
   entry_base_size: 10000
+  post_only: false
   quote_size: 10000
   min_quote_size: 1000
   max_quote_size: 10000
@@ -72,7 +73,7 @@ risk:
   max_effective_taker_fee_rate: 0
   max_managed_orders_per_side: 1
   max_consistency_failures: 3
-  cancel_managed_on_consistency_failure: true
+  cancel_managed_on_consistency_failure: false
   balance_consistency_tolerance_quote: 1
   require_passive_prices_on_resync: true
   zero_fee_instruments:

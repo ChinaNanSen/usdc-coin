@@ -248,7 +248,7 @@ class OKXRestClient:
         price: Decimal,
         size: Decimal,
         cl_ord_id: str,
-        post_only: bool = True,
+        post_only: bool = False,
     ) -> dict[str, Any]:
         payload = {
             "instId": inst_id,

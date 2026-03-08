@@ -47,6 +47,7 @@ class TradingConfig:
     base_ccy: str = "USDC"
     quote_ccy: str = "USDT"
     entry_base_size: Decimal = Decimal("0")
+    post_only: bool = False
     quote_size: Decimal = Decimal("10000")
     min_quote_size: Decimal = Decimal("1000")
     max_quote_size: Decimal = Decimal("10000")
@@ -108,7 +109,7 @@ class RiskConfig:
     zero_fee_instruments: list[str] = field(default_factory=lambda: ["USDC-USDT"])
     max_managed_orders_per_side: int = 1
     max_consistency_failures: int = 3
-    cancel_managed_on_consistency_failure: bool = True
+    cancel_managed_on_consistency_failure: bool = False
     balance_consistency_tolerance_quote: Decimal = Decimal("1")
     require_passive_prices_on_resync: bool = True
 

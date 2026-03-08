@@ -143,22 +143,6 @@ class OrderExecutor:
         if primary:
             if primary.cancel_requested:
                 return
-            age_ms = now_ms() - primary.created_at_ms
-            same_price = primary.price == intent.price
-            same_size = primary.remaining_size == base_size
-            ttl_expired = age_ms > int(self.config.trading.order_ttl_seconds * 1000)
-            if same_price and same_size:
-                if not ttl_expired:
-                    return
-                if not self.config.trading.cancel_on_ttl_expiry:
-                    return
-            if self._should_preserve_partial_fill_with_same_price(primary=primary, intent=intent, base_size=base_size):
-                return
-            if self._should_preserve_entry_queue(primary=primary, intent=intent):
-                return
-            if self._should_preserve_rebalance_queue(primary=primary, intent=intent, base_size=base_size):
-                return
-            await self._cancel_order(primary, reason="reprice_or_ttl")
             return
 
         if not self._cooldown_ok(side):
@@ -204,7 +188,7 @@ class OrderExecutor:
                 price=intent.price,
                 size=base_size,
                 cl_ord_id=cl_ord_id,
-                post_only=True,
+                post_only=self.config.trading.post_only,
             )
         except Exception as exc:
             self.state.record_place_result(False)
@@ -314,6 +298,8 @@ class OrderExecutor:
     def _should_keep_order_without_intent(self, *, primary: LiveOrder, risk_status: RiskStatus | None) -> bool:
         if risk_status is None:
             return False
+        if risk_status.runtime_state in {"INIT", "PAUSED"}:
+            return True
         if risk_status.reason.startswith("stale book:") and not self.config.risk.cancel_orders_on_stale_book:
             return True
         if primary.filled_size > 0 and risk_status.ok and self._side_allowed_by_risk(primary.side, risk_status):

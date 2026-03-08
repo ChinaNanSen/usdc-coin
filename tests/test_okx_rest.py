@@ -249,7 +249,7 @@ def test_executor_keeps_same_order_after_ttl_when_disabled():
     assert cl_ord_id in state.live_orders
 
 
-def test_executor_cancels_same_order_after_ttl_when_enabled():
+def test_executor_keeps_same_order_after_ttl_even_when_enabled():
     state = make_state()
     config = BotConfig(mode="live")
     config.trading.order_ttl_seconds = 1
@@ -284,9 +284,9 @@ def test_executor_cancels_same_order_after_ttl_when_enabled():
 
     asyncio.run(run())
 
-    assert len(rest.cancel_calls) == 1
+    assert rest.cancel_calls == []
     assert cl_ord_id in state.live_orders
-    assert state.live_orders[cl_ord_id].cancel_requested is True
+    assert state.live_orders[cl_ord_id].cancel_requested is False
 
 
 def test_executor_keeps_order_when_book_is_stale_by_default():
@@ -324,7 +324,7 @@ def test_executor_keeps_order_when_book_is_stale_by_default():
     assert cl_ord_id in state.live_orders
 
 
-def test_executor_cancels_order_when_stale_book_cancel_enabled():
+def test_executor_keeps_order_when_stale_book_cancel_is_enabled_but_runtime_is_paused():
     state = make_state()
     config = BotConfig(mode="live")
     config.risk.cancel_orders_on_stale_book = True
@@ -356,9 +356,9 @@ def test_executor_cancels_order_when_stale_book_cancel_enabled():
 
     asyncio.run(run())
 
-    assert len(rest.cancel_calls) == 1
+    assert rest.cancel_calls == []
     assert cl_ord_id in state.live_orders
-    assert state.live_orders[cl_ord_id].cancel_requested is True
+    assert state.live_orders[cl_ord_id].cancel_requested is False
 
 
 def test_executor_treats_okx_51400_cancel_as_benign_terminal():
@@ -492,7 +492,7 @@ def test_executor_preserves_entry_buy_queue_when_old_price_still_has_min_spread(
     assert buy_id in state.live_orders
 
 
-def test_executor_reprices_entry_buy_when_old_price_no_longer_has_min_spread():
+def test_executor_keeps_entry_buy_when_old_price_no_longer_matches_new_target():
     state = make_state()
     config = BotConfig(mode="live")
     config.risk.min_free_quote_buffer = Decimal("0")
@@ -537,12 +537,12 @@ def test_executor_reprices_entry_buy_when_old_price_no_longer_has_min_spread():
 
     asyncio.run(run())
 
-    assert len(rest.cancel_calls) == 1
+    assert rest.cancel_calls == []
     assert buy_id in state.live_orders
-    assert state.live_orders[buy_id].cancel_requested is True
+    assert state.live_orders[buy_id].cancel_requested is False
 
 
-def test_executor_reprices_rebalance_sell_when_existing_order_price_is_too_low():
+def test_executor_keeps_existing_rebalance_sell_when_target_price_moves_higher():
     state = make_state()
     config = BotConfig(mode="live")
     config.risk.min_free_base_buffer = Decimal("0")
@@ -593,14 +593,10 @@ def test_executor_reprices_rebalance_sell_when_existing_order_price_is_too_low()
 
     asyncio.run(run())
 
-    assert len(rest.cancel_calls) == 1
-
+    assert rest.cancel_calls == []
     assert state.consecutive_cancel_failures == 0
     assert sell_id in state.live_orders
-    assert state.live_orders[sell_id].cancel_requested is True
-    assert journal.events[-1][0] == "cancel_order"
-    assert journal.events[-1][1]["reason"] == "reprice_or_ttl"
-    assert journal.events[-1][1]["reason_zh"] == "改价或超时重挂"
+    assert state.live_orders[sell_id].cancel_requested is False
 
 
 def test_executor_caps_buy_size_by_available_quote_balance():
@@ -626,6 +622,42 @@ def test_executor_caps_buy_size_by_available_quote_balance():
 
     assert len(rest.place_calls) == 1
     assert rest.place_calls[0]["size"] == Decimal("5000")
+    assert rest.place_calls[0]["post_only"] is False
+
+
+def test_executor_keeps_live_order_when_streams_are_not_ready():
+    state = make_state()
+    config = BotConfig(mode="live")
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    cl_ord_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "123",
+            "clOrdId": cl_ord_id,
+            "px": "1.0001",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor.reconcile(
+            QuoteDecision(reason="streams not ready", bid=None, ask=None),
+            risk_status=RiskStatus(ok=False, reason="streams not ready", allow_bid=False, allow_ask=False, runtime_state="INIT"),
+        )
+
+    asyncio.run(run())
+
+    assert rest.cancel_calls == []
+    assert cl_ord_id in state.live_orders
 
 
 def test_executor_keeps_partially_filled_order_when_remaining_matches_target():
