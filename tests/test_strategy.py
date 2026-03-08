@@ -288,3 +288,59 @@ def test_strategy_rebalance_sell_can_allow_flat_exit_when_profit_ticks_zero():
 
     assert decision.ask is not None
     assert decision.ask.price == Decimal("1")
+
+
+def test_strategy_ignores_sub_min_rebalance_dust_and_keeps_normal_ask():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(normal_sell_price_floor=Decimal("1")),
+        TradingConfig(entry_base_size=Decimal("10000")),
+    )
+    state = build_state("20230.742424", "4785.963127427094")
+    sell_cl_ord_id = build_cl_ord_id("bot6", "sell")
+    buy_cl_ord_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": sell_cl_ord_id,
+            "px": "1.0001",
+            "fillPx": "1.0001",
+            "sz": "9999.000099",
+            "accFillSz": "9999.000099",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "2",
+            "clOrdId": buy_cl_ord_id,
+            "px": "1",
+            "fillPx": "1",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "3",
+            "uTime": "4",
+        },
+        source="test",
+    )
+
+    assert state.strategy_position_base() == Decimal("0.999901")
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"),
+    )
+
+    assert decision.bid is None
+    assert decision.ask is not None
+    assert decision.ask.reason == "join_best_ask"
+    assert decision.ask.price == Decimal("1")
+    assert decision.ask.base_size == Decimal("10000")
+    assert decision.reason == "inventory_high_ask_only"

@@ -25,8 +25,8 @@ class MicroMakerStrategy:
         quote_size = min(max(self.trading.quote_size, self.trading.min_quote_size), self.trading.max_quote_size)
         entry_quote_ref = fixed_entry_base_size * state.book.mid if fixed_entry_base_size is not None else quote_size
         inventory_ratio = state.inventory_ratio()
-        rebalance_buy_base = state.rebalance_base_size("buy")
-        rebalance_sell_base = state.rebalance_base_size("sell")
+        rebalance_buy_base = self._tradable_rebalance_size(state=state, side="buy")
+        rebalance_sell_base = self._tradable_rebalance_size(state=state, side="sell")
         rebalance_quote_ref = max(
             entry_quote_ref,
             rebalance_buy_base * state.book.best_bid.price,
@@ -153,6 +153,15 @@ class MicroMakerStrategy:
         if not state.instrument:
             return None
         return quantize_up(self.trading.entry_base_size, state.instrument.lot_size)
+
+    @staticmethod
+    def _tradable_rebalance_size(*, state: BotState, side: str) -> Decimal:
+        if not state.instrument:
+            return Decimal("0")
+        base_size = state.rebalance_base_size(side)
+        if base_size < state.instrument.min_size:
+            return Decimal("0")
+        return base_size
 
     @staticmethod
     def _entry_intent(*, side: str, price: Decimal, base_size: Decimal | None, quote_notional: Decimal, reason: str) -> OrderIntent:
