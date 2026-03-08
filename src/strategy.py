@@ -21,12 +21,14 @@ class MicroMakerStrategy:
         if spread_ticks < Decimal(self.config.min_spread_ticks):
             return QuoteDecision(reason=f"spread too tight: {spread_ticks}")
 
+        fixed_entry_base_size = self._entry_base_size(state=state)
         quote_size = min(max(self.trading.quote_size, self.trading.min_quote_size), self.trading.max_quote_size)
+        entry_quote_ref = fixed_entry_base_size * state.book.mid if fixed_entry_base_size is not None else quote_size
         inventory_ratio = state.inventory_ratio()
         rebalance_buy_base = state.rebalance_base_size("buy")
         rebalance_sell_base = state.rebalance_base_size("sell")
         rebalance_quote_ref = max(
-            quote_size,
+            entry_quote_ref,
             rebalance_buy_base * state.book.best_bid.price,
             rebalance_sell_base * state.book.best_ask.price,
         )
@@ -36,14 +38,20 @@ class MicroMakerStrategy:
         if bid_depth < min_visible_depth or ask_depth < min_visible_depth:
             return QuoteDecision(reason=f"visible depth too thin: bid={bid_depth}, ask={ask_depth}")
 
-        bid_size = quote_size
-        ask_size = quote_size
+        bid_quote_size = quote_size
+        ask_quote_size = quote_size
+        bid_base_size = fixed_entry_base_size
+        ask_base_size = fixed_entry_base_size
         if inventory_ratio is not None:
             deviation = inventory_ratio - self.config.inventory_target_pct
             if deviation >= self.config.mild_skew_threshold_pct:
-                bid_size = quote_size * (Decimal("1") - self.config.mild_skew_size_factor)
+                bid_quote_size = quote_size * (Decimal("1") - self.config.mild_skew_size_factor)
+                if bid_base_size is not None:
+                    bid_base_size *= Decimal("1") - self.config.mild_skew_size_factor
             elif deviation <= -self.config.mild_skew_threshold_pct:
-                ask_size = quote_size * (Decimal("1") - self.config.mild_skew_size_factor)
+                ask_quote_size = quote_size * (Decimal("1") - self.config.mild_skew_size_factor)
+                if ask_base_size is not None:
+                    ask_base_size *= Decimal("1") - self.config.mild_skew_size_factor
 
         allow_bid = risk_status.allow_bid
         allow_ask = risk_status.allow_ask
@@ -77,7 +85,13 @@ class MicroMakerStrategy:
                     base_size=rebalance_buy_base,
                 )
             else:
-                bid = OrderIntent(side="buy", price=state.book.best_bid.price, quote_notional=bid_size, reason="join_best_bid")
+                bid = self._entry_intent(
+                    side="buy",
+                    price=state.book.best_bid.price,
+                    base_size=bid_base_size,
+                    quote_notional=bid_quote_size,
+                    reason="join_best_bid",
+                )
         if allow_ask:
             if rebalance_sell_base > 0:
                 sell_price_floor = state.min_rebalance_sell_price(
@@ -100,7 +114,13 @@ class MicroMakerStrategy:
                 normal_sell_floor = self._normal_sell_price_floor(state=state, allow_bid=allow_bid)
                 if normal_sell_floor is not None:
                     ask_price = max(ask_price, normal_sell_floor)
-                ask = OrderIntent(side="sell", price=ask_price, quote_notional=ask_size, reason="join_best_ask")
+                ask = self._entry_intent(
+                    side="sell",
+                    price=ask_price,
+                    base_size=ask_base_size,
+                    quote_notional=ask_quote_size,
+                    reason="join_best_ask",
+                )
 
         reason = "two_sided"
         if bid and not ask:
@@ -126,3 +146,22 @@ class MicroMakerStrategy:
         if not state.instrument:
             return None
         return quantize_up(self.config.normal_sell_price_floor, state.instrument.tick_size)
+
+    def _entry_base_size(self, *, state: BotState) -> Decimal | None:
+        if self.trading.entry_base_size <= 0:
+            return None
+        if not state.instrument:
+            return None
+        return quantize_up(self.trading.entry_base_size, state.instrument.lot_size)
+
+    @staticmethod
+    def _entry_intent(*, side: str, price: Decimal, base_size: Decimal | None, quote_notional: Decimal, reason: str) -> OrderIntent:
+        if base_size is not None:
+            return OrderIntent(
+                side=side,
+                price=price,
+                quote_notional=base_size * price,
+                reason=reason,
+                base_size=base_size,
+            )
+        return OrderIntent(side=side, price=price, quote_notional=quote_notional, reason=reason)

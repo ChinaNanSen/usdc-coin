@@ -46,6 +46,7 @@ class TradingConfig:
     inst_type: str = "SPOT"
     base_ccy: str = "USDC"
     quote_ccy: str = "USDT"
+    entry_base_size: Decimal = Decimal("0")
     quote_size: Decimal = Decimal("10000")
     min_quote_size: Decimal = Decimal("1000")
     max_quote_size: Decimal = Decimal("10000")

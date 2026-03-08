@@ -53,6 +53,22 @@ def test_strategy_quotes_both_sides_near_target_inventory():
     assert decision.reason == "two_sided"
 
 
+def test_strategy_can_use_fixed_entry_base_size_for_two_sided_quotes():
+    strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig(entry_base_size=Decimal("10000")))
+    decision = strategy.decide(
+        build_state("50000", "50000"),
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is not None
+    assert decision.ask is not None
+    assert decision.bid.base_size == Decimal("10000")
+    assert decision.bid.quote_notional == Decimal("9999")
+    assert decision.ask.base_size == Decimal("10000")
+    assert decision.ask.quote_notional == Decimal("10000")
+    assert decision.reason == "two_sided"
+
+
 def test_strategy_turns_into_ask_only_when_inventory_high():
     strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig())
     decision = strategy.decide(
@@ -99,7 +115,7 @@ def test_strategy_keeps_ask_only_after_selling_startup_inventory():
 def test_strategy_inventory_high_normal_sell_respects_price_floor():
     strategy = MicroMakerStrategy(
         StrategyConfig(normal_sell_price_floor=Decimal("1")),
-        TradingConfig(),
+        TradingConfig(entry_base_size=Decimal("10000")),
     )
     state = build_state("80000", "20000")
     state.set_book(
@@ -118,6 +134,8 @@ def test_strategy_inventory_high_normal_sell_respects_price_floor():
     assert decision.bid is None
     assert decision.ask is not None
     assert decision.ask.price == Decimal("1")
+    assert decision.ask.base_size == Decimal("10000")
+    assert decision.ask.quote_notional == Decimal("10000")
     assert decision.reason == "inventory_high_ask_only"
 
 

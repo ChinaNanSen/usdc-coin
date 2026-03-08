@@ -16,6 +16,7 @@ trading:
   inst_type: SPOT
   base_ccy: USDC
   quote_ccy: USDT
+  entry_base_size: 10000
   quote_size: 10000
   min_quote_size: 1000
   max_quote_size: 10000
