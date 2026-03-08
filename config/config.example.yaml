@@ -1,0 +1,93 @@
+mode: shadow
+
+exchange:
+  rest_url: https://www.okx.com
+  public_ws_url: wss://ws.okx.com:8443/ws/v5/public
+  private_ws_url: wss://ws.okx.com:8443/ws/v5/private
+  api_key: ""
+  secret_key: ""
+  passphrase: ""
+  simulated: false
+  request_timeout_seconds: 10
+  user_agent: trend_bot_6/0.1
+
+trading:
+  inst_id: USDC-USDT
+  inst_type: SPOT
+  base_ccy: USDC
+  quote_ccy: USDT
+  quote_size: 10000
+  min_quote_size: 1000
+  max_quote_size: 10000
+  loop_interval_seconds: 1.0
+  balance_poll_interval_seconds: 10.0
+  order_ttl_seconds: 10.0
+  cancel_on_ttl_expiry: false
+  action_cooldown_seconds: 1.0
+  bootstrap_depth: 5
+  shadow_base_balance: 50000
+  shadow_quote_balance: 50000
+
+strategy:
+  min_spread_ticks: 1
+  inventory_target_pct: 0.50
+  inventory_soft_lower_pct: 0.45
+  inventory_soft_upper_pct: 0.55
+  mild_skew_threshold_pct: 0.03
+  mild_skew_size_factor: 0.50
+  visible_depth_levels: 5
+  min_visible_depth_multiplier: 3
+
+risk:
+  stale_book_ms: 15000
+  cancel_orders_on_stale_book: false
+  max_reconnects_per_5m: 3
+  daily_loss_limit_quote: 50
+  min_free_quote_buffer: 1000
+  min_free_base_buffer: 1000
+  fail_on_foreign_pending_orders: true
+  cancel_managed_orders_on_startup: true
+  cancel_managed_orders_on_shutdown: true
+  cancel_managed_orders_on_public_reconnect: true
+  allow_emergency_ioc: false
+  hard_inventory_lower_pct: 0.35
+  hard_inventory_upper_pct: 0.65
+  pause_after_reconnect_seconds: 5
+  max_mid_deviation_bps: 20
+  peg_reference_price: 1
+  max_consecutive_place_failures: 3
+  max_consecutive_cancel_failures: 3
+  place_failure_cooldown_seconds: 30
+  cancel_failure_cooldown_seconds: 30
+  instrument_poll_interval_seconds: 300
+  fee_poll_interval_seconds: 300
+  require_public_stream_ready: true
+  require_private_stream_ready: true
+  enforce_effective_fee_gate: true
+  max_effective_maker_fee_rate: 0
+  max_effective_taker_fee_rate: 0
+  max_managed_orders_per_side: 1
+  max_consistency_failures: 3
+  cancel_managed_on_consistency_failure: true
+  balance_consistency_tolerance_quote: 1
+  require_passive_prices_on_resync: true
+  zero_fee_instruments:
+    - USDC-USDT
+
+shadow:
+  subscribe_trades: true
+  min_rest_seconds: 1.0
+  queue_ahead_fraction: 1.0
+  update_queue_from_books: true
+  fill_on_book_cross: true
+
+telemetry:
+  journal_path: data/journal.jsonl
+  sqlite_enabled: true
+  sqlite_path: data/audit.db
+  state_path: data/state_snapshot.json
+  snapshot_interval_seconds: 30
+  status_panel_enabled: true
+  status_panel_interval_seconds: 1.0
+  status_panel_clear_screen: true
+  status_panel_render_non_interactive: false

@@ -1,0 +1,15 @@
+# 敏感配置
+config/config.yaml
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 运行时数据
+data/
+
+# 环境
+.env
+*.egg-info/
