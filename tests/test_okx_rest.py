@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import BotConfig, ExchangeConfig
 from src.executor import OrderExecutor
-from src.models import Balance, InstrumentMeta, OrderIntent, QuoteDecision
+from src.models import Balance, BookLevel, BookSnapshot, InstrumentMeta, OrderIntent, QuoteDecision
 from src.models import RiskStatus
 from src.okx_rest import OKXAPIError, OKXRestClient
 from src.state import BotState
@@ -121,6 +121,14 @@ def make_state() -> BotState:
             min_size=Decimal("1"),
             max_market_amount=Decimal("1000000"),
             max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=1,
+            received_ms=1,
+            bids=[BookLevel(price=Decimal("1"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1.0001"), size=Decimal("100000"))],
         )
     )
     state.set_balances(
@@ -277,7 +285,8 @@ def test_executor_cancels_same_order_after_ttl_when_enabled():
     asyncio.run(run())
 
     assert len(rest.cancel_calls) == 1
-    assert cl_ord_id not in state.live_orders
+    assert cl_ord_id in state.live_orders
+    assert state.live_orders[cl_ord_id].cancel_requested is True
 
 
 def test_executor_keeps_order_when_book_is_stale_by_default():
@@ -348,7 +357,8 @@ def test_executor_cancels_order_when_stale_book_cancel_enabled():
     asyncio.run(run())
 
     assert len(rest.cancel_calls) == 1
-    assert cl_ord_id not in state.live_orders
+    assert cl_ord_id in state.live_orders
+    assert state.live_orders[cl_ord_id].cancel_requested is True
 
 
 def test_executor_treats_okx_51400_cancel_as_benign_terminal():
@@ -379,12 +389,218 @@ def test_executor_treats_okx_51400_cancel_as_benign_terminal():
 
     asyncio.run(run())
 
+
+def test_executor_preserves_rebalance_sell_queue_when_existing_order_price_is_better():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_base_buffer = Decimal("0")
+    config.strategy.preserve_rebalance_queue = True
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "1",
+            "fillPx": "1",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0001",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "3",
+            "uTime": "3",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "sell",
+            OrderIntent(side="sell", price=Decimal("1.0002"), quote_notional=Decimal("10002"), reason="rebalance_open_long", base_size=Decimal("10000")),
+        )
+
+    asyncio.run(run())
+
+    assert rest.cancel_calls == []
+    assert sell_id in state.live_orders
+
+
+def test_executor_preserves_entry_buy_queue_when_old_price_still_has_min_spread():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_quote_buffer = Decimal("0")
+    config.strategy.preserve_entry_queue = True
+    state.set_book(
+        state.book.__class__(
+            ts_ms=1,
+            received_ms=1,
+            bids=state.book.bids,
+            asks=[
+                state.book.asks[0].__class__(price=Decimal("1.0001"), size=Decimal("100000"), order_count=0),
+            ],
+        )
+    )
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "1",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            OrderIntent(side="buy", price=Decimal("0.9999"), quote_notional=Decimal("10000"), reason="join_best_bid"),
+        )
+
+    asyncio.run(run())
+
+    assert rest.cancel_calls == []
+    assert buy_id in state.live_orders
+
+
+def test_executor_reprices_entry_buy_when_old_price_no_longer_has_min_spread():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_quote_buffer = Decimal("0")
+    config.strategy.preserve_entry_queue = True
+    state.set_book(
+        state.book.__class__(
+            ts_ms=1,
+            received_ms=1,
+            bids=[
+                state.book.bids[0].__class__(price=Decimal("0.9999"), size=Decimal("100000"), order_count=0),
+            ],
+            asks=[
+                state.book.asks[0].__class__(price=Decimal("1"), size=Decimal("100000"), order_count=0),
+            ],
+        )
+    )
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "1",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            OrderIntent(side="buy", price=Decimal("0.9999"), quote_notional=Decimal("10000"), reason="join_best_bid"),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.cancel_calls) == 1
+    assert buy_id in state.live_orders
+    assert state.live_orders[buy_id].cancel_requested is True
+
+
+def test_executor_reprices_rebalance_sell_when_existing_order_price_is_too_low():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_base_buffer = Decimal("0")
+    config.strategy.preserve_rebalance_queue = True
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "1",
+            "fillPx": "1",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "3",
+            "uTime": "3",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "sell",
+            OrderIntent(side="sell", price=Decimal("1.0001"), quote_notional=Decimal("10001"), reason="rebalance_open_long", base_size=Decimal("10000")),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.cancel_calls) == 1
+
     assert state.consecutive_cancel_failures == 0
-    assert cl_ord_id not in state.live_orders
-    assert journal.events[-1][0] == "cancel_order_terminal"
-    assert journal.events[-1][1]["okx"]["data"][0]["sCode"] == "51400"
-    assert journal.events[-1][1]["reason_zh"] == "公共行情重连清理"
-    assert "撤单时订单已终态" in journal.events[-1][1]["okx_zh"]
+    assert sell_id in state.live_orders
+    assert state.live_orders[sell_id].cancel_requested is True
+    assert journal.events[-1][0] == "cancel_order"
+    assert journal.events[-1][1]["reason"] == "reprice_or_ttl"
+    assert journal.events[-1][1]["reason_zh"] == "改价或超时重挂"
 
 
 def test_executor_caps_buy_size_by_available_quote_balance():
@@ -451,6 +667,159 @@ def test_executor_keeps_partially_filled_order_when_remaining_matches_target():
 
     assert rest.cancel_calls == []
     assert cl_ord_id in state.live_orders
+
+
+def test_executor_keeps_partially_filled_order_when_remaining_is_smaller_but_price_same():
+    state = make_state()
+    config = BotConfig(mode="live")
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    cl_ord_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "123",
+            "clOrdId": cl_ord_id,
+            "px": "1.0001",
+            "sz": "10000",
+            "accFillSz": "3600",
+            "state": "partially_filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "sell",
+            OrderIntent(
+                side="sell",
+                price=Decimal("1.0001"),
+                quote_notional=Decimal("10001"),
+                base_size=Decimal("10000"),
+                reason="join_best_ask",
+            ),
+        )
+
+    asyncio.run(run())
+
+    assert rest.cancel_calls == []
+    assert cl_ord_id in state.live_orders
+
+
+def test_executor_keeps_partially_filled_sell_without_intent_when_risk_still_allows_ask():
+    state = make_state()
+    config = BotConfig(mode="live")
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    cl_ord_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "123",
+            "clOrdId": cl_ord_id,
+            "px": "1.0001",
+            "sz": "10000",
+            "accFillSz": "1200",
+            "state": "partially_filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor.reconcile(
+            QuoteDecision(reason="reduce_only_inventory_high", bid=None, ask=None),
+            risk_status=RiskStatus(
+                ok=True,
+                reason="reduce_only_inventory_high",
+                allow_bid=False,
+                allow_ask=True,
+                runtime_state="REDUCE_ONLY",
+            ),
+        )
+
+    asyncio.run(run())
+
+    assert rest.cancel_calls == []
+    assert cl_ord_id in state.live_orders
+    assert state.live_orders[cl_ord_id].cancel_requested is False
+
+
+def test_cancel_request_keeps_order_for_late_fill_delta_accounting():
+    state = make_state()
+    config = BotConfig(mode="live")
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    cl_ord_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "123",
+            "clOrdId": cl_ord_id,
+            "px": "1",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "123",
+            "clOrdId": cl_ord_id,
+            "px": "1",
+            "sz": "10000",
+            "accFillSz": "2000",
+            "fillPx": "1",
+            "state": "partially_filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._cancel_order(state.live_orders[cl_ord_id], reason="side_disabled")
+
+    asyncio.run(run())
+
+    assert len(rest.cancel_calls) == 1
+    assert cl_ord_id in state.live_orders
+    assert state.live_orders[cl_ord_id].cancel_requested is True
+
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "123",
+            "clOrdId": cl_ord_id,
+            "px": "1",
+            "sz": "10000",
+            "accFillSz": "5000",
+            "fillPx": "1",
+            "state": "partially_filled",
+            "cTime": "1",
+            "uTime": "3",
+        },
+        source="test",
+    )
+
+    assert state.strategy_position_base() == Decimal("5000")
+    assert state.observed_fill_count == 2
+    assert state.observed_fill_volume_quote == Decimal("5000")
 
 
 def test_executor_keeps_buy_order_when_only_own_frozen_quote_makes_available_look_low():

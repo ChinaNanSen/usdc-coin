@@ -115,7 +115,9 @@ class OrderExecutor:
 
         if intent is None:
             if primary:
-                if self._should_keep_order_without_intent(risk_status):
+                if primary.cancel_requested:
+                    return
+                if self._should_keep_order_without_intent(primary=primary, risk_status=risk_status):
                     return
                 await self._cancel_order(primary, reason="side_disabled")
             return
@@ -139,6 +141,8 @@ class OrderExecutor:
             return
 
         if primary:
+            if primary.cancel_requested:
+                return
             age_ms = now_ms() - primary.created_at_ms
             same_price = primary.price == intent.price
             same_size = primary.remaining_size == base_size
@@ -148,6 +152,12 @@ class OrderExecutor:
                     return
                 if not self.config.trading.cancel_on_ttl_expiry:
                     return
+            if self._should_preserve_partial_fill_with_same_price(primary=primary, intent=intent, base_size=base_size):
+                return
+            if self._should_preserve_entry_queue(primary=primary, intent=intent):
+                return
+            if self._should_preserve_rebalance_queue(primary=primary, intent=intent, base_size=base_size):
+                return
             await self._cancel_order(primary, reason="reprice_or_ttl")
             return
 
@@ -284,7 +294,6 @@ class OrderExecutor:
             )
             logger.warning("撤单失败 | %s | %s", translate_reason(reason), payload.get("okx_zh") or payload["error"])
             return
-        self.state.live_orders.pop(order.cl_ord_id, None)
         self.state.record_cancel_result(True)
         self.journal.append(
             "cancel_order",
@@ -295,17 +304,90 @@ class OrderExecutor:
                 "reason_zh": translate_reason(reason),
             },
         )
+        self.state.mark_cancel_requested(order.cl_ord_id)
         self._last_action_by_side[order.side] = now_ms()
 
     def _cooldown_ok(self, side: str) -> bool:
         last = self._last_action_by_side.get(side, 0)
         return (now_ms() - last) >= int(self.config.trading.action_cooldown_seconds * 1000)
 
-    def _should_keep_order_without_intent(self, risk_status: RiskStatus | None) -> bool:
+    def _should_keep_order_without_intent(self, *, primary: LiveOrder, risk_status: RiskStatus | None) -> bool:
         if risk_status is None:
             return False
         if risk_status.reason.startswith("stale book:") and not self.config.risk.cancel_orders_on_stale_book:
             return True
+        if primary.filled_size > 0 and risk_status.ok and self._side_allowed_by_risk(primary.side, risk_status):
+            return True
+        return False
+
+    @staticmethod
+    def _side_allowed_by_risk(side: str, risk_status: RiskStatus) -> bool:
+        if side == "buy":
+            return risk_status.allow_bid
+        if side == "sell":
+            return risk_status.allow_ask
+        return False
+
+    def _should_preserve_partial_fill_with_same_price(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
+        if primary.filled_size <= 0:
+            return False
+        if primary.side != intent.side:
+            return False
+        if primary.price != intent.price:
+            return False
+        if primary.remaining_size <= 0:
+            return False
+        return primary.remaining_size <= base_size
+
+    def _should_preserve_entry_queue(self, *, primary: LiveOrder, intent) -> bool:
+        if not self.config.strategy.preserve_entry_queue:
+            return False
+        if not self.state.instrument or not self.state.book:
+            return False
+        if primary.side != intent.side:
+            return False
+        if primary.remaining_size <= 0:
+            return False
+        if intent.reason not in {"join_best_bid", "join_best_ask"}:
+            return False
+        min_spread = self.state.instrument.tick_size * Decimal(self.config.strategy.min_spread_ticks)
+        if intent.reason == "join_best_bid":
+            best_ask = self.state.book.best_ask.price if self.state.book.best_ask else None
+            if best_ask is None:
+                return False
+            return (best_ask - primary.price) >= min_spread
+        if intent.reason == "join_best_ask":
+            best_bid = self.state.book.best_bid.price if self.state.book.best_bid else None
+            if best_bid is None:
+                return False
+            return (primary.price - best_bid) >= min_spread
+        return False
+
+    def _should_preserve_rebalance_queue(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
+        if not self.config.strategy.preserve_rebalance_queue:
+            return False
+        if not self.state.instrument:
+            return False
+        if primary.remaining_size != base_size:
+            return False
+        if intent.reason == "rebalance_open_long":
+            floor = self.state.min_rebalance_sell_price(
+                base_size,
+                tick_size=self.state.instrument.tick_size,
+                profit_ticks=self.config.strategy.rebalance_min_profit_ticks,
+            )
+            if floor is None:
+                return False
+            return primary.side == "sell" and primary.price >= floor
+        if intent.reason == "rebalance_open_short":
+            cap = self.state.max_rebalance_buy_price(
+                base_size,
+                tick_size=self.state.instrument.tick_size,
+                profit_ticks=self.config.strategy.rebalance_min_profit_ticks,
+            )
+            if cap is None:
+                return False
+            return primary.side == "buy" and primary.price <= cap
         return False
 
     @staticmethod

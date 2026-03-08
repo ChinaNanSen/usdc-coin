@@ -100,6 +100,7 @@ class LiveOrder:
     updated_at_ms: int
     source: str = "rest"
     queue_ahead_size: Decimal = ZERO
+    cancel_requested: bool = False
 
     @property
     def is_terminal(self) -> bool:

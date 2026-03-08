@@ -76,6 +76,7 @@ class TerminalStatusPanel:
                 f"买一={self._fmt_dec(bid)} 卖一={self._fmt_dec(ask)} "
                 f"价差tick={self._fmt_dec(spread_ticks)} 盘口年龄毫秒={book_age_ms}"
             ),
+            f"市场成交 | {self._fmt_market_trade(state)}",
             (
                 "流状态 | "
                 f"公共={self._fmt_bool(state.stream_status.get('public_books5', False))} "
@@ -146,6 +147,21 @@ class TerminalStatusPanel:
         ]
         if trade.trade_id:
             parts.append(f"订单号={trade.trade_id}")
+        parts.append(f"年龄毫秒={age_ms}")
+        return " ".join(parts)
+
+    def _fmt_market_trade(self, state: BotState) -> str:
+        trade = state.last_market_trade
+        if not trade:
+            return "无"
+        age_ms = max(now_ms() - trade.last_update_ms, 0)
+        parts = [
+            f"方向={self._translate_side(trade.side)}",
+            f"价格={self._fmt_dec(trade.price)}",
+            f"数量={self._fmt_dec(trade.size)}",
+        ]
+        if trade.trade_id:
+            parts.append(f"成交ID={trade.trade_id}")
         parts.append(f"年龄毫秒={age_ms}")
         return " ".join(parts)
 

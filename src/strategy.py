@@ -5,6 +5,7 @@ from decimal import Decimal
 from .config import StrategyConfig, TradingConfig
 from .models import OrderIntent, QuoteDecision, RiskStatus
 from .state import BotState
+from .utils import quantize_up
 
 
 class MicroMakerStrategy:
@@ -95,7 +96,11 @@ class MicroMakerStrategy:
                     base_size=rebalance_sell_base,
                 )
             else:
-                ask = OrderIntent(side="sell", price=state.book.best_ask.price, quote_notional=ask_size, reason="join_best_ask")
+                ask_price = state.book.best_ask.price
+                normal_sell_floor = self._normal_sell_price_floor(state=state, allow_bid=allow_bid)
+                if normal_sell_floor is not None:
+                    ask_price = max(ask_price, normal_sell_floor)
+                ask = OrderIntent(side="sell", price=ask_price, quote_notional=ask_size, reason="join_best_ask")
 
         reason = "two_sided"
         if bid and not ask:
@@ -112,3 +117,12 @@ class MicroMakerStrategy:
         for level in levels[: self.config.visible_depth_levels]:
             depth += level.price * level.size
         return depth
+
+    def _normal_sell_price_floor(self, *, state: BotState, allow_bid: bool) -> Decimal | None:
+        if allow_bid:
+            return None
+        if self.config.normal_sell_price_floor <= 0:
+            return None
+        if not state.instrument:
+            return None
+        return quantize_up(self.config.normal_sell_price_floor, state.instrument.tick_size)

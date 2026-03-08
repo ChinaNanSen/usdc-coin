@@ -64,6 +64,87 @@ def test_strategy_turns_into_ask_only_when_inventory_high():
     assert decision.reason == "inventory_high_ask_only"
 
 
+def test_strategy_keeps_ask_only_after_selling_startup_inventory():
+    strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig())
+    state = build_state("80000", "20000")
+    cl_ord_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": cl_ord_id,
+            "px": "1",
+            "fillPx": "1",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"),
+    )
+
+    assert state.strategy_position_base() == Decimal("0")
+    assert decision.bid is None
+    assert decision.ask is not None
+    assert decision.reason == "inventory_high_ask_only"
+
+
+def test_strategy_inventory_high_normal_sell_respects_price_floor():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(normal_sell_price_floor=Decimal("1")),
+        TradingConfig(),
+    )
+    state = build_state("80000", "20000")
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal("0.9998"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("0.9999"), size=Decimal("100000"))],
+        )
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"),
+    )
+
+    assert decision.bid is None
+    assert decision.ask is not None
+    assert decision.ask.price == Decimal("1")
+    assert decision.reason == "inventory_high_ask_only"
+
+
+def test_strategy_two_sided_quote_does_not_apply_normal_sell_floor():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(normal_sell_price_floor=Decimal("1")),
+        TradingConfig(),
+    )
+    state = build_state("50000", "50000")
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal("0.9998"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("0.9999"), size=Decimal("100000"))],
+        )
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is not None
+    assert decision.ask is not None
+    assert decision.ask.price == Decimal("0.9999")
+
+
 def test_strategy_blocks_when_visible_depth_is_too_thin():
     strategy = MicroMakerStrategy(StrategyConfig(min_visible_depth_multiplier=Decimal("3")), TradingConfig(quote_size=Decimal("10000")))
     decision = strategy.decide(

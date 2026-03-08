@@ -32,6 +32,7 @@ class BotState:
         self.resync_reason = ""
         self.fee_snapshot: FeeSnapshot | None = None
         self.last_trade: TradeTick | None = None
+        self.last_market_trade: TradeTick | None = None
         self.last_fee_check_ms = 0
         self.last_instrument_check_ms = 0
         self.last_consistency_check_ms = 0
@@ -46,10 +47,13 @@ class BotState:
         self.observed_fill_volume_quote = Decimal("0")
         self.live_realized_pnl_quote = Decimal("0")
         self.live_position_lots: deque[StrategyLot] = deque()
+        self.initial_external_base_inventory: Decimal | None = None
+        self.external_base_inventory_remaining: Decimal = Decimal("0")
 
     def set_instrument(self, instrument: InstrumentMeta) -> None:
         self.instrument = instrument
         self.last_instrument_check_ms = now_ms()
+        self._init_external_inventory_if_possible()
 
     def set_book(self, book: BookSnapshot) -> None:
         self.book = book
@@ -60,6 +64,7 @@ class BotState:
         self.balances.update(balances)
         self._init_nav_if_possible()
         self._init_shadow_cost_if_possible()
+        self._init_external_inventory_if_possible()
 
     def seed_shadow_balances(self, *, base_ccy: str, quote_ccy: str, base_balance: Decimal, quote_balance: Decimal) -> None:
         self.balances[base_ccy] = Balance(ccy=base_ccy, total=base_balance, available=base_balance)
@@ -73,6 +78,49 @@ class BotState:
 
     def set_last_trade(self, trade: TradeTick) -> None:
         self.last_trade = trade
+
+    def set_last_market_trade(self, trade: TradeTick) -> None:
+        self.last_market_trade = trade
+
+    def load_persisted_accounting(self) -> dict[str, int | str] | None:
+        if not self.state_path.exists():
+            return None
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+        self.initial_nav_quote = self._optional_decimal(payload.get("initial_nav_quote"))
+        self.last_fill_ms = self._optional_int(payload.get("last_fill_ms"))
+        self.shadow_realized_pnl_quote = parse_decimal(payload.get("shadow_realized_pnl_quote") or "0")
+        self.shadow_base_cost_quote = self._optional_decimal(payload.get("shadow_base_cost_quote"))
+        self.shadow_fill_count = self._optional_int(payload.get("shadow_fill_count")) or 0
+        self.shadow_fill_volume_quote = parse_decimal(payload.get("shadow_fill_volume_quote") or "0")
+        self.observed_fill_count = self._optional_int(payload.get("observed_fill_count")) or 0
+        self.observed_fill_volume_quote = parse_decimal(payload.get("observed_fill_volume_quote") or "0")
+        self.live_realized_pnl_quote = parse_decimal(payload.get("live_realized_pnl_quote") or "0")
+        self.initial_external_base_inventory = self._optional_decimal(payload.get("initial_external_base_inventory"))
+        self.external_base_inventory_remaining = parse_decimal(payload.get("external_base_inventory_remaining") or "0")
+
+        restored_lots: deque[StrategyLot] = deque()
+        for item in payload.get("live_position_lots", []):
+            lot = self._parse_strategy_lot(item)
+            if lot is not None:
+                restored_lots.append(lot)
+        self.live_position_lots = restored_lots
+
+        last_trade = self._parse_trade_tick(payload.get("last_trade"))
+        if last_trade is not None:
+            self.last_trade = last_trade
+        last_market_trade = self._parse_trade_tick(payload.get("last_market_trade"))
+        if last_market_trade is not None:
+            self.last_market_trade = last_market_trade
+
+        return {
+            "live_lot_count": len(self.live_position_lots),
+            "live_realized_pnl_quote": str(self.live_realized_pnl_quote),
+            "observed_fill_count": self.observed_fill_count,
+        }
 
     def apply_account_update(self, payload: dict) -> None:
         for item in payload.get("details", []):
@@ -106,6 +154,7 @@ class BotState:
             created_at_ms=int(payload.get("cTime") or now_ms()),
             updated_at_ms=int(payload.get("uTime") or now_ms()),
             source=source,
+            cancel_requested=previous.cancel_requested if previous else False,
         )
         previous_filled = previous.filled_size if previous else Decimal("0")
         fill_delta = order.filled_size - previous_filled
@@ -427,6 +476,7 @@ class BotState:
             "resync_reason": self.resync_reason,
             "fee_snapshot": self.fee_snapshot,
             "last_trade": self.last_trade,
+            "last_market_trade": self.last_market_trade,
             "last_fee_check_ms": self.last_fee_check_ms,
             "last_instrument_check_ms": self.last_instrument_check_ms,
             "last_consistency_check_ms": self.last_consistency_check_ms,
@@ -444,6 +494,8 @@ class BotState:
             "live_total_pnl_quote": self.live_total_pnl_quote(),
             "strategy_position_base": self.strategy_position_base(),
             "live_position_lots": list(self.live_position_lots),
+            "initial_external_base_inventory": self.initial_external_base_inventory,
+            "external_base_inventory_remaining": self.external_base_inventory_remaining,
         }
         self.state_path.write_text(json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -456,6 +508,62 @@ class BotState:
     def _init_shadow_cost_if_possible(self) -> None:
         if self.shadow_base_cost_quote is None and self.instrument and self.book and self.book.mid is not None and self._has_balance_snapshot():
             self.shadow_base_cost_quote = self.total_balance(self.instrument.base_ccy) * self.book.mid
+
+    @staticmethod
+    def _optional_decimal(value) -> Decimal | None:
+        if value in (None, "", "null"):
+            return None
+        return parse_decimal(value)
+
+    @staticmethod
+    def _optional_int(value) -> int | None:
+        if value in (None, "", "null"):
+            return None
+        return int(value)
+
+    @staticmethod
+    def _parse_trade_tick(value) -> TradeTick | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            return TradeTick(
+                ts_ms=int(value.get("ts_ms") or 0),
+                price=parse_decimal(value.get("price") or "0"),
+                size=parse_decimal(value.get("size") or "0"),
+                side=str(value.get("side") or ""),
+                received_ms=BotState._optional_int(value.get("received_ms")),
+                trade_id=str(value.get("trade_id") or "") or None,
+                order_price=BotState._optional_decimal(value.get("order_price")),
+            )
+        except (TypeError, ValueError, ArithmeticError):
+            return None
+
+    @staticmethod
+    def _parse_strategy_lot(value) -> StrategyLot | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            return StrategyLot(
+                qty=parse_decimal(value.get("qty") or "0"),
+                price=parse_decimal(value.get("price") or "0"),
+                ts_ms=int(value.get("ts_ms") or 0),
+                cl_ord_id=str(value.get("cl_ord_id") or ""),
+            )
+        except (TypeError, ValueError, ArithmeticError):
+            return None
+
+    def _init_external_inventory_if_possible(self) -> None:
+        if self.initial_external_base_inventory is not None or not self.instrument or not self._has_balance_snapshot():
+            return
+        self.initial_external_base_inventory = self.total_balance(self.instrument.base_ccy)
+        self.external_base_inventory_remaining = self.initial_external_base_inventory
+
+    def mark_cancel_requested(self, cl_ord_id: str) -> None:
+        order = self.live_orders.get(cl_ord_id)
+        if not order:
+            return
+        order.cancel_requested = True
+        order.updated_at_ms = now_ms()
 
     def _adjust_balance(
         self,
@@ -505,6 +613,12 @@ class BotState:
                 remaining -= matched
                 if lot.qty == 0:
                     self.live_position_lots.popleft()
+            if remaining > 0 and self.initial_external_base_inventory is not None:
+                restorable = self.initial_external_base_inventory - self.external_base_inventory_remaining
+                if restorable > 0:
+                    restored = min(remaining, restorable)
+                    self.external_base_inventory_remaining += restored
+                    remaining -= restored
             if remaining > 0:
                 self.live_position_lots.append(
                     StrategyLot(qty=remaining, price=fill_price, ts_ms=fill_ts_ms, cl_ord_id=cl_ord_id)
@@ -518,6 +632,10 @@ class BotState:
                 remaining -= matched
                 if lot.qty == 0:
                     self.live_position_lots.popleft()
+            if remaining > 0 and self.external_base_inventory_remaining > 0:
+                reduced = min(remaining, self.external_base_inventory_remaining)
+                self.external_base_inventory_remaining -= reduced
+                remaining -= reduced
             if remaining > 0:
                 self.live_position_lots.append(
                     StrategyLot(qty=-remaining, price=fill_price, ts_ms=fill_ts_ms, cl_ord_id=cl_ord_id)

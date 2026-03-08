@@ -45,6 +45,7 @@ def test_status_panel_builds_readable_snapshot():
     state.shadow_realized_pnl_quote = Decimal("1.25")
     state.shadow_fill_count = 3
     state.set_last_trade(TradeTick(ts_ms=11, received_ms=11, price=Decimal("1"), size=Decimal("100"), side="sell"))
+    state.set_last_market_trade(TradeTick(ts_ms=12, received_ms=12, price=Decimal("1.0001"), size=Decimal("50"), side="buy", trade_id="mkt-1"))
     state.apply_order_update(
         {
             "instId": "USDC-USDT",
@@ -80,6 +81,7 @@ def test_status_panel_builds_readable_snapshot():
     assert "原因=双边报价" in text
     assert "成交次数=3" in text
     assert "已实现(U)=+1.25" in text
+    assert "市场成交 | 方向=买 价格=1.0001 数量=50 成交ID=mkt-1" in text
     assert "买单 价格=0.9999 数量=10000" in text
     assert "买单 价格=0.9999 目标金额=10000U" in text
     assert "最近成交 | 方向=卖 委托价=- 成交价=1 数量=100" in text
@@ -116,6 +118,7 @@ def test_status_panel_marks_demo_live_mode_in_chinese():
     )
     state.runtime_state = "QUOTING"
     state.runtime_reason = "inventory_low_bid_only"
+    state.set_last_market_trade(TradeTick(ts_ms=11, received_ms=11, price=Decimal("1"), size=Decimal("123"), side="sell", trade_id="market-2"))
 
     panel = TerminalStatusPanel(
         config=TelemetryConfig(status_panel_enabled=True, status_panel_render_non_interactive=True),
@@ -129,6 +132,7 @@ def test_status_panel_marks_demo_live_mode_in_chinese():
 
     assert "模式=OKX模拟盘" in text
     assert "本轮盈亏(U)=" in text
+    assert "市场成交 | 方向=卖 价格=1 数量=123 成交ID=market-2" in text
 
 
 def test_status_panel_shows_live_realized_and_unrealized_pnl():

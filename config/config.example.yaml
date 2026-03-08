@@ -38,6 +38,8 @@ strategy:
   visible_depth_levels: 5
   min_visible_depth_multiplier: 3
   rebalance_min_profit_ticks: 1
+  preserve_entry_queue: true
+  preserve_rebalance_queue: true
 
 risk:
   stale_book_ms: 15000
@@ -49,7 +51,7 @@ risk:
   fail_on_foreign_pending_orders: true
   cancel_managed_orders_on_startup: true
   cancel_managed_orders_on_shutdown: true
-  cancel_managed_orders_on_public_reconnect: true
+  cancel_managed_orders_on_public_reconnect: false
   allow_emergency_ioc: false
   hard_inventory_lower_pct: 0.35
   hard_inventory_upper_pct: 0.65

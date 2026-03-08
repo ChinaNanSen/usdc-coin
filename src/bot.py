@@ -28,6 +28,7 @@ class TrendBot6:
         self.config = config
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         self.state = BotState(managed_prefix=config.managed_prefix, state_path=config.telemetry.state_path)
+        restored_state = self.state.load_persisted_accounting()
         self.audit_store = SQLiteAuditStore(
             config.telemetry.sqlite_path,
             enabled=config.telemetry.sqlite_enabled,
@@ -39,6 +40,8 @@ class TrendBot6:
             runtime_state_getter=lambda: self.state.runtime_state,
             run_id=self.run_id,
         )
+        if restored_state:
+            self.journal.append("state_restored", restored_state)
         self.rest = OKXRestClient(config.exchange)
         self.risk = RiskManager(config.risk, config.trading, mode=config.mode)
         self.strategy = MicroMakerStrategy(config.strategy, config.trading)
@@ -138,11 +141,11 @@ class TrendBot6:
             url=self.config.exchange.public_ws_url,
             inst_id=self.config.trading.inst_id,
             on_book=self._on_book,
-            on_trade=self._on_trade if self.shadow_simulator and self.config.shadow.subscribe_trades else None,
+            on_trade=self._on_trade,
             on_reconnect=self._on_reconnect,
             on_status=self._on_stream_status,
             on_error=self._on_stream_error,
-            subscribe_trades=bool(self.shadow_simulator and self.config.shadow.subscribe_trades),
+            subscribe_trades=True,
         )
         await self.public_stream.start()
 
@@ -293,6 +296,7 @@ class TrendBot6:
             await self.shadow_simulator.on_book(book)
 
     async def _on_trade(self, trade) -> None:
+        self.state.set_last_market_trade(trade)
         if self.shadow_simulator:
             await self.shadow_simulator.on_trade(trade)
 
@@ -345,5 +349,12 @@ class TrendBot6:
             duration_ms=int(self.config.risk.pause_after_reconnect_seconds * 1000),
         )
         self.journal.append("reconnect", {"stream": stream_name})
-        if self.config.mode == "live" and stream_name == "public_books5" and self.config.risk.cancel_managed_orders_on_public_reconnect:
-            await self.executor.cancel_all_managed_orders(reason="public_reconnect")
+        if self.config.mode == "live" and stream_name == "public_books5":
+            self.journal.append(
+                "public_reconnect_resync_only",
+                {
+                    "stream": stream_name,
+                    "immediate_cancel": False,
+                    "configured_cancel_on_public_reconnect": self.config.risk.cancel_managed_orders_on_public_reconnect,
+                },
+            )

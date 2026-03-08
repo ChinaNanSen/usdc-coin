@@ -126,3 +126,32 @@ def test_live_pnl_tracks_realized_and_unrealized_from_managed_fills():
     assert state.last_trade is not None
     assert state.last_trade.order_price == Decimal("1.0001")
     assert state.last_trade.price == Decimal("1.0001")
+
+
+def test_load_persisted_accounting_restores_live_state(tmp_path):
+    state_path = tmp_path / "state.json"
+    state = BotState(managed_prefix="bot6", state_path=str(state_path))
+    state.initial_nav_quote = Decimal("25000")
+    state.live_realized_pnl_quote = Decimal("2.2")
+    state.observed_fill_count = 4
+    state.observed_fill_volume_quote = Decimal("2888.8692150357")
+    state.initial_external_base_inventory = Decimal("23008.69913")
+    state.external_base_inventory_remaining = Decimal("21021.301162")
+    state.live_position_lots.append(
+        state._parse_strategy_lot(
+            {"qty": "-1693.170218", "price": "1.0001", "ts_ms": 1234, "cl_ord_id": "bot6ms1"}
+        )
+    )
+    state.persist()
+
+    restored = BotState(managed_prefix="bot6", state_path=str(state_path))
+    summary = restored.load_persisted_accounting()
+
+    assert summary is not None
+    assert restored.initial_nav_quote == Decimal("25000")
+    assert restored.live_realized_pnl_quote == Decimal("2.2")
+    assert restored.observed_fill_count == 4
+    assert restored.observed_fill_volume_quote == Decimal("2888.8692150357")
+    assert restored.initial_external_base_inventory == Decimal("23008.69913")
+    assert restored.external_base_inventory_remaining == Decimal("21021.301162")
+    assert restored.strategy_position_base() == Decimal("-1693.170218")

@@ -70,6 +70,9 @@ class StrategyConfig:
     visible_depth_levels: int = 5
     min_visible_depth_multiplier: Decimal = Decimal("3")
     rebalance_min_profit_ticks: int = 1
+    normal_sell_price_floor: Decimal = Decimal("0")
+    preserve_entry_queue: bool = True
+    preserve_rebalance_queue: bool = True
 
 
 @dataclass
@@ -83,7 +86,7 @@ class RiskConfig:
     fail_on_foreign_pending_orders: bool = True
     cancel_managed_orders_on_startup: bool = True
     cancel_managed_orders_on_shutdown: bool = True
-    cancel_managed_orders_on_public_reconnect: bool = True
+    cancel_managed_orders_on_public_reconnect: bool = False
     allow_emergency_ioc: bool = False
     hard_inventory_lower_pct: Decimal = Decimal("0.35")
     hard_inventory_upper_pct: Decimal = Decimal("0.65")
