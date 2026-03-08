@@ -60,10 +60,18 @@ class MicroMakerStrategy:
         ask = None
         if allow_bid:
             if rebalance_buy_base > 0:
+                buy_price_cap = state.max_rebalance_buy_price(
+                    rebalance_buy_base,
+                    tick_size=state.instrument.tick_size,
+                    profit_ticks=self.config.rebalance_min_profit_ticks,
+                )
+                bid_price = state.book.best_bid.price
+                if buy_price_cap is not None:
+                    bid_price = min(bid_price, buy_price_cap)
                 bid = OrderIntent(
                     side="buy",
-                    price=state.book.best_bid.price,
-                    quote_notional=rebalance_buy_base * state.book.best_bid.price,
+                    price=bid_price,
+                    quote_notional=rebalance_buy_base * bid_price,
                     reason="rebalance_open_short",
                     base_size=rebalance_buy_base,
                 )
@@ -71,10 +79,18 @@ class MicroMakerStrategy:
                 bid = OrderIntent(side="buy", price=state.book.best_bid.price, quote_notional=bid_size, reason="join_best_bid")
         if allow_ask:
             if rebalance_sell_base > 0:
+                sell_price_floor = state.min_rebalance_sell_price(
+                    rebalance_sell_base,
+                    tick_size=state.instrument.tick_size,
+                    profit_ticks=self.config.rebalance_min_profit_ticks,
+                )
+                ask_price = state.book.best_ask.price
+                if sell_price_floor is not None:
+                    ask_price = max(ask_price, sell_price_floor)
                 ask = OrderIntent(
                     side="sell",
-                    price=state.book.best_ask.price,
-                    quote_notional=rebalance_sell_base * state.book.best_ask.price,
+                    price=ask_price,
+                    quote_notional=rebalance_sell_base * ask_price,
                     reason="rebalance_open_long",
                     base_size=rebalance_sell_base,
                 )

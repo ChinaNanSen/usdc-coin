@@ -37,6 +37,7 @@ strategy:
   mild_skew_size_factor: 0.50
   visible_depth_levels: 5
   min_visible_depth_multiplier: 3
+  rebalance_min_profit_ticks: 1
 
 risk:
   stale_book_ms: 15000

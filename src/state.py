@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from .models import Balance, BookSnapshot, FeeSnapshot, InstrumentMeta, LiveOrder, StrategyLot, TradeTick
-from .utils import is_managed_cl_ord_id, now_ms, parse_decimal, to_jsonable
+from .utils import is_managed_cl_ord_id, now_ms, parse_decimal, quantize_down, quantize_up, to_jsonable
 
 
 class BotState:
@@ -325,6 +325,46 @@ class BotState:
         if side == "buy" and position < 0:
             return -position
         return Decimal("0")
+
+    def min_rebalance_sell_price(self, base_size: Decimal, *, tick_size: Decimal, profit_ticks: int) -> Decimal | None:
+        if base_size <= 0:
+            return None
+        remaining = base_size
+        max_cost: Decimal | None = None
+        for lot in self.live_position_lots:
+            if lot.qty <= 0:
+                continue
+            matched = min(remaining, lot.qty)
+            if matched <= 0:
+                continue
+            max_cost = lot.price if max_cost is None else max(max_cost, lot.price)
+            remaining -= matched
+            if remaining <= 0:
+                break
+        if max_cost is None:
+            return None
+        target = max_cost + tick_size * Decimal(max(profit_ticks, 0))
+        return quantize_up(target, tick_size)
+
+    def max_rebalance_buy_price(self, base_size: Decimal, *, tick_size: Decimal, profit_ticks: int) -> Decimal | None:
+        if base_size <= 0:
+            return None
+        remaining = base_size
+        min_open_price: Decimal | None = None
+        for lot in self.live_position_lots:
+            if lot.qty >= 0:
+                continue
+            matched = min(remaining, -lot.qty)
+            if matched <= 0:
+                continue
+            min_open_price = lot.price if min_open_price is None else min(min_open_price, lot.price)
+            remaining -= matched
+            if remaining <= 0:
+                break
+        if min_open_price is None:
+            return None
+        target = min_open_price - tick_size * Decimal(max(profit_ticks, 0))
+        return quantize_down(target, tick_size)
 
     def inventory_ratio(self) -> Decimal | None:
         if not self.instrument or not self.book or not self.book.mid:

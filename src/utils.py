@@ -8,7 +8,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any
 
 
@@ -22,6 +22,12 @@ def quantize_down(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
         return value
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def quantize_up(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_UP) * step
 
 
 def decimal_to_str(value: Decimal) -> str:

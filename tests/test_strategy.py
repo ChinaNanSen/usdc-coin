@@ -120,3 +120,72 @@ def test_strategy_uses_exact_fill_size_to_rebalance_open_long():
     assert decision.ask.base_size == Decimal("10000")
     assert decision.ask.quote_notional == Decimal("10001")
     assert decision.reason == "fill_rebalance_sell_only"
+
+
+def test_strategy_rebalance_sell_respects_min_profit_ticks():
+    strategy = MicroMakerStrategy(StrategyConfig(rebalance_min_profit_ticks=1), TradingConfig())
+    state = build_state("50000", "50000")
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal("0.9999"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1"), size=Decimal("100000"))],
+        )
+    )
+    cl_ord_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": cl_ord_id,
+            "px": "1",
+            "fillPx": "1",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    decision = strategy.decide(state, RiskStatus(ok=True, reason="ok", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"))
+
+    assert decision.ask is not None
+    assert decision.ask.price == Decimal("1.0001")
+    assert decision.ask.quote_notional == Decimal("10001")
+
+
+def test_strategy_rebalance_sell_can_allow_flat_exit_when_profit_ticks_zero():
+    strategy = MicroMakerStrategy(StrategyConfig(rebalance_min_profit_ticks=0), TradingConfig())
+    state = build_state("50000", "50000")
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal("0.9999"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1"), size=Decimal("100000"))],
+        )
+    )
+    cl_ord_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": cl_ord_id,
+            "px": "1",
+            "fillPx": "1",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    decision = strategy.decide(state, RiskStatus(ok=True, reason="ok", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"))
+
+    assert decision.ask is not None
+    assert decision.ask.price == Decimal("1")

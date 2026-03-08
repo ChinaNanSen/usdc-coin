@@ -69,6 +69,7 @@ class StrategyConfig:
     mild_skew_size_factor: Decimal = Decimal("0.50")
     visible_depth_levels: int = 5
     min_visible_depth_multiplier: Decimal = Decimal("3")
+    rebalance_min_profit_ticks: int = 1
 
 
 @dataclass
