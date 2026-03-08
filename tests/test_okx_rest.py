@@ -383,6 +383,8 @@ def test_executor_treats_okx_51400_cancel_as_benign_terminal():
     assert cl_ord_id not in state.live_orders
     assert journal.events[-1][0] == "cancel_order_terminal"
     assert journal.events[-1][1]["okx"]["data"][0]["sCode"] == "51400"
+    assert journal.events[-1][1]["reason_zh"] == "公共行情重连清理"
+    assert "撤单时订单已终态" in journal.events[-1][1]["okx_zh"]
 
 
 def test_executor_caps_buy_size_by_available_quote_balance():
@@ -443,6 +445,88 @@ def test_executor_keeps_partially_filled_order_when_remaining_matches_target():
                 base_size=Decimal("6400"),
                 reason="rebalance_open_long",
             ),
+        )
+
+    asyncio.run(run())
+
+    assert rest.cancel_calls == []
+    assert cl_ord_id in state.live_orders
+
+
+def test_executor_keeps_buy_order_when_only_own_frozen_quote_makes_available_look_low():
+    state = make_state()
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("13008.69913"), available=Decimal("13008.69913")),
+            "USDT": Balance(ccy="USDT", total=Decimal("12004.728825776494"), available=Decimal("2004.728825776494"), frozen=Decimal("10000")),
+        }
+    )
+    config = BotConfig(mode="live")
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    cl_ord_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "buy-1",
+            "clOrdId": cl_ord_id,
+            "px": "1",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            OrderIntent(side="buy", price=Decimal("1"), quote_notional=Decimal("10000"), reason="join_best_bid"),
+        )
+
+    asyncio.run(run())
+
+    assert rest.cancel_calls == []
+    assert cl_ord_id in state.live_orders
+
+
+def test_executor_keeps_sell_order_when_only_own_frozen_base_makes_available_look_low():
+    state = make_state()
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("13008.69913"), available=Decimal("3009.699031"), frozen=Decimal("9999.000099")),
+            "USDT": Balance(ccy="USDT", total=Decimal("12004.728825776494"), available=Decimal("12004.728825776494")),
+        }
+    )
+    config = BotConfig(mode="live")
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    cl_ord_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "sell-1",
+            "clOrdId": cl_ord_id,
+            "px": "1.0001",
+            "sz": "9999.000099",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "sell",
+            OrderIntent(side="sell", price=Decimal("1.0001"), quote_notional=Decimal("10000"), reason="join_best_ask"),
         )
 
     asyncio.run(run())

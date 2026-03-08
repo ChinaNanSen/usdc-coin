@@ -99,7 +99,7 @@ def _render_run_section(sqlite_path: str, run_id: str, *, title: str) -> list[st
 
     for _, event, payload in events:
         if event == "cancel_order":
-            cancel_reasons[str(payload.get("reason") or "-")] += 1
+            cancel_reasons[str(payload.get("reason_zh") or _translate_reason(str(payload.get("reason") or "-")))] += 1
             continue
         if event == "decision":
             reason = ((payload.get("decision") or {}).get("reason")) or "-"
@@ -169,7 +169,7 @@ def _render_run_section(sqlite_path: str, run_id: str, *, title: str) -> list[st
     if roundtrip_pnl is None and (buy_count or sell_count):
         lines.append("- 说明: 当前只有单边成交，或买卖数量未配平，暂不把成交额差额当成利润")
     if cancel_reasons:
-        translated = "，".join(f"{_translate_reason(reason)} {count}" for reason, count in cancel_reasons.most_common())
+        translated = "，".join(f"{reason} {count}" for reason, count in cancel_reasons.most_common())
         lines.append(f"- 撤单主因: {translated}")
     if decision_reasons:
         translated = "，".join(f"{_translate_reason(reason)} {count}" for reason, count in decision_reasons.most_common(3))

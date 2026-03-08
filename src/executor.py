@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .audit_store import SQLiteAuditStore
 from .config import BotConfig
+from .log_labels import summarize_okx_error, translate_reason
 from .models import InstrumentMeta, LiveOrder, QuoteDecision, RiskStatus
 from .okx_rest import OKXAPIError, OKXRestClient
 from .state import BotState
@@ -119,9 +120,22 @@ class OrderExecutor:
                 await self._cancel_order(primary, reason="side_disabled")
             return
 
-        base_size = self._resolved_base_size_for_intent(side=side, intent=intent, instrument=self.state.instrument)
+        base_size = self._resolved_base_size_for_intent(
+            side=side,
+            intent=intent,
+            instrument=self.state.instrument,
+            existing_order=primary,
+        )
         if base_size < self.state.instrument.min_size:
-            self.journal.append("skip_order", {"side": side, "reason": "size_below_min", "base_size": base_size})
+            self.journal.append(
+                "skip_order",
+                {
+                    "side": side,
+                    "reason": "size_below_min",
+                    "reason_zh": translate_reason("size_below_min"),
+                    "base_size": base_size,
+                },
+            )
             return
 
         if primary:
@@ -184,11 +198,17 @@ class OrderExecutor:
             )
         except Exception as exc:
             self.state.record_place_result(False)
-            payload = {"side": side, "reason": str(exc)}
+            payload = {
+                "side": side,
+                "reason": str(exc),
+                "reason_zh": "下单失败",
+                "side_zh": "买单" if side == "buy" else "卖单",
+            }
             if isinstance(exc, OKXAPIError):
                 payload["okx"] = exc.to_dict()
+                payload["okx_zh"] = summarize_okx_error(payload["okx"])
             self.journal.append("place_order_error", payload)
-            logger.warning("Place order failed on %s: %s", side, payload)
+            logger.warning("下单失败 | %s | %s", payload["side_zh"], payload.get("okx_zh") or payload["reason"])
             return
 
         payload = {
@@ -214,7 +234,15 @@ class OrderExecutor:
         if self.config.mode == "shadow":
             if self.shadow_simulator:
                 self.shadow_simulator.on_order_canceled(order, reason=reason)
-            self.journal.append("shadow_cancel", {"side": order.side, "cl_ord_id": order.cl_ord_id, "reason": reason})
+            self.journal.append(
+                "shadow_cancel",
+                {
+                    "side": order.side,
+                    "cl_ord_id": order.cl_ord_id,
+                    "reason": reason,
+                    "reason_zh": translate_reason(reason),
+                },
+            )
             self.state.live_orders.pop(order.cl_ord_id, None)
             self.state.record_cancel_result(True)
             self._last_action_by_side[order.side] = now_ms()
@@ -227,29 +255,46 @@ class OrderExecutor:
                     "cl_ord_id": order.cl_ord_id,
                     "ord_id": order.ord_id,
                     "reason": reason,
+                    "reason_zh": translate_reason(reason),
                     "error": str(exc),
                 }
                 if isinstance(exc, OKXAPIError):
                     payload["okx"] = exc.to_dict()
+                    payload["okx_zh"] = summarize_okx_error(payload["okx"])
                 self.state.live_orders.pop(order.cl_ord_id, None)
                 self.state.record_cancel_result(True)
                 self.journal.append("cancel_order_terminal", payload)
-                logger.info("Cancel became no-op because order is already terminal on %s: %s", order.cl_ord_id, payload)
+                logger.info("撤单已无须执行 | %s | %s", translate_reason(reason), payload.get("okx_zh") or payload["error"])
                 self._last_action_by_side[order.side] = now_ms()
                 return
             self.state.record_cancel_result(False)
-            payload = {"cl_ord_id": order.cl_ord_id, "ord_id": order.ord_id, "reason": reason, "error": str(exc)}
+            payload = {
+                "cl_ord_id": order.cl_ord_id,
+                "ord_id": order.ord_id,
+                "reason": reason,
+                "reason_zh": translate_reason(reason),
+                "error": str(exc),
+            }
             if isinstance(exc, OKXAPIError):
                 payload["okx"] = exc.to_dict()
+                payload["okx_zh"] = summarize_okx_error(payload["okx"])
             self.journal.append(
                 "cancel_order_error",
                 payload,
             )
-            logger.warning("Cancel order failed on %s: %s", order.cl_ord_id, payload)
+            logger.warning("撤单失败 | %s | %s", translate_reason(reason), payload.get("okx_zh") or payload["error"])
             return
         self.state.live_orders.pop(order.cl_ord_id, None)
         self.state.record_cancel_result(True)
-        self.journal.append("cancel_order", {"cl_ord_id": order.cl_ord_id, "ord_id": order.ord_id, "reason": reason})
+        self.journal.append(
+            "cancel_order",
+            {
+                "cl_ord_id": order.cl_ord_id,
+                "ord_id": order.ord_id,
+                "reason": reason,
+                "reason_zh": translate_reason(reason),
+            },
+        )
         self._last_action_by_side[order.side] = now_ms()
 
     def _cooldown_ok(self, side: str) -> bool:
@@ -279,24 +324,50 @@ class OrderExecutor:
             return False
         return found_terminal
 
-    def _resolved_base_size_for_intent(self, *, side: str, intent, instrument: InstrumentMeta) -> Decimal:
+    def _resolved_base_size_for_intent(self, *, side: str, intent, instrument: InstrumentMeta, existing_order: LiveOrder | None = None) -> Decimal:
         if intent.base_size is not None:
             desired = quantize_down(intent.base_size, instrument.lot_size)
         else:
             desired = self._base_size_for_intent(intent.price, intent.quote_notional, instrument)
-        max_placeable = self._max_placeable_base_size(side=side, price=intent.price, instrument=instrument)
+        max_placeable = self._max_placeable_base_size(
+            side=side,
+            price=intent.price,
+            instrument=instrument,
+            existing_order=existing_order,
+        )
         return min(desired, max_placeable)
 
-    def _max_placeable_base_size(self, *, side: str, price: Decimal, instrument: InstrumentMeta) -> Decimal:
+    def _max_placeable_base_size(
+        self,
+        *,
+        side: str,
+        price: Decimal,
+        instrument: InstrumentMeta,
+        existing_order: LiveOrder | None = None,
+    ) -> Decimal:
         if not self.state.instrument:
             return Decimal("0")
         if side == "buy":
-            free_quote = self.state.free_balance(self.state.instrument.quote_ccy) - self.config.risk.min_free_quote_buffer
+            reusable_quote = Decimal("0")
+            if existing_order and existing_order.side == "buy":
+                reusable_quote = existing_order.remaining_size * existing_order.price
+            free_quote = (
+                self.state.free_balance(self.state.instrument.quote_ccy)
+                + reusable_quote
+                - self.config.risk.min_free_quote_buffer
+            )
             if free_quote <= 0:
                 return Decimal("0")
             return quantize_down(free_quote / price, instrument.lot_size)
         if side == "sell":
-            free_base = self.state.free_balance(self.state.instrument.base_ccy) - self.config.risk.min_free_base_buffer
+            reusable_base = Decimal("0")
+            if existing_order and existing_order.side == "sell":
+                reusable_base = existing_order.remaining_size
+            free_base = (
+                self.state.free_balance(self.state.instrument.base_ccy)
+                + reusable_base
+                - self.config.risk.min_free_base_buffer
+            )
             if free_base <= 0:
                 return Decimal("0")
             return quantize_down(free_base, instrument.lot_size)

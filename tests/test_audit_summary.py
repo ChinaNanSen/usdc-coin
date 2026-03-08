@@ -46,7 +46,7 @@ def test_render_audit_summary_outputs_chinese_sections(tmp_path):
         payload={"order": {"cl_ord_id": "sell1", "side": "sell", "price": "1", "filled_size": "10000", "state": "filled"}},
         run_id="run-fill",
     )
-    store.append_event(ts_ms=1600, event="cancel_order", payload={"reason": "reprice_or_ttl"}, run_id="run-fill")
+    store.append_event(ts_ms=1600, event="cancel_order", payload={"reason": "reprice_or_ttl", "reason_zh": "改价或超时重挂"}, run_id="run-fill")
     store.append_event(
         ts_ms=2000,
         event="decision",
@@ -54,7 +54,7 @@ def test_render_audit_summary_outputs_chinese_sections(tmp_path):
         run_id="run-latest",
     )
     store.append_event(ts_ms=2100, event="place_order", payload={"clOrdId": "latest-buy"}, run_id="run-latest")
-    store.append_event(ts_ms=2200, event="cancel_order", payload={"reason": "shutdown"}, run_id="run-latest")
+    store.append_event(ts_ms=2200, event="cancel_order", payload={"reason": "shutdown", "reason_zh": "程序关闭"}, run_id="run-latest")
     store.close()
 
     snapshot_path.write_text(
@@ -92,4 +92,4 @@ def test_render_audit_summary_outputs_chinese_sections(tmp_path):
     assert "最新运行" in text
     assert "最近一次有成交的运行" in text
     assert "往返价差毛收益估算(U)=0" in text
-    assert "撤单主因: 超时或需要重挂 1" in text
+    assert "撤单主因: 改价或超时重挂 1" in text
