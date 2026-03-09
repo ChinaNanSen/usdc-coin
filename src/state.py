@@ -134,9 +134,14 @@ class BotState:
         self._init_nav_if_possible()
 
     def replace_live_orders(self, payloads: list[dict], *, source: str = "rest_sync") -> None:
-        self.live_orders = {}
+        seen: set[str] = set()
         for payload in payloads:
+            cl_ord_id = payload.get("clOrdId") or payload.get("ordId") or ""
+            seen.add(str(cl_ord_id))
             self.apply_order_update(payload, source=source)
+        for cl_ord_id in list(self.live_orders.keys()):
+            if cl_ord_id not in seen:
+                self.live_orders.pop(cl_ord_id, None)
 
     def apply_order_update(self, payload: dict, *, source: str = "ws") -> LiveOrder:
         cl_ord_id = payload.get("clOrdId") or payload.get("ordId") or ""
