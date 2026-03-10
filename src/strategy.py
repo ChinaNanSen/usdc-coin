@@ -5,7 +5,7 @@ from decimal import Decimal
 from .config import StrategyConfig, TradingConfig
 from .models import OrderIntent, QuoteDecision, RiskStatus
 from .state import BotState
-from .utils import quantize_up
+from .utils import quantize_down, quantize_up
 
 
 class MicroMakerStrategy:
@@ -77,6 +77,9 @@ class MicroMakerStrategy:
                 bid_price = state.book.best_bid.price
                 if buy_price_cap is not None:
                     bid_price = min(bid_price, buy_price_cap)
+                hard_buy_cap = self._buy_price_cap(state=state)
+                if hard_buy_cap is not None:
+                    bid_price = min(bid_price, hard_buy_cap)
                 bid = OrderIntent(
                     side="buy",
                     price=bid_price,
@@ -85,9 +88,13 @@ class MicroMakerStrategy:
                     base_size=rebalance_buy_base,
                 )
             else:
+                bid_price = state.book.best_bid.price
+                hard_buy_cap = self._buy_price_cap(state=state)
+                if hard_buy_cap is not None:
+                    bid_price = min(bid_price, hard_buy_cap)
                 bid = self._entry_intent(
                     side="buy",
-                    price=state.book.best_bid.price,
+                    price=bid_price,
                     base_size=bid_base_size,
                     quote_notional=bid_quote_size,
                     reason="join_best_bid",
@@ -102,6 +109,9 @@ class MicroMakerStrategy:
                 ask_price = state.book.best_ask.price
                 if sell_price_floor is not None:
                     ask_price = max(ask_price, sell_price_floor)
+                hard_sell_floor = self._sell_price_floor(state=state)
+                if hard_sell_floor is not None:
+                    ask_price = max(ask_price, hard_sell_floor)
                 ask = OrderIntent(
                     side="sell",
                     price=ask_price,
@@ -111,9 +121,9 @@ class MicroMakerStrategy:
                 )
             else:
                 ask_price = state.book.best_ask.price
-                normal_sell_floor = self._normal_sell_price_floor(state=state, allow_bid=allow_bid)
-                if normal_sell_floor is not None:
-                    ask_price = max(ask_price, normal_sell_floor)
+                sell_price_floor = self._sell_price_floor(state=state)
+                if sell_price_floor is not None:
+                    ask_price = max(ask_price, sell_price_floor)
                 ask = self._entry_intent(
                     side="sell",
                     price=ask_price,
@@ -138,9 +148,14 @@ class MicroMakerStrategy:
             depth += level.price * level.size
         return depth
 
-    def _normal_sell_price_floor(self, *, state: BotState, allow_bid: bool) -> Decimal | None:
-        if allow_bid:
+    def _buy_price_cap(self, *, state: BotState) -> Decimal | None:
+        if self.config.normal_buy_price_cap <= 0:
             return None
+        if not state.instrument:
+            return None
+        return quantize_down(self.config.normal_buy_price_cap, state.instrument.tick_size)
+
+    def _sell_price_floor(self, *, state: BotState) -> Decimal | None:
         if self.config.normal_sell_price_floor <= 0:
             return None
         if not state.instrument:

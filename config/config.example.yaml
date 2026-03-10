@@ -40,6 +40,8 @@ strategy:
   visible_depth_levels: 5
   min_visible_depth_multiplier: 3
   rebalance_min_profit_ticks: 1
+  normal_buy_price_cap: 1
+  normal_sell_price_floor: 1.0001
   preserve_entry_queue: true
   preserve_rebalance_queue: true
 

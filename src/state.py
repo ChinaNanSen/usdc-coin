@@ -169,6 +169,11 @@ class BotState:
             if fill_price > 0:
                 self.observed_fill_volume_quote += fill_delta * fill_price
                 if is_managed_cl_ord_id(cl_ord_id, self.managed_prefix):
+                    self._apply_live_fill_balance_effect(
+                        side=order.side,
+                        fill_size=fill_delta,
+                        fill_price=fill_price,
+                    )
                     self._record_live_fill(
                         side=order.side,
                         fill_size=fill_delta,
@@ -570,6 +575,37 @@ class BotState:
         order.cancel_requested = True
         order.updated_at_ms = now_ms()
 
+    def _apply_live_fill_balance_effect(self, *, side: str, fill_size: Decimal, fill_price: Decimal) -> None:
+        if fill_size <= 0 or fill_price <= 0 or not self.instrument or not self._has_balance_snapshot():
+            return
+
+        quote_amount = fill_size * fill_price
+        base_ccy = self.instrument.base_ccy
+        quote_ccy = self.instrument.quote_ccy
+
+        if side == "buy":
+            self._consume_balance(ccy=quote_ccy, amount=quote_amount)
+            self._adjust_balance(base_ccy, total_delta=fill_size, available_delta=fill_size)
+            return
+        if side == "sell":
+            self._consume_balance(ccy=base_ccy, amount=fill_size)
+            self._adjust_balance(quote_ccy, total_delta=quote_amount, available_delta=quote_amount)
+            return
+        raise ValueError(f"unsupported side for live fill balance effect: {side}")
+
+    def _consume_balance(self, *, ccy: str, amount: Decimal) -> None:
+        if amount <= 0:
+            return
+        current = self.balances.get(ccy, Balance(ccy=ccy, total=Decimal("0"), available=Decimal("0"), frozen=Decimal("0")))
+        consumed_frozen = min(current.frozen, amount)
+        consumed_available = amount - consumed_frozen
+        self._adjust_balance(
+            ccy,
+            total_delta=-amount,
+            available_delta=-consumed_available,
+            frozen_delta=-consumed_frozen,
+        )
+
     def _adjust_balance(
         self,
         ccy: str,
@@ -618,12 +654,6 @@ class BotState:
                 remaining -= matched
                 if lot.qty == 0:
                     self.live_position_lots.popleft()
-            if remaining > 0 and self.initial_external_base_inventory is not None:
-                restorable = self.initial_external_base_inventory - self.external_base_inventory_remaining
-                if restorable > 0:
-                    restored = min(remaining, restorable)
-                    self.external_base_inventory_remaining += restored
-                    remaining -= restored
             if remaining > 0:
                 self.live_position_lots.append(
                     StrategyLot(qty=remaining, price=fill_price, ts_ms=fill_ts_ms, cl_ord_id=cl_ord_id)
@@ -637,10 +667,6 @@ class BotState:
                 remaining -= matched
                 if lot.qty == 0:
                     self.live_position_lots.popleft()
-            if remaining > 0 and self.external_base_inventory_remaining > 0:
-                reduced = min(remaining, self.external_base_inventory_remaining)
-                self.external_base_inventory_remaining -= reduced
-                remaining -= reduced
             if remaining > 0:
                 self.live_position_lots.append(
                     StrategyLot(qty=-remaining, price=fill_price, ts_ms=fill_ts_ms, cl_ord_id=cl_ord_id)

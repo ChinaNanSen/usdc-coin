@@ -128,6 +128,100 @@ def test_live_pnl_tracks_realized_and_unrealized_from_managed_fills():
     assert state.last_trade.price == Decimal("1.0001")
 
 
+def test_managed_buy_fill_updates_local_balances_immediately():
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("50000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("40000"), frozen=Decimal("10000")),
+        }
+    )
+
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": buy_id,
+            "px": "1",
+            "fillPx": "1",
+            "sz": "10000",
+            "accFillSz": "4000",
+            "state": "partially_filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    assert state.total_balance("USDT") == Decimal("46000")
+    assert state.free_balance("USDT") == Decimal("40000")
+    assert state.balances["USDT"].frozen == Decimal("6000")
+    assert state.total_balance("USDC") == Decimal("54000")
+    assert state.free_balance("USDC") == Decimal("54000")
+
+
+def test_managed_sell_fill_consumes_frozen_base_before_available():
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("45000"), frozen=Decimal("5000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("50000")),
+        }
+    )
+
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": sell_id,
+            "px": "1.0001",
+            "fillPx": "1.0001",
+            "sz": "5000",
+            "accFillSz": "4000",
+            "state": "partially_filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    assert state.total_balance("USDC") == Decimal("46000")
+    assert state.free_balance("USDC") == Decimal("45000")
+    assert state.balances["USDC"].frozen == Decimal("1000")
+    assert state.total_balance("USDT") == Decimal("54000.4")
+    assert state.free_balance("USDT") == Decimal("54000.4")
+
+
 def test_load_persisted_accounting_restores_live_state(tmp_path):
     state_path = tmp_path / "state.json"
     state = BotState(managed_prefix="bot6", state_path=str(state_path))
