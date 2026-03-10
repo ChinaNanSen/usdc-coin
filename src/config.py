@@ -64,6 +64,7 @@ class TradingConfig:
 @dataclass
 class StrategyConfig:
     min_spread_ticks: int = 1
+    strict_alternating_sides: bool = False
     inventory_target_pct: Decimal = Decimal("0.50")
     inventory_soft_lower_pct: Decimal = Decimal("0.45")
     inventory_soft_upper_pct: Decimal = Decimal("0.55")
@@ -187,6 +188,21 @@ def _resolve_runtime_path(raw_path: str, *, config_path: Path) -> str:
     return str(preferred)
 
 
+def _telemetry_environment_label(*, mode: str, simulated: bool) -> str:
+    if mode == "shadow":
+        return "shadow"
+    return "sim" if simulated else "live"
+
+
+def _apply_environment_suffix(raw_path: str, *, mode: str, simulated: bool) -> str:
+    path = Path(raw_path)
+    env_suffix = f".{_telemetry_environment_label(mode=mode, simulated=simulated)}"
+    stem = path.stem
+    if stem.endswith(".shadow") or stem.endswith(".sim") or stem.endswith(".live"):
+        return str(path)
+    return str(path.with_name(f"{stem}{env_suffix}{path.suffix}"))
+
+
 def load_config(
     path: str | os.PathLike[str],
     mode_override: str | None = None,
@@ -213,6 +229,21 @@ def load_config(
 
     config.exchange.apply_env()
     config.exchange.apply_runtime_defaults()
+    config.telemetry.journal_path = _apply_environment_suffix(
+        config.telemetry.journal_path,
+        mode=config.mode,
+        simulated=config.exchange.simulated,
+    )
+    config.telemetry.sqlite_path = _apply_environment_suffix(
+        config.telemetry.sqlite_path,
+        mode=config.mode,
+        simulated=config.exchange.simulated,
+    )
+    config.telemetry.state_path = _apply_environment_suffix(
+        config.telemetry.state_path,
+        mode=config.mode,
+        simulated=config.exchange.simulated,
+    )
     if config.mode == "live" and validate_live_credentials:
         missing = [
             name

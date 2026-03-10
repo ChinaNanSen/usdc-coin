@@ -32,6 +32,7 @@ trading:
 
 strategy:
   min_spread_ticks: 1
+  strict_alternating_sides: true
   inventory_target_pct: 0.50
   inventory_soft_lower_pct: 0.45
   inventory_soft_upper_pct: 0.55

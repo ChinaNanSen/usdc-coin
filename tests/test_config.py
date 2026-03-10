@@ -47,6 +47,62 @@ telemetry:
     monkeypatch.chdir(tmp_path)
     config = load_config(config_path, validate_live_credentials=False)
 
-    assert Path(config.telemetry.journal_path) == data_dir / "journal.jsonl"
-    assert Path(config.telemetry.sqlite_path) == project_root.parent / "trend_bot_6" / "data" / "audit.db"
-    assert Path(config.telemetry.state_path) == data_dir / "state_snapshot.json"
+    assert Path(config.telemetry.journal_path) == data_dir / "journal.shadow.jsonl"
+    assert Path(config.telemetry.sqlite_path) == project_root.parent / "trend_bot_6" / "data" / "audit.shadow.db"
+    assert Path(config.telemetry.state_path) == data_dir / "state_snapshot.shadow.json"
+
+
+def test_live_mode_telemetry_paths_get_live_suffix(tmp_path, monkeypatch):
+    project_root = tmp_path / "trend_bot_6"
+    config_dir = project_root / "config"
+    data_dir = project_root / "data"
+    config_dir.mkdir(parents=True)
+    data_dir.mkdir(parents=True)
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        """
+mode: live
+exchange:
+  simulated: false
+  api_key: live_key
+  secret_key: live_secret
+  passphrase: live_pass
+telemetry:
+  journal_path: data/journal.jsonl
+  sqlite_path: trend_bot_6/data/audit.db
+  state_path: data/state_snapshot.json
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    config = load_config(config_path)
+
+    assert Path(config.telemetry.journal_path) == data_dir / "journal.live.jsonl"
+    assert Path(config.telemetry.sqlite_path) == project_root.parent / "trend_bot_6" / "data" / "audit.live.db"
+    assert Path(config.telemetry.state_path) == data_dir / "state_snapshot.live.json"
+
+
+def test_explicit_environment_suffix_is_preserved(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+mode: live
+exchange:
+  simulated: false
+  api_key: live_key
+  secret_key: live_secret
+  passphrase: live_pass
+telemetry:
+  journal_path: journal.live.jsonl
+  sqlite_path: audit.live.db
+  state_path: state_snapshot.live.json
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert Path(config.telemetry.journal_path).name == "journal.live.jsonl"
+    assert Path(config.telemetry.sqlite_path).name == "audit.live.db"
+    assert Path(config.telemetry.state_path).name == "state_snapshot.live.json"
