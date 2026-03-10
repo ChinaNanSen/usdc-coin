@@ -202,3 +202,53 @@ def test_status_panel_shows_live_realized_and_unrealized_pnl():
     assert "待回补仓位(USDC)=+10000" in text
     assert "成交后回补，只挂卖单" in text
     assert f"最近成交 | 方向=买 委托价=1 成交价=1 数量=10000 订单号={buy_id}" in text
+
+
+def test_status_panel_translates_strict_cycle_reasons():
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=10,
+            received_ms=10,
+            bids=[BookLevel(price=Decimal("1"), size=Decimal("1000"))],
+            asks=[BookLevel(price=Decimal("1.0001"), size=Decimal("1000"))],
+        )
+    )
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("10000"), available=Decimal("10000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000")),
+        }
+    )
+    state.runtime_state = "QUOTING"
+    state.runtime_reason = "strict_cycle_sell_only"
+
+    panel = TerminalStatusPanel(
+        config=TelemetryConfig(status_panel_enabled=True, status_panel_render_non_interactive=True),
+        mode="live",
+        simulated=True,
+    )
+    decision = QuoteDecision(
+        reason="strict_cycle_buy_only",
+        bid=OrderIntent(side="buy", price=Decimal("1"), quote_notional=Decimal("10000"), reason="join_best_bid"),
+        ask=None,
+    )
+    risk = RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=False)
+
+    text = panel.build_text(state=state, risk_status=risk, decision=decision)
+
+    assert "原因=严格交替：本轮只挂卖单" in text
+    assert "决策 | 原因=严格交替：本轮只挂买单" in text

@@ -93,3 +93,51 @@ def test_render_audit_summary_outputs_chinese_sections(tmp_path):
     assert "最近一次有成交的运行" in text
     assert "往返价差毛收益估算(U)=0" in text
     assert "撤单主因: 改价或超时重挂 1" in text
+
+
+def test_render_audit_summary_translates_strict_cycle_reasons(tmp_path):
+    db_path = tmp_path / "audit.db"
+    snapshot_path = tmp_path / "state_snapshot.json"
+
+    store = SQLiteAuditStore(str(db_path))
+    store.open()
+    store.append_event(
+        ts_ms=1000,
+        event="decision",
+        payload={"decision": {"reason": "strict_cycle_buy_only"}},
+        run_id="run-latest",
+    )
+    store.close()
+
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "instrument": {"base_ccy": "USDC", "quote_ccy": "USDT"},
+                "book": {
+                    "bids": [{"price": "1", "size": "1000"}],
+                    "asks": [{"price": "1.0001", "size": "1000"}],
+                },
+                "balances": {
+                    "USDC": {"total": "10000"},
+                    "USDT": {"total": "10000"},
+                },
+                "runtime_state": "QUOTING",
+                "runtime_reason": "strict_cycle_sell_only",
+                "initial_nav_quote": "20000",
+                "observed_fill_count": 0,
+                "observed_fill_volume_quote": "0",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    config = BotConfig(mode="live")
+    config.exchange.simulated = True
+    config.telemetry.sqlite_path = str(db_path)
+    config.telemetry.state_path = str(snapshot_path)
+
+    text = render_audit_summary(config)
+
+    assert "原因=严格交替：本轮只挂卖单" in text
+    assert "严格交替：本轮只挂买单 1" in text

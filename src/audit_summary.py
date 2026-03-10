@@ -295,6 +295,8 @@ def _translate_reason(value: str) -> str:
         "inventory_high_ask_only": "库存偏高，只挂卖单",
         "fill_rebalance_buy_only": "成交后回补，只挂买单",
         "fill_rebalance_sell_only": "成交后回补，只挂卖单",
+        "strict_cycle_buy_only": "严格交替：本轮只挂买单",
+        "strict_cycle_sell_only": "严格交替：本轮只挂卖单",
         "streams not ready": "流未就绪",
         "too many place failures": "下单失败次数过多",
         "too many reconnects in 5m": "5分钟内重连次数过多",

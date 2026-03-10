@@ -15,6 +15,8 @@ REASON_LABELS = {
     "join_best_ask": "挂卖一排队",
     "rebalance_open_long": "按已成交仓位回补卖出",
     "rebalance_open_short": "按已成交仓位回补买入",
+    "strict_cycle_buy_only": "严格交替：本轮只挂买单",
+    "strict_cycle_sell_only": "严格交替：本轮只挂卖单",
 }
 
 PLACE_ERROR_LABELS = {
