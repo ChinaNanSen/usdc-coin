@@ -54,16 +54,18 @@ class MicroMakerStrategy:
         ask_quote_size = quote_size
         bid_base_size = fixed_entry_base_size
         ask_base_size = fixed_entry_base_size
+        skew_high = False
+        skew_low = False
         if inventory_ratio is not None:
-            deviation = inventory_ratio - self.config.inventory_target_pct
-            if deviation >= self.config.mild_skew_threshold_pct:
-                bid_quote_size = quote_size * (Decimal("1") - self.config.mild_skew_size_factor)
+            skew_low, skew_high, size_multiplier = self._inventory_skew_profile(inventory_ratio=inventory_ratio)
+            if skew_high:
+                bid_quote_size = quote_size * size_multiplier
                 if bid_base_size is not None:
-                    bid_base_size *= Decimal("1") - self.config.mild_skew_size_factor
-            elif deviation <= -self.config.mild_skew_threshold_pct:
-                ask_quote_size = quote_size * (Decimal("1") - self.config.mild_skew_size_factor)
+                    bid_base_size *= size_multiplier
+            elif skew_low:
+                ask_quote_size = quote_size * size_multiplier
                 if ask_base_size is not None:
-                    ask_base_size *= Decimal("1") - self.config.mild_skew_size_factor
+                    ask_base_size *= size_multiplier
 
         allow_bid = risk_status.allow_bid
         allow_ask = risk_status.allow_ask
@@ -71,11 +73,6 @@ class MicroMakerStrategy:
             allow_ask = False
         if rebalance_sell_base > 0:
             allow_bid = False
-        if inventory_ratio is not None:
-            if inventory_ratio >= self.config.inventory_soft_upper_pct:
-                allow_bid = False
-            if inventory_ratio <= self.config.inventory_soft_lower_pct:
-                allow_ask = False
 
         bid = None
         ask = None
@@ -100,7 +97,12 @@ class MicroMakerStrategy:
                     base_size=rebalance_buy_base,
                 )
             else:
-                bid_price = state.book.best_bid.price
+                bid_price = self._entry_bid_price(
+                    state=state,
+                    spread_ticks=spread_ticks,
+                    skew_low=skew_low,
+                    skew_high=skew_high,
+                )
                 hard_buy_cap = self._buy_price_cap(state=state)
                 if hard_buy_cap is not None:
                     bid_price = min(bid_price, hard_buy_cap)
@@ -129,10 +131,15 @@ class MicroMakerStrategy:
                     base_size=rebalance_sell_base,
                 )
             else:
-                ask_price = state.book.best_ask.price
-                sell_price_floor = self._sell_price_floor(state=state)
-                if sell_price_floor is not None:
-                    ask_price = max(ask_price, sell_price_floor)
+                ask_price = self._entry_ask_price(
+                    state=state,
+                    spread_ticks=spread_ticks,
+                    skew_low=skew_low,
+                    skew_high=skew_high,
+                )
+                normal_sell_floor = self._normal_sell_price_floor(state=state, allow_bid=allow_bid)
+                if normal_sell_floor is not None:
+                    ask_price = max(ask_price, normal_sell_floor)
                 ask = self._entry_intent(
                     side="sell",
                     price=ask_price,
@@ -150,6 +157,30 @@ class MicroMakerStrategy:
             reason = risk_status.reason
 
         return QuoteDecision(reason=reason, bid=bid, ask=ask, inventory_ratio=inventory_ratio, spread_ticks=spread_ticks)
+
+    def _inventory_skew_profile(self, *, inventory_ratio: Decimal) -> tuple[bool, bool, Decimal]:
+        soft_lower = min(self.config.inventory_soft_lower_pct, self.config.inventory_target_pct)
+        soft_upper = max(self.config.inventory_soft_upper_pct, self.config.inventory_target_pct)
+        if soft_lower >= soft_upper:
+            deviation = inventory_ratio - self.config.inventory_target_pct
+            if deviation >= self.config.mild_skew_threshold_pct:
+                return False, True, Decimal("1") - self.config.mild_skew_size_factor
+            if deviation <= -self.config.mild_skew_threshold_pct:
+                return True, False, Decimal("1") - self.config.mild_skew_size_factor
+            return False, False, Decimal("1")
+
+        ramp_width = max(self.config.mild_skew_threshold_pct, Decimal("0"))
+        if inventory_ratio > soft_upper:
+            overflow = inventory_ratio - soft_upper
+            skew_progress = Decimal("1") if ramp_width <= 0 else min(overflow / ramp_width, Decimal("1"))
+            reduction = self.config.mild_skew_size_factor * skew_progress
+            return False, True, Decimal("1") - reduction
+        if inventory_ratio < soft_lower:
+            underflow = soft_lower - inventory_ratio
+            skew_progress = Decimal("1") if ramp_width <= 0 else min(underflow / ramp_width, Decimal("1"))
+            reduction = self.config.mild_skew_size_factor * skew_progress
+            return True, False, Decimal("1") - reduction
+        return False, False, Decimal("1")
 
     def _decide_strict_cycle(
         self,
@@ -288,12 +319,54 @@ class MicroMakerStrategy:
             return None
         return quantize_down(self.config.normal_buy_price_cap, state.instrument.tick_size)
 
+    def _normal_sell_price_floor(self, *, state: BotState, allow_bid: bool) -> Decimal | None:
+        if allow_bid:
+            return None
+        return self._sell_price_floor(state=state)
+
+    def _entry_bid_price(
+        self,
+        *,
+        state: BotState,
+        spread_ticks: Decimal,
+        skew_low: bool,
+        skew_high: bool,
+    ) -> Decimal:
+        bid_price = state.book.best_bid.price
+        tick_size = state.instrument.tick_size
+        if skew_high:
+            passive_pull = bid_price - tick_size
+            return quantize_down(max(passive_pull, tick_size), tick_size)
+        if skew_low and spread_ticks > Decimal(self.config.min_spread_ticks):
+            improved = bid_price + tick_size
+            if improved < state.book.best_ask.price:
+                return quantize_down(improved, tick_size)
+        return bid_price
+
     def _sell_price_floor(self, *, state: BotState) -> Decimal | None:
         if self.config.normal_sell_price_floor <= 0:
             return None
         if not state.instrument:
             return None
         return quantize_up(self.config.normal_sell_price_floor, state.instrument.tick_size)
+
+    def _entry_ask_price(
+        self,
+        *,
+        state: BotState,
+        spread_ticks: Decimal,
+        skew_low: bool,
+        skew_high: bool,
+    ) -> Decimal:
+        ask_price = state.book.best_ask.price
+        tick_size = state.instrument.tick_size
+        if skew_low:
+            return quantize_up(ask_price + tick_size, tick_size)
+        if skew_high and spread_ticks > Decimal(self.config.min_spread_ticks):
+            improved = ask_price - tick_size
+            if improved > state.book.best_bid.price:
+                return quantize_up(improved, tick_size)
+        return ask_price
 
     def _entry_base_size(self, *, state: BotState) -> Decimal | None:
         if self.trading.entry_base_size <= 0:

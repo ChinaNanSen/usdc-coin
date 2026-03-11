@@ -233,7 +233,7 @@ def test_strategy_inventory_high_normal_sell_respects_price_floor():
     assert decision.reason == "inventory_high_ask_only"
 
 
-def test_strategy_two_sided_quote_applies_sell_price_floor():
+def test_strategy_two_sided_quote_does_not_apply_sell_price_floor_while_bid_is_live():
     strategy = MicroMakerStrategy(
         StrategyConfig(normal_sell_price_floor=Decimal("1.0001")),
         TradingConfig(),
@@ -254,7 +254,7 @@ def test_strategy_two_sided_quote_applies_sell_price_floor():
 
     assert decision.bid is not None
     assert decision.ask is not None
-    assert decision.ask.price == Decimal("1.0001")
+    assert decision.ask.price == Decimal("0.9999")
 
 
 def test_strategy_two_sided_quote_applies_buy_price_cap():
@@ -293,14 +293,92 @@ def test_strategy_blocks_when_visible_depth_is_too_thin():
     assert "visible depth too thin" in decision.reason
 
 
-def test_strategy_uses_soft_band_to_disable_bid():
+def test_strategy_uses_soft_band_to_reduce_bid_and_keep_two_sided_quotes():
     strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig())
     decision = strategy.decide(
         build_state("70000", "30000"),
         RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
     )
-    assert decision.bid is None
+    assert decision.bid is not None
     assert decision.ask is not None
+    assert decision.bid.price == Decimal("0.9998")
+    assert decision.bid.quote_notional == Decimal("5000")
+    assert decision.reason == "two_sided"
+
+
+def test_strategy_keeps_full_two_sided_quotes_inside_configured_soft_band():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            inventory_soft_lower_pct=Decimal("0.40"),
+            inventory_soft_upper_pct=Decimal("0.60"),
+            mild_skew_threshold_pct=Decimal("0.03"),
+            mild_skew_size_factor=Decimal("0.50"),
+        ),
+        TradingConfig(),
+    )
+
+    decision = strategy.decide(
+        build_state("58000", "42000"),
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is not None
+    assert decision.ask is not None
+    assert decision.bid.price == Decimal("0.9999")
+    assert decision.bid.quote_notional == Decimal("10000")
+    assert decision.ask.price == Decimal("1.0000")
+    assert decision.ask.quote_notional == Decimal("10000")
+    assert decision.reason == "two_sided"
+
+
+def test_strategy_starts_reducing_bid_after_crossing_soft_upper_band():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            inventory_soft_lower_pct=Decimal("0.40"),
+            inventory_soft_upper_pct=Decimal("0.60"),
+            mild_skew_threshold_pct=Decimal("0.03"),
+            mild_skew_size_factor=Decimal("0.50"),
+        ),
+        TradingConfig(),
+    )
+
+    decision = strategy.decide(
+        build_state("63000", "37000"),
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is not None
+    assert decision.ask is not None
+    assert decision.bid.price == Decimal("0.9998")
+    assert Decimal("5000") < decision.bid.quote_notional < Decimal("5100")
+    assert decision.ask.price == Decimal("1.0000")
+    assert decision.ask.quote_notional == Decimal("10000")
+    assert decision.reason == "two_sided"
+
+
+def test_strategy_starts_reducing_ask_after_crossing_soft_lower_band():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            inventory_soft_lower_pct=Decimal("0.40"),
+            inventory_soft_upper_pct=Decimal("0.60"),
+            mild_skew_threshold_pct=Decimal("0.03"),
+            mild_skew_size_factor=Decimal("0.50"),
+        ),
+        TradingConfig(),
+    )
+
+    decision = strategy.decide(
+        build_state("37000", "63000"),
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is not None
+    assert decision.ask is not None
+    assert decision.bid.price == Decimal("0.9999")
+    assert decision.bid.quote_notional == Decimal("10000")
+    assert decision.ask.price == Decimal("1.0001")
+    assert decision.ask.quote_notional == Decimal("5000")
+    assert decision.reason == "two_sided"
 
 
 def test_strategy_uses_exact_fill_size_to_rebalance_open_long():

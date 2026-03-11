@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.bot import TrendBot6
 from src.config import BotConfig
+from src.models import BookLevel, BookSnapshot
 
 
 class StubJournal:
@@ -16,6 +17,15 @@ class StubJournal:
 
     def append(self, event: str, payload: dict) -> None:
         self.events.append((event, payload))
+
+
+def make_book(*, bid: str, ask: str, ts_ms: int) -> BookSnapshot:
+    return BookSnapshot(
+        ts_ms=ts_ms,
+        received_ms=ts_ms,
+        bids=[BookLevel(price=Decimal(bid), size=Decimal("100000"))],
+        asks=[BookLevel(price=Decimal(ask), size=Decimal("100000"))],
+    )
 
 
 def test_public_reconnect_resyncs_without_immediate_cancel(tmp_path):
@@ -93,3 +103,97 @@ def test_bot_restores_persisted_accounting_on_init(tmp_path):
         assert '"event": "state_restored"' in journal_text
     finally:
         bot.audit_store.close()
+
+
+def test_on_book_triggers_debounced_quote_cycle_when_top_price_changes(tmp_path):
+    config = BotConfig(mode="shadow")
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+    config.trading.book_requote_debounce_ms = 20
+
+    bot = TrendBot6(config)
+    calls: list[tuple[str, bool]] = []
+    bot.state.set_book(make_book(bid="1.0000", ask="1.0001", ts_ms=1))
+
+    async def fake_run_quote_cycle(*, trigger: str, include_maintenance: bool) -> None:
+        calls.append((trigger, include_maintenance))
+
+    bot._run_quote_cycle = fake_run_quote_cycle  # type: ignore[method-assign]
+
+    async def run() -> None:
+        await bot._on_book(make_book(bid="0.9999", ask="1.0000", ts_ms=2))
+        await asyncio.sleep(0.06)
+        await bot._stop_book_requote_worker()
+        await bot.rest.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        bot.audit_store.close()
+
+    assert calls == [("book_top_price_changed", False)]
+
+
+def test_on_book_debounce_coalesces_multiple_price_updates(tmp_path):
+    config = BotConfig(mode="shadow")
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+    config.trading.book_requote_debounce_ms = 20
+
+    bot = TrendBot6(config)
+    calls: list[tuple[str, bool]] = []
+    bot.state.set_book(make_book(bid="1.0000", ask="1.0001", ts_ms=1))
+
+    async def fake_run_quote_cycle(*, trigger: str, include_maintenance: bool) -> None:
+        calls.append((trigger, include_maintenance))
+
+    bot._run_quote_cycle = fake_run_quote_cycle  # type: ignore[method-assign]
+
+    async def run() -> None:
+        await bot._on_book(make_book(bid="0.9999", ask="1.0000", ts_ms=2))
+        await bot._on_book(make_book(bid="0.9998", ask="0.9999", ts_ms=3))
+        await asyncio.sleep(0.06)
+        await bot._stop_book_requote_worker()
+        await bot.rest.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        bot.audit_store.close()
+
+    assert calls == [("book_top_price_changed", False)]
+
+
+def test_on_book_ignores_same_top_prices(tmp_path):
+    config = BotConfig(mode="shadow")
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+    config.trading.book_requote_debounce_ms = 20
+
+    bot = TrendBot6(config)
+    calls: list[tuple[str, bool]] = []
+    bot.state.set_book(make_book(bid="1.0000", ask="1.0001", ts_ms=1))
+
+    async def fake_run_quote_cycle(*, trigger: str, include_maintenance: bool) -> None:
+        calls.append((trigger, include_maintenance))
+
+    bot._run_quote_cycle = fake_run_quote_cycle  # type: ignore[method-assign]
+
+    async def run() -> None:
+        await bot._on_book(make_book(bid="1.0000", ask="1.0001", ts_ms=2))
+        await asyncio.sleep(0.06)
+        await bot._stop_book_requote_worker()
+        await bot.rest.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        bot.audit_store.close()
+
+    assert calls == []

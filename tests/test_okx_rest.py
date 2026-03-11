@@ -40,6 +40,20 @@ class FailingRest:
     async def cancel_order(self, **kwargs):
         return {}
 
+    async def amend_order(self, **kwargs):
+        raise OKXAPIError(
+            path="/api/v5/trade/amend-order",
+            code="51008",
+            msg="Insufficient balance",
+            data=[
+                {
+                    "sCode": "51008",
+                    "sMsg": "Insufficient USDT balance",
+                    "clOrdId": kwargs.get("cl_ord_id", ""),
+                }
+            ],
+        )
+
     async def list_pending_orders(self, **kwargs):
         return []
 
@@ -47,8 +61,13 @@ class FailingRest:
 class TrackingRest:
     def __init__(self):
         self.cancel_calls = []
+        self.amend_calls = []
 
     async def place_limit_order(self, **kwargs):
+        return {}
+
+    async def amend_order(self, **kwargs):
+        self.amend_calls.append(kwargs)
         return {}
 
     async def cancel_order(self, **kwargs):
@@ -67,11 +86,31 @@ class CapturingPlaceRest:
         self.place_calls.append(kwargs)
         return {}
 
+    async def amend_order(self, **kwargs):
+        return {}
+
     async def cancel_order(self, **kwargs):
         return {}
 
     async def list_pending_orders(self, **kwargs):
         return []
+
+
+class FailingAmendRest(TrackingRest):
+    async def amend_order(self, **kwargs):
+        self.amend_calls.append(kwargs)
+        raise OKXAPIError(
+            path="/api/v5/trade/amend-order",
+            code="51008",
+            msg="Amend rejected",
+            data=[
+                {
+                    "sCode": "51008",
+                    "sMsg": "Order amend failed",
+                    "clOrdId": kwargs.get("cl_ord_id", ""),
+                }
+            ],
+        )
 
 
 class AlreadyTerminalCancelRest:
@@ -176,6 +215,31 @@ def test_place_limit_order_raises_on_inner_scode():
                 price=Decimal("0.9999"),
                 size=Decimal("10000"),
                 cl_ord_id="bot6-buy-1",
+            )
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(run())
+        raised = False
+    except OKXAPIError as exc:
+        raised = True
+        assert exc.code == "51008"
+        assert "Insufficient USDT balance" in str(exc)
+    assert raised is True
+
+
+def test_amend_order_raises_on_inner_scode():
+    client = DummyTradeOrderClient(ExchangeConfig(api_key="k", secret_key="s", passphrase="p"))
+
+    async def run():
+        try:
+            await client.amend_order(
+                inst_id="USDC-USDT",
+                ord_id="123",
+                cl_ord_id="bot6-buy-1",
+                new_price=Decimal("1.0000"),
+                new_size=Decimal("10000"),
             )
         finally:
             await client.close()
@@ -492,7 +556,176 @@ def test_executor_preserves_entry_buy_queue_when_old_price_still_has_min_spread(
     assert buy_id in state.live_orders
 
 
-def test_executor_keeps_entry_buy_when_old_price_no_longer_matches_new_target():
+def test_executor_does_not_preserve_entry_buy_queue_when_inventory_high():
+    state = make_state()
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("70000"), available=Decimal("70000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("30000"), available=Decimal("30000")),
+        }
+    )
+    config = BotConfig(mode="live")
+    config.risk.min_free_quote_buffer = Decimal("0")
+    config.strategy.preserve_entry_queue = True
+    state.set_book(
+        state.book.__class__(
+            ts_ms=1,
+            received_ms=1,
+            bids=state.book.bids,
+            asks=[
+                state.book.asks[0].__class__(price=Decimal("1.0001"), size=Decimal("100000"), order_count=0),
+            ],
+        )
+    )
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "1",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            OrderIntent(side="buy", price=Decimal("0.9999"), quote_notional=Decimal("10000"), reason="join_best_bid"),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.amend_calls) == 1
+    assert rest.cancel_calls == []
+    assert buy_id in state.live_orders
+    assert state.live_orders[buy_id].price == Decimal("0.9999")
+
+
+def test_executor_preserves_entry_sell_queue_when_inventory_high():
+    state = make_state()
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("70000"), available=Decimal("70000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("30000"), available=Decimal("30000")),
+        }
+    )
+    config = BotConfig(mode="live")
+    config.risk.min_free_base_buffer = Decimal("0")
+    config.strategy.preserve_entry_queue = True
+    state.set_book(
+        state.book.__class__(
+            ts_ms=1,
+            received_ms=1,
+            bids=[
+                state.book.bids[0].__class__(price=Decimal("0.9999"), size=Decimal("100000"), order_count=0),
+            ],
+            asks=[
+                state.book.asks[0].__class__(price=Decimal("1.0001"), size=Decimal("100000"), order_count=0),
+            ],
+        )
+    )
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0000",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "sell",
+            OrderIntent(side="sell", price=Decimal("1.0001"), quote_notional=Decimal("10000"), reason="join_best_ask"),
+        )
+
+    asyncio.run(run())
+
+    assert rest.amend_calls == []
+    assert rest.cancel_calls == []
+    assert sell_id in state.live_orders
+    assert state.live_orders[sell_id].price == Decimal("1.0000")
+
+
+def test_executor_does_not_preserve_entry_sell_queue_when_inventory_low():
+    state = make_state()
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("30000"), available=Decimal("30000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("70000"), available=Decimal("70000")),
+        }
+    )
+    config = BotConfig(mode="live")
+    config.risk.min_free_base_buffer = Decimal("0")
+    config.strategy.preserve_entry_queue = True
+    state.set_book(
+        state.book.__class__(
+            ts_ms=1,
+            received_ms=1,
+            bids=[
+                state.book.bids[0].__class__(price=Decimal("0.9999"), size=Decimal("100000"), order_count=0),
+            ],
+            asks=[
+                state.book.asks[0].__class__(price=Decimal("1.0001"), size=Decimal("100000"), order_count=0),
+            ],
+        )
+    )
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0000",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "sell",
+            OrderIntent(side="sell", price=Decimal("1.0001"), quote_notional=Decimal("10000"), reason="join_best_ask"),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.amend_calls) == 1
+    assert rest.cancel_calls == []
+    assert sell_id in state.live_orders
+    assert state.live_orders[sell_id].price == Decimal("1.0001")
+
+
+def test_executor_amends_entry_buy_when_old_price_no_longer_matches_new_target():
     state = make_state()
     config = BotConfig(mode="live")
     config.risk.min_free_quote_buffer = Decimal("0")
@@ -537,12 +770,14 @@ def test_executor_keeps_entry_buy_when_old_price_no_longer_matches_new_target():
 
     asyncio.run(run())
 
+    assert len(rest.amend_calls) == 1
     assert rest.cancel_calls == []
     assert buy_id in state.live_orders
     assert state.live_orders[buy_id].cancel_requested is False
+    assert state.live_orders[buy_id].price == Decimal("0.9999")
 
 
-def test_executor_keeps_existing_rebalance_sell_when_target_price_moves_higher():
+def test_executor_reprices_existing_rebalance_sell_when_target_price_moves_higher():
     state = make_state()
     config = BotConfig(mode="live")
     config.risk.min_free_base_buffer = Decimal("0")
@@ -593,10 +828,150 @@ def test_executor_keeps_existing_rebalance_sell_when_target_price_moves_higher()
 
     asyncio.run(run())
 
+    assert len(rest.amend_calls) == 1
     assert rest.cancel_calls == []
-    assert state.consecutive_cancel_failures == 0
     assert sell_id in state.live_orders
     assert state.live_orders[sell_id].cancel_requested is False
+    assert state.live_orders[sell_id].price == Decimal("1.0001")
+
+
+def test_executor_reprices_existing_buy_when_target_moves_higher_for_dynamic_quote():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_quote_buffer = Decimal("0")
+    config.strategy.preserve_entry_queue = True
+    state.set_book(
+        state.book.__class__(
+            ts_ms=1,
+            received_ms=1,
+            bids=[
+                state.book.bids[0].__class__(price=Decimal("0.9999"), size=Decimal("100000"), order_count=0),
+            ],
+            asks=[
+                state.book.asks[0].__class__(price=Decimal("1.0001"), size=Decimal("100000"), order_count=0),
+            ],
+        )
+    )
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "0.9998",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            OrderIntent(side="buy", price=Decimal("0.9999"), quote_notional=Decimal("9999"), reason="join_best_bid"),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.amend_calls) == 1
+    assert rest.cancel_calls == []
+    assert buy_id in state.live_orders
+    assert state.live_orders[buy_id].cancel_requested is False
+    assert state.live_orders[buy_id].price == Decimal("0.9999")
+
+
+def test_executor_amends_partially_filled_sell_using_total_order_size():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_base_buffer = Decimal("0")
+    config.strategy.preserve_rebalance_queue = False
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0000",
+            "sz": "10000",
+            "accFillSz": "3600",
+            "state": "partially_filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "sell",
+            OrderIntent(
+                side="sell",
+                price=Decimal("1.0001"),
+                quote_notional=Decimal("5000.5"),
+                base_size=Decimal("5000"),
+                reason="rebalance_open_long",
+            ),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.amend_calls) == 1
+    assert rest.amend_calls[0]["new_size"] == Decimal("8600")
+    assert rest.cancel_calls == []
+    assert sell_id in state.live_orders
+    assert state.live_orders[sell_id].price == Decimal("1.0001")
+    assert state.live_orders[sell_id].size == Decimal("8600")
+    assert state.live_orders[sell_id].remaining_size == Decimal("5000")
+
+
+def test_executor_falls_back_to_cancel_when_amend_fails():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_quote_buffer = Decimal("0")
+    config.strategy.preserve_entry_queue = False
+    journal = StubJournal()
+    rest = FailingAmendRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "0.9998",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            OrderIntent(side="buy", price=Decimal("0.9999"), quote_notional=Decimal("9999"), reason="join_best_bid"),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.amend_calls) == 1
+    assert len(rest.cancel_calls) == 1
+    assert buy_id in state.live_orders
+    assert state.live_orders[buy_id].cancel_requested is True
 
 
 def test_executor_caps_buy_size_by_available_quote_balance():

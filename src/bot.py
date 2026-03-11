@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -72,6 +73,11 @@ class TrendBot6:
         self._last_balance_poll_ms = 0
         self._last_snapshot_ms = 0
         self._last_resync_attempt_ms = 0
+        self._quote_cycle_lock = asyncio.Lock()
+        self._book_requote_event = asyncio.Event()
+        self._book_requote_task: asyncio.Task | None = None
+        self._last_book_requote_signal_ms = 0
+        self._last_book_requote_reason = "book_top_price_changed"
 
     async def run(self) -> None:
         logger.info("Trend Bot 6 starting in [%s] mode", self.config.mode)
@@ -90,9 +96,11 @@ class TrendBot6:
                     )
                 await asyncio.sleep(self.config.trading.loop_interval_seconds)
         finally:
+            await self._stop_book_requote_worker()
             await self.shutdown()
 
     async def shutdown(self) -> None:
+        await self._stop_book_requote_worker()
         self.state.set_runtime_state("STOPPED", "shutdown")
         logger.info("Shutting down Trend Bot 6")
         if self.config.mode == "live" and self.config.risk.cancel_managed_orders_on_shutdown:
@@ -164,33 +172,39 @@ class TrendBot6:
             await self.private_stream.start()
 
     async def _tick(self) -> None:
-        await self._refresh_balances_if_due()
-        await self._refresh_instrument(force=False)
-        await self._refresh_fee(force=False)
-        await self._maybe_resync()
-        self.state.clear_pause_if_elapsed()
+        await self._run_quote_cycle(trigger="loop", include_maintenance=True)
 
-        risk_status = self.risk.evaluate(self.state)
-        decision = self.strategy.decide(self.state, risk_status)
-        self._update_runtime_state(risk_status, decision)
-        self.journal.append(
-            "decision",
-            {
-                "runtime_state": self.state.runtime_state,
-                "risk": risk_status,
-                "decision": decision,
-                "balances": self.state.balances,
-                "live_orders": self.state.live_orders,
-                "fee_snapshot": self.state.fee_snapshot,
-            },
-        )
-        await self.executor.reconcile(decision, risk_status=risk_status)
-        self.status_panel.maybe_render(state=self.state, risk_status=risk_status, decision=decision)
+    async def _run_quote_cycle(self, *, trigger: str, include_maintenance: bool) -> None:
+        async with self._quote_cycle_lock:
+            if include_maintenance:
+                await self._refresh_balances_if_due()
+                await self._refresh_instrument(force=False)
+                await self._refresh_fee(force=False)
+                await self._maybe_resync()
+            self.state.clear_pause_if_elapsed()
 
-        loop_ms = now_ms()
-        if loop_ms - self._last_snapshot_ms >= int(self.config.telemetry.snapshot_interval_seconds * 1000):
-            self.state.persist()
-            self._last_snapshot_ms = loop_ms
+            risk_status = self.risk.evaluate(self.state)
+            decision = self.strategy.decide(self.state, risk_status)
+            self._update_runtime_state(risk_status, decision)
+            self.journal.append(
+                "decision",
+                {
+                    "runtime_state": self.state.runtime_state,
+                    "trigger": trigger,
+                    "risk": risk_status,
+                    "decision": decision,
+                    "balances": self.state.balances,
+                    "live_orders": self.state.live_orders,
+                    "fee_snapshot": self.state.fee_snapshot,
+                },
+            )
+            await self.executor.reconcile(decision, risk_status=risk_status)
+            self.status_panel.maybe_render(state=self.state, risk_status=risk_status, decision=decision)
+
+            loop_ms = now_ms()
+            if include_maintenance and loop_ms - self._last_snapshot_ms >= int(self.config.telemetry.snapshot_interval_seconds * 1000):
+                self.state.persist()
+                self._last_snapshot_ms = loop_ms
 
     async def _refresh_balances_if_due(self) -> None:
         if self.config.mode != "live":
@@ -291,9 +305,13 @@ class TrendBot6:
         return False
 
     async def _on_book(self, book) -> None:
+        previous_book = self.state.book
         self.state.set_book(book)
         if self.shadow_simulator:
             await self.shadow_simulator.on_book(book)
+        reason = self._book_requote_reason(previous_book, book)
+        if reason:
+            self._signal_book_requote(reason)
 
     async def _on_trade(self, trade) -> None:
         self.state.set_last_market_trade(trade)
@@ -357,4 +375,69 @@ class TrendBot6:
                     "immediate_cancel": False,
                     "configured_cancel_on_public_reconnect": self.config.risk.cancel_managed_orders_on_public_reconnect,
                 },
+            )
+
+    def _book_requote_reason(self, previous_book, current_book) -> str | None:
+        if not self.config.trading.event_driven_requote:
+            return None
+        if previous_book is None:
+            return None
+
+        previous_best_bid = previous_book.best_bid.price if previous_book.best_bid else None
+        previous_best_ask = previous_book.best_ask.price if previous_book.best_ask else None
+        current_best_bid = current_book.best_bid.price if current_book.best_bid else None
+        current_best_ask = current_book.best_ask.price if current_book.best_ask else None
+
+        if previous_best_bid == current_best_bid and previous_best_ask == current_best_ask:
+            return None
+        return "book_top_price_changed"
+
+    def _signal_book_requote(self, reason: str) -> None:
+        if self.state.runtime_state == "STOPPED":
+            return
+        self._last_book_requote_reason = reason
+        self._last_book_requote_signal_ms = now_ms()
+        self._book_requote_event.set()
+        self._ensure_book_requote_worker()
+
+    def _ensure_book_requote_worker(self) -> None:
+        if self._book_requote_task and not self._book_requote_task.done():
+            return
+        self._book_requote_task = asyncio.create_task(self._book_requote_worker())
+
+    async def _stop_book_requote_worker(self) -> None:
+        if not self._book_requote_task:
+            return
+        self._book_requote_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._book_requote_task
+        self._book_requote_task = None
+        self._book_requote_event.clear()
+
+    async def _book_requote_worker(self) -> None:
+        try:
+            while self.state.runtime_state != "STOPPED":
+                await self._book_requote_event.wait()
+                while self.state.runtime_state != "STOPPED":
+                    due_ms = self._last_book_requote_signal_ms + self.config.trading.book_requote_debounce_ms
+                    delay_ms = due_ms - now_ms()
+                    if delay_ms > 0:
+                        await asyncio.sleep(delay_ms / 1000)
+                        continue
+
+                    observed_signal_ms = self._last_book_requote_signal_ms
+                    trigger = self._last_book_requote_reason
+                    self._book_requote_event.clear()
+                    await self._run_quote_cycle(trigger=trigger, include_maintenance=False)
+                    if observed_signal_ms == self._last_book_requote_signal_ms and not self._book_requote_event.is_set():
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Book reprice failed: %s", exc)
+            self.journal.append("book_requote_error", {"error": str(exc)})
+            self.state.request_resync(f"book reprice failure: {exc}")
+            self.state.set_pause(
+                reason=f"book reprice failure: {exc}",
+                duration_ms=int(self.config.risk.pause_after_reconnect_seconds * 1000),
             )

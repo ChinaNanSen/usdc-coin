@@ -39,6 +39,11 @@ class ShadowFillSimulator:
             },
         )
 
+    def on_order_amended(self, previous_order: LiveOrder, current_order: LiveOrder) -> None:
+        self.state.release_shadow_order(previous_order)
+        self.state.reserve_shadow_order(current_order)
+        current_order.queue_ahead_size = self._initial_queue_ahead(current_order, self.state.book)
+
     async def on_book(self, book: BookSnapshot) -> None:
         if self.config.update_queue_from_books:
             for order in list(self.state.bot_orders()):

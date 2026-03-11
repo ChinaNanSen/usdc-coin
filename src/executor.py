@@ -143,6 +143,13 @@ class OrderExecutor:
         if primary:
             if primary.cancel_requested:
                 return
+            if self._should_keep_existing_order(primary=primary, intent=intent, base_size=base_size):
+                return
+            if not self._cooldown_ok(side):
+                return
+            if await self._amend_order(primary=primary, intent=intent, base_size=base_size):
+                return
+            await self._cancel_order(primary, reason="reprice_or_ttl")
             return
 
         if not self._cooldown_ok(side):
@@ -221,6 +228,83 @@ class OrderExecutor:
         self.state.record_place_result(True)
         self.journal.append("place_order", payload)
         self._last_action_by_side[side] = now_ms()
+
+    async def _amend_order(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
+        amend_order = getattr(self.rest, "amend_order", None)
+        if self.config.mode != "shadow" and not callable(amend_order):
+            return False
+
+        new_total_size = primary.filled_size + base_size
+        update_payload = {
+            "instId": primary.inst_id,
+            "side": primary.side,
+            "ordId": primary.ord_id,
+            "clOrdId": primary.cl_ord_id,
+            "px": decimal_to_str(intent.price),
+            "sz": decimal_to_str(new_total_size),
+            "accFillSz": decimal_to_str(primary.filled_size),
+            "state": primary.state,
+            "cTime": str(primary.created_at_ms),
+            "uTime": str(now_ms()),
+        }
+        journal_payload = {
+            "cl_ord_id": primary.cl_ord_id,
+            "ord_id": primary.ord_id,
+            "side": primary.side,
+            "reason": intent.reason,
+            "old_price": primary.price,
+            "new_price": intent.price,
+            "old_size": primary.size,
+            "new_size": new_total_size,
+            "filled_size": primary.filled_size,
+            "old_remaining_size": primary.remaining_size,
+            "new_remaining_size": base_size,
+        }
+
+        if self.config.mode == "shadow":
+            amended_order = self.state.apply_order_update(update_payload, source="shadow_amend")
+            if self.shadow_simulator:
+                self.shadow_simulator.on_order_amended(primary, amended_order)
+            self.journal.append("shadow_amend_order", journal_payload)
+            self._last_action_by_side[primary.side] = now_ms()
+            return True
+
+        try:
+            response = await amend_order(
+                inst_id=primary.inst_id,
+                ord_id=primary.ord_id or None,
+                cl_ord_id=primary.cl_ord_id or None,
+                new_price=intent.price,
+                new_size=new_total_size,
+                cxl_on_fail=False,
+            )
+        except Exception as exc:
+            payload = {
+                "cl_ord_id": primary.cl_ord_id,
+                "ord_id": primary.ord_id,
+                "side": primary.side,
+                "reason": intent.reason,
+                "old_price": primary.price,
+                "new_price": intent.price,
+                "old_size": primary.size,
+                "new_size": new_total_size,
+                "error": str(exc),
+            }
+            if isinstance(exc, OKXAPIError):
+                payload["okx"] = exc.to_dict()
+                payload["okx_zh"] = summarize_okx_error(payload["okx"])
+            self.journal.append("amend_order_error", payload)
+            logger.warning("改单失败 | %s | %s", primary.side, payload.get("okx_zh") or payload["error"])
+            return False
+
+        if response.get("ordId"):
+            update_payload["ordId"] = str(response["ordId"])
+        if response.get("clOrdId"):
+            update_payload["clOrdId"] = str(response["clOrdId"])
+        self.state.apply_order_update(update_payload, source="rest_amend")
+        self.journal.append("amend_order", journal_payload)
+        self._last_action_by_side[primary.side] = now_ms()
+        return True
 
     async def _cancel_order(self, order: LiveOrder, *, reason: str) -> None:
         if not self._cooldown_ok(order.side):
@@ -306,6 +390,25 @@ class OrderExecutor:
             return True
         return False
 
+    def _should_keep_existing_order(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
+        if self._same_live_order_target(primary=primary, intent=intent, base_size=base_size):
+            return True
+        if self._should_preserve_partial_fill_with_same_price(primary=primary, intent=intent, base_size=base_size):
+            return True
+        if self._should_preserve_entry_queue(primary=primary, intent=intent, base_size=base_size):
+            return True
+        if self._should_preserve_rebalance_queue(primary=primary, intent=intent, base_size=base_size):
+            return True
+        return False
+
+    @staticmethod
+    def _same_live_order_target(*, primary: LiveOrder, intent, base_size: Decimal) -> bool:
+        if primary.side != intent.side:
+            return False
+        if primary.price != intent.price:
+            return False
+        return primary.remaining_size == base_size
+
     @staticmethod
     def _side_allowed_by_risk(side: str, risk_status: RiskStatus) -> bool:
         if side == "buy":
@@ -325,14 +428,18 @@ class OrderExecutor:
             return False
         return primary.remaining_size <= base_size
 
-    def _should_preserve_entry_queue(self, *, primary: LiveOrder, intent) -> bool:
+    def _should_preserve_entry_queue(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
         if not self.config.strategy.preserve_entry_queue:
             return False
         if not self.state.instrument or not self.state.book:
             return False
+        if not self._entry_queue_preserve_allowed(side=primary.side):
+            return False
         if primary.side != intent.side:
             return False
         if primary.remaining_size <= 0:
+            return False
+        if not self._entry_order_matches_requested_exposure(primary=primary, intent=intent, base_size=base_size):
             return False
         if intent.reason not in {"join_best_bid", "join_best_ask"}:
             return False
@@ -341,13 +448,38 @@ class OrderExecutor:
             best_ask = self.state.book.best_ask.price if self.state.book.best_ask else None
             if best_ask is None:
                 return False
+            if primary.price < intent.price:
+                return False
             return (best_ask - primary.price) >= min_spread
         if intent.reason == "join_best_ask":
             best_bid = self.state.book.best_bid.price if self.state.book.best_bid else None
             if best_bid is None:
                 return False
+            if primary.price > intent.price:
+                return False
             return (primary.price - best_bid) >= min_spread
         return False
+
+    def _entry_queue_preserve_allowed(self, *, side: str) -> bool:
+        inventory_ratio = self.state.inventory_ratio()
+        if inventory_ratio is None:
+            return True
+        soft_lower = min(self.config.strategy.inventory_soft_lower_pct, self.config.strategy.inventory_target_pct)
+        soft_upper = max(self.config.strategy.inventory_soft_upper_pct, self.config.strategy.inventory_target_pct)
+        if inventory_ratio > soft_upper and side == "buy":
+            return False
+        if inventory_ratio < soft_lower and side == "sell":
+            return False
+        return True
+
+    def _entry_order_matches_requested_exposure(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
+        if intent.base_size is not None:
+            return primary.remaining_size == base_size
+        if not self.state.instrument:
+            return False
+        tolerance = max(primary.price, intent.price) * self.state.instrument.lot_size
+        current_quote_notional = primary.remaining_size * primary.price
+        return abs(current_quote_notional - intent.quote_notional) <= tolerance
 
     def _should_preserve_rebalance_queue(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
         if not self.config.strategy.preserve_rebalance_queue:
@@ -364,7 +496,7 @@ class OrderExecutor:
             )
             if floor is None:
                 return False
-            return primary.side == "sell" and primary.price >= floor
+            return primary.side == "sell" and primary.price <= intent.price and primary.price >= floor
         if intent.reason == "rebalance_open_short":
             cap = self.state.max_rebalance_buy_price(
                 base_size,
@@ -373,7 +505,7 @@ class OrderExecutor:
             )
             if cap is None:
                 return False
-            return primary.side == "buy" and primary.price <= cap
+            return primary.side == "buy" and primary.price >= intent.price and primary.price <= cap
         return False
 
     @staticmethod

@@ -17,7 +17,7 @@ trading:
   base_ccy: USDC
   quote_ccy: USDT
   entry_base_size: 10000
-  post_only: false
+  post_only: true
   quote_size: 10000
   min_quote_size: 1000
   max_quote_size: 10000
@@ -25,24 +25,26 @@ trading:
   balance_poll_interval_seconds: 10.0
   order_ttl_seconds: 10.0
   cancel_on_ttl_expiry: false
-  action_cooldown_seconds: 1.0
+  action_cooldown_seconds: 0.2
+  event_driven_requote: true
+  book_requote_debounce_ms: 150
   bootstrap_depth: 5
   shadow_base_balance: 50000
   shadow_quote_balance: 50000
 
 strategy:
   min_spread_ticks: 1
-  strict_alternating_sides: true
+  strict_alternating_sides: false
   inventory_target_pct: 0.50
-  inventory_soft_lower_pct: 0.45
-  inventory_soft_upper_pct: 0.55
+  inventory_soft_lower_pct: 0.40
+  inventory_soft_upper_pct: 0.60
   mild_skew_threshold_pct: 0.03
   mild_skew_size_factor: 0.50
   visible_depth_levels: 5
   min_visible_depth_multiplier: 3
   rebalance_min_profit_ticks: 1
-  normal_buy_price_cap: 1
-  normal_sell_price_floor: 1.0001
+  normal_buy_price_cap: 0
+  normal_sell_price_floor: 0
   preserve_entry_queue: true
   preserve_rebalance_queue: true
 
@@ -58,8 +60,8 @@ risk:
   cancel_managed_orders_on_shutdown: true
   cancel_managed_orders_on_public_reconnect: false
   allow_emergency_ioc: false
-  hard_inventory_lower_pct: 0.35
-  hard_inventory_upper_pct: 0.65
+  hard_inventory_lower_pct: 0.25
+  hard_inventory_upper_pct: 0.75
   pause_after_reconnect_seconds: 5
   max_mid_deviation_bps: 20
   peg_reference_price: 1

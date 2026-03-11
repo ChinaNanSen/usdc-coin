@@ -55,7 +55,9 @@ class TradingConfig:
     balance_poll_interval_seconds: float = 10.0
     order_ttl_seconds: float = 8.0
     cancel_on_ttl_expiry: bool = False
-    action_cooldown_seconds: float = 1.0
+    action_cooldown_seconds: float = 0.2
+    event_driven_requote: bool = True
+    book_requote_debounce_ms: int = 150
     bootstrap_depth: int = 5
     shadow_base_balance: Decimal = Decimal("50000")
     shadow_quote_balance: Decimal = Decimal("50000")

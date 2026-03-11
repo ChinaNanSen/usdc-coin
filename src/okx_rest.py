@@ -240,6 +240,20 @@ class OKXRestClient:
             private=True,
         )
 
+    @staticmethod
+    def _require_trade_success(*, path: str, data: list[dict[str, Any]], empty_msg: str, failure_msg: str) -> dict[str, Any]:
+        if not data:
+            raise OKXAPIError(path=path, msg=empty_msg)
+        item = data[0]
+        if str(item.get("sCode") or "0") != "0":
+            raise OKXAPIError(
+                path=path,
+                code=str(item.get("sCode") or ""),
+                msg=str(item.get("sMsg") or failure_msg),
+                data=[item],
+            )
+        return item
+
     async def place_limit_order(
         self,
         *,
@@ -260,17 +274,40 @@ class OKXRestClient:
             "clOrdId": cl_ord_id,
         }
         data = await self._request("POST", "/api/v5/trade/order", json_body=payload, private=True)
-        if not data:
-            raise OKXAPIError(path="/api/v5/trade/order", msg="empty data")
-        item = data[0]
-        if str(item.get("sCode") or "0") != "0":
-            raise OKXAPIError(
-                path="/api/v5/trade/order",
-                code=str(item.get("sCode") or ""),
-                msg=str(item.get("sMsg") or "place order failed"),
-                data=[item],
-            )
-        return item
+        return self._require_trade_success(
+            path="/api/v5/trade/order",
+            data=data,
+            empty_msg="empty data",
+            failure_msg="place order failed",
+        )
+
+    async def amend_order(
+        self,
+        *,
+        inst_id: str,
+        new_price: Decimal,
+        new_size: Decimal,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        cxl_on_fail: bool = False,
+    ) -> dict[str, Any]:
+        payload = {
+            "instId": inst_id,
+            "newPx": str(new_price),
+            "newSz": str(new_size),
+            "cxlOnFail": str(cxl_on_fail).lower(),
+        }
+        if ord_id:
+            payload["ordId"] = ord_id
+        if cl_ord_id:
+            payload["clOrdId"] = cl_ord_id
+        data = await self._request("POST", "/api/v5/trade/amend-order", json_body=payload, private=True)
+        return self._require_trade_success(
+            path="/api/v5/trade/amend-order",
+            data=data,
+            empty_msg="empty data",
+            failure_msg="amend order failed",
+        )
 
     async def cancel_order(self, *, inst_id: str, ord_id: str | None = None, cl_ord_id: str | None = None) -> dict[str, Any]:
         payload = {"instId": inst_id}
@@ -279,14 +316,9 @@ class OKXRestClient:
         if cl_ord_id:
             payload["clOrdId"] = cl_ord_id
         data = await self._request("POST", "/api/v5/trade/cancel-order", json_body=payload, private=True)
-        if not data:
-            raise OKXAPIError(path="/api/v5/trade/cancel-order", msg="empty data")
-        item = data[0]
-        if str(item.get("sCode") or "0") != "0":
-            raise OKXAPIError(
-                path="/api/v5/trade/cancel-order",
-                code=str(item.get("sCode") or ""),
-                msg=str(item.get("sMsg") or "cancel order failed"),
-                data=[item],
-            )
-        return item
+        return self._require_trade_success(
+            path="/api/v5/trade/cancel-order",
+            data=data,
+            empty_msg="empty data",
+            failure_msg="cancel order failed",
+        )
