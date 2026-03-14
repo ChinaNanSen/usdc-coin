@@ -98,8 +98,8 @@ class TerminalStatusPanel:
             (
                 "决策 | "
                 f"原因={self._translate_reason(decision.reason)} "
-                f"买单={self._fmt_intent(decision.bid)} "
-                f"卖单={self._fmt_intent(decision.ask)}"
+                f"买单={self._fmt_intents(decision.bid_layers)} "
+                f"卖单={self._fmt_intents(decision.ask_layers)}"
             ),
             f"挂单 | {self._fmt_orders(state)}",
             f"最近成交 | {self._fmt_trade(state)}",
@@ -177,6 +177,11 @@ class TerminalStatusPanel:
             f"{self._translate_side(intent.side)}单 价格={self._fmt_dec(intent.price)} "
             f"目标金额={self._fmt_dec(intent.quote_notional)}U"
         )
+
+    def _fmt_intents(self, intents) -> str:
+        if not intents:
+            return "-"
+        return " | ".join(self._fmt_intent(intent) for intent in intents)
 
     @staticmethod
     def _fmt_dec(value: Decimal | None) -> str:

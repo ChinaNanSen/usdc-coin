@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any
+from typing import Any, Sequence
 
 
 ZERO = Decimal("0")
@@ -141,6 +141,8 @@ class StrategyLot:
     price: Decimal
     ts_ms: int
     cl_ord_id: str = ""
+    reference_best_bid: Decimal | None = None
+    reference_best_ask: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -157,8 +159,38 @@ class QuoteDecision:
     reason: str
     bid: OrderIntent | None = None
     ask: OrderIntent | None = None
+    bid_layers: tuple[OrderIntent, ...] = ()
+    ask_layers: tuple[OrderIntent, ...] = ()
     inventory_ratio: Decimal | None = None
     spread_ticks: Decimal = ZERO
+
+    def __post_init__(self) -> None:
+        bid_layers = self._normalize_layers(self.bid_layers, fallback=self.bid)
+        ask_layers = self._normalize_layers(self.ask_layers, fallback=self.ask)
+        object.__setattr__(self, "bid_layers", bid_layers)
+        object.__setattr__(self, "ask_layers", ask_layers)
+        object.__setattr__(self, "bid", bid_layers[0] if bid_layers else None)
+        object.__setattr__(self, "ask", ask_layers[0] if ask_layers else None)
+
+    @staticmethod
+    def _normalize_layers(
+        layers: Sequence[OrderIntent] | None,
+        *,
+        fallback: OrderIntent | None,
+    ) -> tuple[OrderIntent, ...]:
+        normalized = tuple(layer for layer in (layers or ()) if layer is not None)
+        if normalized:
+            return normalized
+        if fallback is None:
+            return ()
+        return (fallback,)
+
+    def intents_for_side(self, side: str) -> tuple[OrderIntent, ...]:
+        if side == "buy":
+            return self.bid_layers
+        if side == "sell":
+            return self.ask_layers
+        return ()
 
 
 @dataclass(frozen=True)
@@ -166,6 +198,7 @@ class ConsistencyReport:
     ok: bool
     reason: str
     cancel_managed: bool = False
+    offending_managed_orders: tuple[str, ...] = ()
     foreign_orders: tuple[str, ...] = ()
     managed_buy_orders: int = 0
     managed_sell_orders: int = 0

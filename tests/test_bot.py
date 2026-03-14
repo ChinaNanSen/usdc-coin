@@ -8,7 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.bot import TrendBot6
 from src.config import BotConfig
+from src.models import Balance, InstrumentMeta
 from src.models import BookLevel, BookSnapshot
+from src.utils import build_cl_ord_id
 
 
 class StubJournal:
@@ -103,6 +105,91 @@ def test_bot_restores_persisted_accounting_on_init(tmp_path):
         assert '"event": "state_restored"' in journal_text
     finally:
         bot.audit_store.close()
+
+
+def test_consistency_resync_cancels_only_offending_managed_orders(tmp_path):
+    config = BotConfig(mode="live")
+    config.risk.cancel_managed_on_consistency_failure = True
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+    selective_calls: list[tuple[tuple[str, ...], str]] = []
+    all_cancel_calls: list[str] = []
+
+    async def fake_cancel_managed_orders(*, cl_ord_ids, reason: str) -> None:
+        selective_calls.append((tuple(cl_ord_ids), reason))
+
+    async def fake_cancel_all_managed_orders(*, reason: str) -> None:
+        all_cancel_calls.append(reason)
+
+    bot.executor.cancel_managed_orders = fake_cancel_managed_orders  # type: ignore[method-assign]
+    bot.executor.cancel_all_managed_orders = fake_cancel_all_managed_orders  # type: ignore[method-assign]
+
+    bot.state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    bot.state.set_book(make_book(bid="0.9999", ask="1.0000", ts_ms=1))
+    bot.state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("50000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("50000")),
+        }
+    )
+
+    bad_sell_id = build_cl_ord_id("bot6", "sell")
+    good_buy_id = build_cl_ord_id("bot6", "buy")
+    bot.state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": bad_sell_id,
+            "px": "0.9999",
+            "sz": "1000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+    bot.state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "2",
+            "clOrdId": good_buy_id,
+            "px": "0.9998",
+            "sz": "1000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    try:
+        ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
+    finally:
+        bot.audit_store.close()
+
+    assert ok is False
+    assert selective_calls == [((bad_sell_id,), "consistency_failure:resync")]
+    assert all_cancel_calls == []
 
 
 def test_on_book_triggers_debounced_quote_cycle_when_top_price_changes(tmp_path):

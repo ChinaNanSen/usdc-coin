@@ -39,6 +39,8 @@ class StateConsistencyChecker:
         managed_sell_orders = 0
         pending_buy_notional = Decimal("0")
         pending_sell_size = Decimal("0")
+        offending_managed_orders: list[str] = []
+        offending_reasons: list[str] = []
 
         for order in state.live_orders.values():
             if order.inst_id != self.trading.inst_id:
@@ -62,16 +64,31 @@ class StateConsistencyChecker:
                     managed_buy_orders += 1
                     pending_buy_notional += remaining_size * order.price
                     if self.risk.require_passive_prices_on_resync and order.price >= book.best_ask.price:
-                        return ConsistencyReport(ok=False, reason=f"buy order crosses ask on resync: {order.cl_ord_id}", cancel_managed=True)
+                        offending_managed_orders.append(order.cl_ord_id or order.ord_id)
+                        offending_reasons.append(f"buy order crosses ask on resync: {order.cl_ord_id}")
                 elif order.side == "sell":
                     managed_sell_orders += 1
                     pending_sell_size += remaining_size
                     if self.risk.require_passive_prices_on_resync and order.price <= book.best_bid.price:
-                        return ConsistencyReport(ok=False, reason=f"sell order crosses bid on resync: {order.cl_ord_id}", cancel_managed=True)
+                        offending_managed_orders.append(order.cl_ord_id or order.ord_id)
+                        offending_reasons.append(f"sell order crosses bid on resync: {order.cl_ord_id}")
                 else:
                     return ConsistencyReport(ok=False, reason=f"unknown managed order side: {order.side}", cancel_managed=True)
             else:
                 foreign_orders.append(order.cl_ord_id or order.ord_id)
+
+        if offending_managed_orders:
+            return ConsistencyReport(
+                ok=False,
+                reason=offending_reasons[0],
+                cancel_managed=True,
+                offending_managed_orders=tuple(offending_managed_orders),
+                foreign_orders=tuple(foreign_orders),
+                managed_buy_orders=managed_buy_orders,
+                managed_sell_orders=managed_sell_orders,
+                pending_buy_notional=pending_buy_notional,
+                pending_sell_size=pending_sell_size,
+            )
 
         if managed_buy_orders > self.risk.max_managed_orders_per_side:
             return ConsistencyReport(

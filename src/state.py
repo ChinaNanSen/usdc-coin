@@ -385,6 +385,30 @@ class BotState:
             return -position
         return Decimal("0")
 
+    def oldest_rebalance_lot_age_ms(self, side: str, *, reference_ms: int | None = None) -> int | None:
+        if side == "sell":
+            lot_timestamps = [lot.ts_ms for lot in self.live_position_lots if lot.qty > 0 and lot.ts_ms >= 1_000_000_000_000]
+        elif side == "buy":
+            lot_timestamps = [lot.ts_ms for lot in self.live_position_lots if lot.qty < 0 and lot.ts_ms >= 1_000_000_000_000]
+        else:
+            return None
+        if not lot_timestamps:
+            return None
+        now_ref = reference_ms if reference_ms is not None else now_ms()
+        return max(now_ref - min(lot_timestamps), 0)
+
+    def oldest_rebalance_lot(self, side: str) -> StrategyLot | None:
+        candidates: list[StrategyLot]
+        if side == "sell":
+            candidates = [lot for lot in self.live_position_lots if lot.qty > 0 and lot.ts_ms >= 1_000_000_000_000]
+        elif side == "buy":
+            candidates = [lot for lot in self.live_position_lots if lot.qty < 0 and lot.ts_ms >= 1_000_000_000_000]
+        else:
+            return None
+        if not candidates:
+            return None
+        return min(candidates, key=lambda lot: lot.ts_ms)
+
     def min_rebalance_sell_price(self, base_size: Decimal, *, tick_size: Decimal, profit_ticks: int) -> Decimal | None:
         if base_size <= 0:
             return None
@@ -558,6 +582,8 @@ class BotState:
                 price=parse_decimal(value.get("price") or "0"),
                 ts_ms=int(value.get("ts_ms") or 0),
                 cl_ord_id=str(value.get("cl_ord_id") or ""),
+                reference_best_bid=BotState._optional_decimal(value.get("reference_best_bid")),
+                reference_best_ask=BotState._optional_decimal(value.get("reference_best_ask")),
             )
         except (TypeError, ValueError, ArithmeticError):
             return None
@@ -644,6 +670,9 @@ class BotState:
         if fill_size <= 0 or fill_price <= 0:
             return
 
+        reference_best_bid = self.book.best_bid.price if self.book and self.book.best_bid else None
+        reference_best_ask = self.book.best_ask.price if self.book and self.book.best_ask else None
+
         remaining = fill_size
         if side == "buy":
             while remaining > 0 and self.live_position_lots and self.live_position_lots[0].qty < 0:
@@ -656,7 +685,14 @@ class BotState:
                     self.live_position_lots.popleft()
             if remaining > 0:
                 self.live_position_lots.append(
-                    StrategyLot(qty=remaining, price=fill_price, ts_ms=fill_ts_ms, cl_ord_id=cl_ord_id)
+                    StrategyLot(
+                        qty=remaining,
+                        price=fill_price,
+                        ts_ms=fill_ts_ms,
+                        cl_ord_id=cl_ord_id,
+                        reference_best_bid=reference_best_bid,
+                        reference_best_ask=reference_best_ask,
+                    )
                 )
         elif side == "sell":
             while remaining > 0 and self.live_position_lots and self.live_position_lots[0].qty > 0:
@@ -669,7 +705,14 @@ class BotState:
                     self.live_position_lots.popleft()
             if remaining > 0:
                 self.live_position_lots.append(
-                    StrategyLot(qty=-remaining, price=fill_price, ts_ms=fill_ts_ms, cl_ord_id=cl_ord_id)
+                    StrategyLot(
+                        qty=-remaining,
+                        price=fill_price,
+                        ts_ms=fill_ts_ms,
+                        cl_ord_id=cl_ord_id,
+                        reference_best_bid=reference_best_bid,
+                        reference_best_ask=reference_best_ask,
+                    )
                 )
         else:
             raise ValueError(f"unsupported side for live fill: {side}")

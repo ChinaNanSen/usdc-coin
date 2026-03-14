@@ -5,13 +5,14 @@ from decimal import Decimal
 from .config import StrategyConfig, TradingConfig
 from .models import OrderIntent, QuoteDecision, RiskStatus
 from .state import BotState
-from .utils import quantize_down, quantize_up
+from .utils import now_ms, quantize_down, quantize_up
 
 
 class MicroMakerStrategy:
-    def __init__(self, config: StrategyConfig, trading: TradingConfig):
+    def __init__(self, config: StrategyConfig, trading: TradingConfig, max_orders_per_side: int = 1):
         self.config = config
         self.trading = trading
+        self.max_orders_per_side = max(int(max_orders_per_side), 1)
 
     def decide(self, state: BotState, risk_status: RiskStatus) -> QuoteDecision:
         if not risk_status.ok or not state.instrument or not state.book or not state.book.best_bid or not state.book.best_ask:
@@ -32,6 +33,16 @@ class MicroMakerStrategy:
             rebalance_buy_base * state.book.best_bid.price,
             rebalance_sell_base * state.book.best_ask.price,
         )
+        rebalance_profit_ticks = self._effective_rebalance_profit_ticks(
+            state=state,
+            rebalance_buy_base=rebalance_buy_base,
+            rebalance_sell_base=rebalance_sell_base,
+        )
+        inventory_repair_steps = self._inventory_repair_step_count(
+            state=state,
+            rebalance_buy_base=rebalance_buy_base,
+            rebalance_sell_base=rebalance_sell_base,
+        )
         min_visible_depth = rebalance_quote_ref * self.config.min_visible_depth_multiplier
         bid_depth = self._visible_depth_notional(state.book.bids)
         ask_depth = self._visible_depth_notional(state.book.asks)
@@ -48,6 +59,8 @@ class MicroMakerStrategy:
                 quote_size=quote_size,
                 rebalance_buy_base=rebalance_buy_base,
                 rebalance_sell_base=rebalance_sell_base,
+                rebalance_profit_ticks=rebalance_profit_ticks,
+                inventory_repair_steps=inventory_repair_steps,
             )
 
         bid_quote_size = quote_size
@@ -56,8 +69,15 @@ class MicroMakerStrategy:
         ask_base_size = fixed_entry_base_size
         skew_high = False
         skew_low = False
-        if inventory_ratio is not None:
-            skew_low, skew_high, size_multiplier = self._inventory_skew_profile(inventory_ratio=inventory_ratio)
+        skew_profile = self._bot_position_skew_profile(
+            state=state,
+            entry_base_size=fixed_entry_base_size,
+            quote_size=quote_size,
+        )
+        if skew_profile is None and inventory_ratio is not None:
+            skew_profile = self._inventory_skew_profile(inventory_ratio=inventory_ratio)
+        if skew_profile is not None:
+            skew_low, skew_high, size_multiplier = skew_profile
             if skew_high:
                 bid_quote_size = quote_size * size_multiplier
                 if bid_base_size is not None:
@@ -67,34 +87,29 @@ class MicroMakerStrategy:
                 if ask_base_size is not None:
                     ask_base_size *= size_multiplier
 
-        allow_bid = risk_status.allow_bid
-        allow_ask = risk_status.allow_ask
-        if rebalance_buy_base > 0:
-            allow_ask = False
-        if rebalance_sell_base > 0:
-            allow_bid = False
-
         bid = None
         ask = None
-        if allow_bid:
+        if risk_status.allow_bid:
             if rebalance_buy_base > 0:
-                buy_price_cap = state.max_rebalance_buy_price(
-                    rebalance_buy_base,
-                    tick_size=state.instrument.tick_size,
-                    profit_ticks=self.config.rebalance_min_profit_ticks,
+                bid_price = self._rebalance_bid_price(
+                    state=state,
+                    base_size=rebalance_buy_base,
+                    profit_ticks=rebalance_profit_ticks,
+                    inventory_repair_steps=inventory_repair_steps,
                 )
-                bid_price = state.book.best_bid.price
-                if buy_price_cap is not None:
-                    bid_price = min(bid_price, buy_price_cap)
-                hard_buy_cap = self._buy_price_cap(state=state)
-                if hard_buy_cap is not None:
-                    bid_price = min(bid_price, hard_buy_cap)
                 bid = OrderIntent(
                     side="buy",
                     price=bid_price,
                     quote_notional=rebalance_buy_base * bid_price,
                     reason="rebalance_open_short",
                     base_size=rebalance_buy_base,
+                )
+            elif rebalance_sell_base > 0:
+                bid = self._secondary_rebalance_bid_intent(
+                    state=state,
+                    base_size=bid_base_size,
+                    quote_notional=bid_quote_size,
+                    inventory_repair_steps=inventory_repair_steps,
                 )
             else:
                 bid_price = self._entry_bid_price(
@@ -113,22 +128,27 @@ class MicroMakerStrategy:
                     quote_notional=bid_quote_size,
                     reason="join_best_bid",
                 )
-        if allow_ask:
+        if risk_status.allow_ask:
             if rebalance_sell_base > 0:
-                sell_price_floor = state.min_rebalance_sell_price(
-                    rebalance_sell_base,
-                    tick_size=state.instrument.tick_size,
-                    profit_ticks=self.config.rebalance_min_profit_ticks,
+                ask_price = self._rebalance_ask_price(
+                    state=state,
+                    base_size=rebalance_sell_base,
+                    profit_ticks=rebalance_profit_ticks,
+                    inventory_repair_steps=inventory_repair_steps,
                 )
-                ask_price = state.book.best_ask.price
-                if sell_price_floor is not None:
-                    ask_price = max(ask_price, sell_price_floor)
                 ask = OrderIntent(
                     side="sell",
                     price=ask_price,
                     quote_notional=rebalance_sell_base * ask_price,
                     reason="rebalance_open_long",
                     base_size=rebalance_sell_base,
+                )
+            elif rebalance_buy_base > 0:
+                ask = self._secondary_rebalance_ask_intent(
+                    state=state,
+                    base_size=ask_base_size,
+                    quote_notional=ask_quote_size,
+                    inventory_repair_steps=inventory_repair_steps,
                 )
             else:
                 ask_price = self._entry_ask_price(
@@ -137,7 +157,7 @@ class MicroMakerStrategy:
                     skew_low=skew_low,
                     skew_high=skew_high,
                 )
-                normal_sell_floor = self._normal_sell_price_floor(state=state, allow_bid=allow_bid)
+                normal_sell_floor = self._normal_sell_price_floor(state=state, allow_bid=risk_status.allow_bid)
                 if normal_sell_floor is not None:
                     ask_price = max(ask_price, normal_sell_floor)
                 ask = self._entry_intent(
@@ -148,15 +168,29 @@ class MicroMakerStrategy:
                     reason="join_best_ask",
                 )
 
+        bid_layers = self._build_side_layers(primary=bid, state=state)
+        ask_layers = self._build_side_layers(primary=ask, state=state)
+
         reason = "two_sided"
-        if bid and not ask:
+        if bid and ask:
+            if rebalance_buy_base > 0:
+                reason = "fill_rebalance_buy_biased"
+            elif rebalance_sell_base > 0:
+                reason = "fill_rebalance_sell_biased"
+        elif bid and not ask:
             reason = "fill_rebalance_buy_only" if rebalance_buy_base > 0 else "inventory_low_bid_only"
         elif ask and not bid:
             reason = "fill_rebalance_sell_only" if rebalance_sell_base > 0 else "inventory_high_ask_only"
         elif not bid and not ask:
             reason = risk_status.reason
 
-        return QuoteDecision(reason=reason, bid=bid, ask=ask, inventory_ratio=inventory_ratio, spread_ticks=spread_ticks)
+        return QuoteDecision(
+            reason=reason,
+            bid_layers=bid_layers,
+            ask_layers=ask_layers,
+            inventory_ratio=inventory_ratio,
+            spread_ticks=spread_ticks,
+        )
 
     def _inventory_skew_profile(self, *, inventory_ratio: Decimal) -> tuple[bool, bool, Decimal]:
         soft_lower = min(self.config.inventory_soft_lower_pct, self.config.inventory_target_pct)
@@ -182,6 +216,32 @@ class MicroMakerStrategy:
             return True, False, Decimal("1") - reduction
         return False, False, Decimal("1")
 
+    def _bot_position_skew_profile(
+        self,
+        *,
+        state: BotState,
+        entry_base_size: Decimal | None,
+        quote_size: Decimal,
+    ) -> tuple[bool, bool, Decimal] | None:
+        if not state.instrument or not state.book or not state.book.mid:
+            return None
+        strategy_position = state.strategy_position_base()
+        if strategy_position == 0:
+            return None
+
+        reference_base_size = entry_base_size
+        if reference_base_size is None and quote_size > 0:
+            reference_base_size = quantize_down(quote_size / state.book.mid, state.instrument.lot_size)
+        if reference_base_size is None or reference_base_size <= 0:
+            return None
+
+        skew_progress = min(abs(strategy_position) / reference_base_size, Decimal("1"))
+        reduction = self.config.mild_skew_size_factor * skew_progress
+        size_multiplier = max(Decimal("0"), Decimal("1") - reduction)
+        if strategy_position > 0:
+            return False, True, size_multiplier
+        return True, False, size_multiplier
+
     def _decide_strict_cycle(
         self,
         *,
@@ -193,6 +253,8 @@ class MicroMakerStrategy:
         quote_size: Decimal,
         rebalance_buy_base: Decimal,
         rebalance_sell_base: Decimal,
+        rebalance_profit_ticks: int,
+        inventory_repair_steps: int,
     ) -> QuoteDecision:
         target_side = self._strict_target_side(
             state=state,
@@ -207,17 +269,12 @@ class MicroMakerStrategy:
 
         if target_side == "buy" and risk_status.allow_bid:
             if rebalance_buy_base > 0:
-                buy_price_cap = state.max_rebalance_buy_price(
-                    rebalance_buy_base,
-                    tick_size=state.instrument.tick_size,
-                    profit_ticks=self.config.rebalance_min_profit_ticks,
+                bid_price = self._rebalance_bid_price(
+                    state=state,
+                    base_size=rebalance_buy_base,
+                    profit_ticks=rebalance_profit_ticks,
+                    inventory_repair_steps=inventory_repair_steps,
                 )
-                bid_price = state.book.best_bid.price
-                if buy_price_cap is not None:
-                    bid_price = min(bid_price, buy_price_cap)
-                hard_buy_cap = self._buy_price_cap(state=state)
-                if hard_buy_cap is not None:
-                    bid_price = min(bid_price, hard_buy_cap)
                 bid = OrderIntent(
                     side="buy",
                     price=bid_price,
@@ -240,14 +297,12 @@ class MicroMakerStrategy:
 
         if target_side == "sell" and risk_status.allow_ask:
             if rebalance_sell_base > 0:
-                sell_price_floor = state.min_rebalance_sell_price(
-                    rebalance_sell_base,
-                    tick_size=state.instrument.tick_size,
-                    profit_ticks=self.config.rebalance_min_profit_ticks,
+                ask_price = self._rebalance_ask_price(
+                    state=state,
+                    base_size=rebalance_sell_base,
+                    profit_ticks=rebalance_profit_ticks,
+                    inventory_repair_steps=inventory_repair_steps,
                 )
-                ask_price = state.book.best_ask.price
-                if sell_price_floor is not None:
-                    ask_price = max(ask_price, sell_price_floor)
                 ask = OrderIntent(
                     side="sell",
                     price=ask_price,
@@ -324,6 +379,57 @@ class MicroMakerStrategy:
             return None
         return self._sell_price_floor(state=state)
 
+    def _rebalance_bid_price(
+        self,
+        *,
+        state: BotState,
+        base_size: Decimal,
+        profit_ticks: int,
+        inventory_repair_steps: int = 0,
+    ) -> Decimal:
+        buy_price_cap = state.max_rebalance_buy_price(
+            base_size,
+            tick_size=state.instrument.tick_size,
+            profit_ticks=profit_ticks,
+        )
+        bid_price = state.book.best_bid.price
+        bid_price = self._apply_rebalance_buy_improvement(
+            state=state,
+            price=bid_price,
+            inventory_repair_steps=inventory_repair_steps,
+            allow_inside_spread=profit_ticks <= 0,
+        )
+        if buy_price_cap is not None:
+            bid_price = min(bid_price, buy_price_cap)
+        hard_buy_cap = self._buy_price_cap(state=state)
+        if hard_buy_cap is not None:
+            bid_price = min(bid_price, hard_buy_cap)
+        return quantize_down(bid_price, state.instrument.tick_size)
+
+    def _rebalance_ask_price(
+        self,
+        *,
+        state: BotState,
+        base_size: Decimal,
+        profit_ticks: int,
+        inventory_repair_steps: int = 0,
+    ) -> Decimal:
+        sell_price_floor = state.min_rebalance_sell_price(
+            base_size,
+            tick_size=state.instrument.tick_size,
+            profit_ticks=profit_ticks,
+        )
+        ask_price = state.book.best_ask.price
+        ask_price = self._apply_rebalance_sell_improvement(
+            state=state,
+            price=ask_price,
+            inventory_repair_steps=inventory_repair_steps,
+            allow_inside_spread=profit_ticks <= 0,
+        )
+        if sell_price_floor is not None:
+            ask_price = max(ask_price, sell_price_floor)
+        return quantize_up(ask_price, state.instrument.tick_size)
+
     def _entry_bid_price(
         self,
         *,
@@ -368,12 +474,293 @@ class MicroMakerStrategy:
                 return quantize_up(improved, tick_size)
         return ask_price
 
+    def _secondary_rebalance_bid_intent(
+        self,
+        *,
+        state: BotState,
+        base_size: Decimal | None,
+        quote_notional: Decimal,
+        inventory_repair_steps: int = 0,
+    ) -> OrderIntent | None:
+        tick_offset = max(self.config.rebalance_secondary_price_offset_ticks, 0)
+        tick_size = state.instrument.tick_size
+        bid_price = state.book.best_bid.price - tick_size * Decimal(tick_offset)
+        bid_price = quantize_down(max(bid_price, tick_size), tick_size)
+        hard_buy_cap = self._buy_price_cap(state=state)
+        if hard_buy_cap is not None:
+            bid_price = min(bid_price, hard_buy_cap)
+        return self._secondary_rebalance_intent(
+            state=state,
+            side="buy",
+            price=bid_price,
+            base_size=base_size,
+            quote_notional=quote_notional,
+            reason="rebalance_secondary_bid",
+            inventory_repair_steps=inventory_repair_steps,
+        )
+
+    def _secondary_rebalance_ask_intent(
+        self,
+        *,
+        state: BotState,
+        base_size: Decimal | None,
+        quote_notional: Decimal,
+        inventory_repair_steps: int = 0,
+    ) -> OrderIntent | None:
+        tick_offset = max(self.config.rebalance_secondary_price_offset_ticks, 0)
+        tick_size = state.instrument.tick_size
+        ask_price = state.book.best_ask.price + tick_size * Decimal(tick_offset)
+        ask_price = quantize_up(ask_price, tick_size)
+        return self._secondary_rebalance_intent(
+            state=state,
+            side="sell",
+            price=ask_price,
+            base_size=base_size,
+            quote_notional=quote_notional,
+            reason="rebalance_secondary_ask",
+            inventory_repair_steps=inventory_repair_steps,
+        )
+
+    def _secondary_rebalance_intent(
+        self,
+        *,
+        state: BotState,
+        side: str,
+        price: Decimal,
+        base_size: Decimal | None,
+        quote_notional: Decimal,
+        reason: str,
+        inventory_repair_steps: int = 0,
+    ) -> OrderIntent | None:
+        if not state.instrument or price <= 0:
+            return None
+        factor = self._secondary_rebalance_size_factor(inventory_repair_steps=inventory_repair_steps)
+        if factor <= 0:
+            return None
+
+        scaled_base_size: Decimal | None = None
+        scaled_quote_notional = quote_notional * factor
+        if base_size is not None:
+            scaled_base_size = quantize_down(base_size * factor, state.instrument.lot_size)
+            if scaled_base_size < state.instrument.min_size:
+                return None
+            scaled_quote_notional = scaled_base_size * price
+
+        projected_base_size = self._projected_base_size(
+            state=state,
+            price=price,
+            base_size=scaled_base_size,
+            quote_notional=scaled_quote_notional,
+        )
+        if projected_base_size is None:
+            return None
+
+        projected_ratio = self._projected_inventory_ratio(
+            state=state,
+            side=side,
+            base_size=projected_base_size,
+            price=price,
+        )
+        if projected_ratio is None:
+            return None
+        if side == "buy" and projected_ratio > self.config.inventory_target_pct:
+            return None
+        if side == "sell" and projected_ratio < self.config.inventory_target_pct:
+            return None
+
+        return self._entry_intent(
+            side=side,
+            price=price,
+            base_size=scaled_base_size,
+            quote_notional=scaled_quote_notional,
+            reason=reason,
+        )
+
     def _entry_base_size(self, *, state: BotState) -> Decimal | None:
         if self.trading.entry_base_size <= 0:
             return None
         if not state.instrument:
             return None
         return quantize_up(self.trading.entry_base_size, state.instrument.lot_size)
+
+    def _build_side_layers(self, *, primary: OrderIntent | None, state: BotState) -> tuple[OrderIntent, ...]:
+        if primary is None:
+            return ()
+        layers = [primary]
+        if self.max_orders_per_side > 1:
+            secondary = self._secondary_entry_layer(primary=primary, state=state)
+            if secondary is not None:
+                layers.append(secondary)
+        return tuple(layers[: self.max_orders_per_side])
+
+    def _secondary_entry_layer(self, *, primary: OrderIntent, state: BotState) -> OrderIntent | None:
+        if not state.instrument:
+            return None
+        tick_size = state.instrument.tick_size
+        if primary.reason == "join_best_bid":
+            layered_price = quantize_down(max(primary.price - tick_size, tick_size), tick_size)
+            hard_buy_cap = self._buy_price_cap(state=state)
+            if hard_buy_cap is not None:
+                layered_price = min(layered_price, hard_buy_cap)
+            if layered_price <= 0 or layered_price == primary.price:
+                return None
+            return self._entry_intent(
+                side="buy",
+                price=layered_price,
+                base_size=primary.base_size,
+                quote_notional=primary.quote_notional,
+                reason="join_second_bid",
+            )
+        if primary.reason == "join_best_ask":
+            layered_price = quantize_up(primary.price + tick_size, tick_size)
+            sell_floor = self._sell_price_floor(state=state)
+            if sell_floor is not None:
+                layered_price = max(layered_price, sell_floor)
+            if layered_price == primary.price:
+                return None
+            return self._entry_intent(
+                side="sell",
+                price=layered_price,
+                base_size=primary.base_size,
+                quote_notional=primary.quote_notional,
+                reason="join_second_ask",
+            )
+        return None
+
+    def _effective_rebalance_profit_ticks(
+        self,
+        *,
+        state: BotState,
+        rebalance_buy_base: Decimal,
+        rebalance_sell_base: Decimal,
+    ) -> int:
+        profit_ticks = max(self.config.rebalance_min_profit_ticks, 0)
+        if profit_ticks <= 0:
+            return 0
+        if rebalance_buy_base <= 0 and rebalance_sell_base <= 0:
+            return profit_ticks
+        timeout_ms = int(max(self.config.rebalance_reload_timeout_seconds, 0) * 1000)
+        if timeout_ms <= 0:
+            return profit_ticks
+        rebalance_side = "buy" if rebalance_buy_base > 0 else "sell"
+        lot_age_ms = state.oldest_rebalance_lot_age_ms(rebalance_side, reference_ms=now_ms())
+        if lot_age_ms is None or lot_age_ms < timeout_ms:
+            return profit_ticks
+        oldest_lot = state.oldest_rebalance_lot(rebalance_side)
+        if oldest_lot is None:
+            return profit_ticks
+        if not self._rebalance_reload_condition_changed(state=state, rebalance_side=rebalance_side, lot=oldest_lot):
+            return profit_ticks
+        return 0
+
+    @staticmethod
+    def _rebalance_reload_condition_changed(*, state: BotState, rebalance_side: str, lot) -> bool:
+        if not state.book or not state.book.best_bid or not state.book.best_ask:
+            return False
+        if lot.reference_best_bid is None or lot.reference_best_ask is None:
+            return False
+        if state.book.best_bid.price != lot.reference_best_bid:
+            return True
+        if state.book.best_ask.price != lot.reference_best_ask:
+            return True
+        return False
+
+    def _inventory_repair_step_count(
+        self,
+        *,
+        state: BotState,
+        rebalance_buy_base: Decimal,
+        rebalance_sell_base: Decimal,
+    ) -> int:
+        step_ms = int(max(self.trading.order_ttl_seconds, 0) * 1000)
+        if step_ms <= 0:
+            return 0
+        if rebalance_buy_base > 0:
+            rebalance_side = "buy"
+        elif rebalance_sell_base > 0:
+            rebalance_side = "sell"
+        else:
+            return 0
+        lot_age_ms = state.oldest_rebalance_lot_age_ms(rebalance_side, reference_ms=now_ms())
+        if lot_age_ms is None or lot_age_ms < step_ms:
+            return 0
+        return int(lot_age_ms // step_ms)
+
+    def _secondary_rebalance_size_factor(self, *, inventory_repair_steps: int) -> Decimal:
+        factor = self.config.rebalance_secondary_size_factor
+        return factor
+
+    @staticmethod
+    def _available_passive_improvement_ticks(*, best_price: Decimal, opposite_price: Decimal, tick_size: Decimal) -> int:
+        if tick_size <= 0:
+            return 0
+        spread_ticks = int((opposite_price - best_price) / tick_size)
+        return max(spread_ticks - 1, 0)
+
+    def _apply_rebalance_buy_improvement(
+        self,
+        *,
+        state: BotState,
+        price: Decimal,
+        inventory_repair_steps: int,
+        allow_inside_spread: bool,
+    ) -> Decimal:
+        return price
+
+    def _apply_rebalance_sell_improvement(
+        self,
+        *,
+        state: BotState,
+        price: Decimal,
+        inventory_repair_steps: int,
+        allow_inside_spread: bool,
+    ) -> Decimal:
+        return price
+
+    @staticmethod
+    def _projected_base_size(
+        *,
+        state: BotState,
+        price: Decimal,
+        base_size: Decimal | None,
+        quote_notional: Decimal,
+    ) -> Decimal | None:
+        if not state.instrument or price <= 0:
+            return None
+        if base_size is not None:
+            return base_size
+        projected_base = quantize_down(quote_notional / price, state.instrument.lot_size)
+        if projected_base < state.instrument.min_size:
+            return None
+        return projected_base
+
+    def _projected_inventory_ratio(
+        self,
+        *,
+        state: BotState,
+        side: str,
+        base_size: Decimal,
+        price: Decimal,
+    ) -> Decimal | None:
+        if not state.instrument or not state.book or not state.book.mid:
+            return None
+        base_total = state.total_balance(state.instrument.base_ccy)
+        quote_total = state.total_balance(state.instrument.quote_ccy)
+        quote_delta = base_size * price
+        if side == "buy":
+            base_total += base_size
+            quote_total -= quote_delta
+        elif side == "sell":
+            base_total -= base_size
+            quote_total += quote_delta
+        else:
+            return None
+        if base_total < 0 or quote_total < 0:
+            return None
+        nav = base_total * state.book.mid + quote_total
+        if nav <= 0:
+            return None
+        return (base_total * state.book.mid) / nav
 
     @staticmethod
     def _tradable_rebalance_size(*, state: BotState, side: str) -> Decimal:

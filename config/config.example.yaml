@@ -43,6 +43,9 @@ strategy:
   visible_depth_levels: 5
   min_visible_depth_multiplier: 3
   rebalance_min_profit_ticks: 1
+  rebalance_reload_timeout_seconds: 180
+  rebalance_secondary_size_factor: 0.10
+  rebalance_secondary_price_offset_ticks: 1
   normal_buy_price_cap: 0
   normal_sell_price_floor: 0
   preserve_entry_queue: true
@@ -76,7 +79,7 @@ risk:
   enforce_effective_fee_gate: true
   max_effective_maker_fee_rate: 0
   max_effective_taker_fee_rate: 0
-  max_managed_orders_per_side: 1
+  max_managed_orders_per_side: 2
   max_consistency_failures: 3
   cancel_managed_on_consistency_failure: false
   balance_consistency_tolerance_quote: 1

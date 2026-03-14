@@ -94,6 +94,7 @@ def test_consistency_fails_when_managed_order_crosses_book():
     report = checker.check(state)
     assert report.ok is False
     assert "crosses ask" in report.reason
+    assert report.offending_managed_orders == (state.bot_orders("buy")[0].cl_ord_id,)
 
 
 def test_consistency_fails_when_pending_buy_exceeds_balance():

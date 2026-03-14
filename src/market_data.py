@@ -21,6 +21,9 @@ ErrorCallback = Callable[[str, Exception], Awaitable[None]]
 
 
 class PublicBookStream:
+    HEARTBEAT_INTERVAL_SECONDS = 20.0
+    RECV_TIMEOUT_SECONDS = 60.0
+
     def __init__(
         self,
         *,
@@ -65,9 +68,11 @@ class PublicBookStream:
 
     async def _run(self) -> None:
         while self.running:
+            heartbeat_task: asyncio.Task | None = None
             try:
                 async with websockets.connect(self.url, ping_interval=None, close_timeout=5) as ws:
                     self.ws = ws
+                    heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
                     if self._connected_once and self.on_reconnect:
                         await self.on_reconnect("public_books5")
                     self._connected_once = True
@@ -78,7 +83,7 @@ class PublicBookStream:
                     await self._emit_status(True)
                     while self.running:
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                            raw = await asyncio.wait_for(ws.recv(), timeout=self.RECV_TIMEOUT_SECONDS)
                         except asyncio.TimeoutError:
                             await ws.send("ping")
                             continue
@@ -122,6 +127,17 @@ class PublicBookStream:
                 await self._emit_status(False)
                 logger.warning("Public book stream reconnecting: %s", exc)
                 await asyncio.sleep(1)
+            finally:
+                if heartbeat_task:
+                    heartbeat_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await heartbeat_task
+                self.ws = None
+
+    async def _heartbeat_loop(self, ws) -> None:
+        while self.running:
+            await asyncio.sleep(self.HEARTBEAT_INTERVAL_SECONDS)
+            await ws.send("ping")
 
     async def _emit_status(self, connected: bool) -> None:
         if self.on_status:

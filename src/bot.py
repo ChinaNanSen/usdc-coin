@@ -45,7 +45,11 @@ class TrendBot6:
             self.journal.append("state_restored", restored_state)
         self.rest = OKXRestClient(config.exchange)
         self.risk = RiskManager(config.risk, config.trading, mode=config.mode)
-        self.strategy = MicroMakerStrategy(config.strategy, config.trading)
+        self.strategy = MicroMakerStrategy(
+            config.strategy,
+            config.trading,
+            max_orders_per_side=config.risk.max_managed_orders_per_side,
+        )
         self.shadow_simulator = (
             ShadowFillSimulator(state=self.state, trading=config.trading, config=config.shadow, journal=self.journal)
             if config.mode == "shadow"
@@ -291,7 +295,13 @@ class TrendBot6:
             return True
 
         if self.config.mode == "live" and report.cancel_managed and self.config.risk.cancel_managed_on_consistency_failure:
-            await self.executor.cancel_all_managed_orders(reason=f"consistency_failure:{context}")
+            if report.offending_managed_orders:
+                await self.executor.cancel_managed_orders(
+                    cl_ord_ids=report.offending_managed_orders,
+                    reason=f"consistency_failure:{context}",
+                )
+            else:
+                await self.executor.cancel_all_managed_orders(reason=f"consistency_failure:{context}")
 
         if stop_on_failure or self.state.consecutive_consistency_failures >= self.config.risk.max_consistency_failures:
             self.state.set_runtime_state("STOPPED", f"consistency failure: {report.reason}")

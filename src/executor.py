@@ -84,12 +84,21 @@ class OrderExecutor:
         await self._sync_pending_orders(fail_on_foreign=False, cancel_managed=False)
 
     async def reconcile(self, decision: QuoteDecision, risk_status: RiskStatus | None = None) -> None:
-        await self._reconcile_side("buy", decision.bid, risk_status=risk_status)
-        await self._reconcile_side("sell", decision.ask, risk_status=risk_status)
+        await self._reconcile_side("buy", decision.bid_layers, risk_status=risk_status)
+        await self._reconcile_side("sell", decision.ask_layers, risk_status=risk_status)
 
     async def cancel_all_managed_orders(self, *, reason: str) -> None:
         for order in list(self.state.bot_orders()):
-            await self._cancel_order(order, reason=reason)
+            await self._cancel_order(order, reason=reason, ignore_cooldown=True)
+
+    async def cancel_managed_orders(self, *, cl_ord_ids: tuple[str, ...] | list[str], reason: str) -> None:
+        for cl_ord_id in cl_ord_ids:
+            order = self.state.live_orders.get(cl_ord_id)
+            if order is None:
+                continue
+            if not is_managed_cl_ord_id(order.cl_ord_id, self.config.managed_prefix):
+                continue
+            await self._cancel_order(order, reason=reason, ignore_cooldown=True)
 
     async def _sync_pending_orders(self, *, fail_on_foreign: bool, cancel_managed: bool) -> None:
         orders = await self.rest.list_pending_orders(
@@ -107,50 +116,67 @@ class OrderExecutor:
         if cancel_managed:
             await self.cancel_all_managed_orders(reason="startup_cleanup")
 
-    async def _reconcile_side(self, side: str, intent, *, risk_status: RiskStatus | None = None) -> None:
+    async def _reconcile_side(self, side: str, intents, *, risk_status: RiskStatus | None = None) -> None:
         live_orders = self.state.bot_orders(side)
-        primary = live_orders[0] if live_orders else None
-        for extra in live_orders[1:]:
-            await self._cancel_order(extra, reason="duplicate_side_order")
+        targets = self._resolved_targets_for_side(side=side, intents=intents)
 
-        if intent is None:
-            if primary:
-                if primary.cancel_requested:
-                    return
-                if self._should_keep_order_without_intent(primary=primary, risk_status=risk_status):
-                    return
-                await self._cancel_order(primary, reason="side_disabled")
+        if not targets:
+            for order in live_orders:
+                if order.cancel_requested:
+                    continue
+                if self._should_keep_order_without_intent(primary=order, risk_status=risk_status):
+                    continue
+                await self._cancel_order(order, reason="side_disabled")
+                return
             return
 
-        base_size = self._resolved_base_size_for_intent(
-            side=side,
-            intent=intent,
-            instrument=self.state.instrument,
-            existing_order=primary,
-        )
-        if base_size < self.state.instrument.min_size:
-            self.journal.append(
-                "skip_order",
-                {
-                    "side": side,
-                    "reason": "size_below_min",
-                    "reason_zh": translate_reason("size_below_min"),
-                    "base_size": base_size,
-                },
+        unmatched_orders = list(live_orders)
+        unmatched_targets = list(targets)
+
+        remaining_targets: list[tuple[object, Decimal]] = []
+        for intent, base_size in unmatched_targets:
+            matched = self._pop_first_matching_order(
+                orders=unmatched_orders,
+                intent=intent,
+                base_size=base_size,
+                matcher=self._same_live_order_target,
             )
+            if matched is None:
+                remaining_targets.append((intent, base_size))
+        unmatched_targets = remaining_targets
+
+        remaining_targets = []
+        for intent, base_size in unmatched_targets:
+            matched = self._pop_first_matching_order(
+                orders=unmatched_orders,
+                intent=intent,
+                base_size=base_size,
+                matcher=self._should_keep_existing_order,
+            )
+            if matched is None:
+                remaining_targets.append((intent, base_size))
+        unmatched_targets = remaining_targets
+
+        if any(order.cancel_requested for order in unmatched_orders):
             return
 
-        if primary:
-            if primary.cancel_requested:
-                return
-            if self._should_keep_existing_order(primary=primary, intent=intent, base_size=base_size):
-                return
+        if unmatched_orders and unmatched_targets:
+            order = unmatched_orders[0]
+            intent, base_size = unmatched_targets[0]
             if not self._cooldown_ok(side):
                 return
-            if await self._amend_order(primary=primary, intent=intent, base_size=base_size):
+            if await self._amend_order(primary=order, intent=intent, base_size=base_size):
                 return
-            await self._cancel_order(primary, reason="reprice_or_ttl")
+            await self._cancel_order(order, reason="reprice_or_ttl")
             return
+
+        if unmatched_orders:
+            await self._cancel_order(unmatched_orders[0], reason="duplicate_side_order")
+            return
+
+        if not unmatched_targets:
+            return
+        intent, base_size = unmatched_targets[0]
 
         if not self._cooldown_ok(side):
             return
@@ -306,8 +332,8 @@ class OrderExecutor:
         self._last_action_by_side[primary.side] = now_ms()
         return True
 
-    async def _cancel_order(self, order: LiveOrder, *, reason: str) -> None:
-        if not self._cooldown_ok(order.side):
+    async def _cancel_order(self, order: LiveOrder, *, reason: str, ignore_cooldown: bool = False) -> None:
+        if not ignore_cooldown and not self._cooldown_ok(order.side):
             return
         if self.config.mode == "shadow":
             if self.shadow_simulator:
@@ -379,6 +405,94 @@ class OrderExecutor:
         last = self._last_action_by_side.get(side, 0)
         return (now_ms() - last) >= int(self.config.trading.action_cooldown_seconds * 1000)
 
+    def _normalize_side_intents(self, *, side: str, intents) -> list:
+        if intents is None:
+            return []
+        if isinstance(intents, (list, tuple)):
+            normalized = [intent for intent in intents if intent is not None and getattr(intent, "side", None) == side]
+        else:
+            normalized = [intents] if getattr(intents, "side", None) == side else []
+        max_orders = max(int(self.config.risk.max_managed_orders_per_side), 1)
+        return normalized[:max_orders]
+
+    def _resolved_targets_for_side(self, *, side: str, intents) -> list[tuple[object, Decimal]]:
+        instrument = self.state.instrument
+        if instrument is None:
+            return []
+
+        normalized = self._normalize_side_intents(side=side, intents=intents)
+        if not normalized:
+            return []
+
+        remaining_budget = self._available_side_budget(side=side, live_orders=self.state.bot_orders(side))
+        resolved: list[tuple[object, Decimal]] = []
+        for intent in normalized:
+            if intent.base_size is not None:
+                desired = quantize_down(intent.base_size, instrument.lot_size)
+            else:
+                desired = self._base_size_for_intent(intent.price, intent.quote_notional, instrument)
+            max_placeable = self._max_base_size_from_budget(
+                side=side,
+                price=intent.price,
+                instrument=instrument,
+                budget=remaining_budget,
+            )
+            base_size = min(desired, max_placeable)
+            if base_size < instrument.min_size:
+                self.journal.append(
+                    "skip_order",
+                    {
+                        "side": side,
+                        "reason": "size_below_min",
+                        "reason_zh": translate_reason("size_below_min"),
+                        "base_size": base_size,
+                    },
+                )
+                continue
+            resolved.append((intent, base_size))
+            if side == "buy":
+                remaining_budget = max(remaining_budget - (base_size * intent.price), Decimal("0"))
+            else:
+                remaining_budget = max(remaining_budget - base_size, Decimal("0"))
+        return resolved
+
+    def _available_side_budget(self, *, side: str, live_orders: list[LiveOrder]) -> Decimal:
+        if not self.state.instrument:
+            return Decimal("0")
+        active_orders = [order for order in live_orders if not order.cancel_requested]
+        if side == "buy":
+            free_quote = self.state.free_balance(self.state.instrument.quote_ccy) - self.config.risk.min_free_quote_buffer
+            reusable_quote = sum(order.remaining_size * order.price for order in active_orders)
+            return max(free_quote, Decimal("0")) + reusable_quote
+        if side == "sell":
+            free_base = self.state.free_balance(self.state.instrument.base_ccy) - self.config.risk.min_free_base_buffer
+            reusable_base = sum(order.remaining_size for order in active_orders)
+            return max(free_base, Decimal("0")) + reusable_base
+        return Decimal("0")
+
+    @staticmethod
+    def _max_base_size_from_budget(
+        *,
+        side: str,
+        price: Decimal,
+        instrument: InstrumentMeta,
+        budget: Decimal,
+    ) -> Decimal:
+        if budget <= 0:
+            return Decimal("0")
+        if side == "buy":
+            return quantize_down(budget / price, instrument.lot_size)
+        if side == "sell":
+            return quantize_down(budget, instrument.lot_size)
+        return Decimal("0")
+
+    @staticmethod
+    def _pop_first_matching_order(*, orders: list[LiveOrder], intent, base_size: Decimal, matcher: Callable[..., bool]) -> LiveOrder | None:
+        for index, order in enumerate(orders):
+            if matcher(primary=order, intent=intent, base_size=base_size):
+                return orders.pop(index)
+        return None
+
     def _should_keep_order_without_intent(self, *, primary: LiveOrder, risk_status: RiskStatus | None) -> bool:
         if risk_status is None:
             return False
@@ -441,17 +555,17 @@ class OrderExecutor:
             return False
         if not self._entry_order_matches_requested_exposure(primary=primary, intent=intent, base_size=base_size):
             return False
-        if intent.reason not in {"join_best_bid", "join_best_ask"}:
+        if intent.reason not in {"join_best_bid", "join_best_ask", "join_second_bid", "join_second_ask"}:
             return False
         min_spread = self.state.instrument.tick_size * Decimal(self.config.strategy.min_spread_ticks)
-        if intent.reason == "join_best_bid":
+        if intent.reason in {"join_best_bid", "join_second_bid"}:
             best_ask = self.state.book.best_ask.price if self.state.book.best_ask else None
             if best_ask is None:
                 return False
             if primary.price < intent.price:
                 return False
             return (best_ask - primary.price) >= min_spread
-        if intent.reason == "join_best_ask":
+        if intent.reason in {"join_best_ask", "join_second_ask"}:
             best_bid = self.state.book.best_bid.price if self.state.book.best_bid else None
             if best_bid is None:
                 return False
@@ -461,6 +575,12 @@ class OrderExecutor:
         return False
 
     def _entry_queue_preserve_allowed(self, *, side: str) -> bool:
+        strategy_position = self.state.strategy_position_base()
+        if strategy_position > 0:
+            return side != "buy"
+        if strategy_position < 0:
+            return side != "sell"
+
         inventory_ratio = self.state.inventory_ratio()
         if inventory_ratio is None:
             return True
@@ -484,7 +604,7 @@ class OrderExecutor:
     def _should_preserve_rebalance_queue(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
         if not self.config.strategy.preserve_rebalance_queue:
             return False
-        if not self.state.instrument:
+        if not self.state.instrument or not self.state.book:
             return False
         if primary.remaining_size != base_size:
             return False
@@ -506,6 +626,21 @@ class OrderExecutor:
             if cap is None:
                 return False
             return primary.side == "buy" and primary.price >= intent.price and primary.price <= cap
+        min_spread = self.state.instrument.tick_size * Decimal(self.config.strategy.min_spread_ticks)
+        if intent.reason == "rebalance_secondary_ask":
+            best_bid = self.state.book.best_bid.price if self.state.book.best_bid else None
+            if best_bid is None:
+                return False
+            if primary.side != "sell" or primary.price > intent.price:
+                return False
+            return (primary.price - best_bid) >= min_spread
+        if intent.reason == "rebalance_secondary_bid":
+            best_ask = self.state.book.best_ask.price if self.state.book.best_ask else None
+            if best_ask is None:
+                return False
+            if primary.side != "buy" or primary.price < intent.price:
+                return False
+            return (best_ask - primary.price) >= min_spread
         return False
 
     @staticmethod
