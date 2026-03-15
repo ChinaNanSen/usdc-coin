@@ -24,6 +24,7 @@ class BotState:
         self.runtime_reason = "booting"
         self.pause_until_ms = 0
         self.stream_status = {"public_books5": False, "private_user": False}
+        self.stream_last_activity_ms = {"public_books5": 0, "private_user": 0}
         self.consecutive_place_failures = 0
         self.consecutive_cancel_failures = 0
         self.last_place_failure_ms = 0
@@ -280,6 +281,18 @@ class BotState:
 
     def set_stream_status(self, stream_name: str, connected: bool) -> None:
         self.stream_status[stream_name] = connected
+        if connected:
+            self.mark_stream_activity(stream_name)
+
+    def mark_stream_activity(self, stream_name: str, activity_ms: int | None = None) -> None:
+        self.stream_last_activity_ms[stream_name] = activity_ms if activity_ms is not None else now_ms()
+
+    def stream_activity_age_ms(self, stream_name: str, *, reference_ms: int | None = None) -> int | None:
+        last_activity_ms = self.stream_last_activity_ms.get(stream_name, 0)
+        if last_activity_ms <= 0:
+            return None
+        now_ref = reference_ms if reference_ms is not None else now_ms()
+        return max(now_ref - last_activity_ms, 0)
 
     def streams_ready(self, *, require_public: bool, require_private: bool) -> bool:
         public_ok = self.stream_status.get("public_books5", False) if require_public else True
@@ -502,6 +515,7 @@ class BotState:
             "runtime_reason": self.runtime_reason,
             "pause_until_ms": self.pause_until_ms,
             "stream_status": self.stream_status,
+            "stream_last_activity_ms": self.stream_last_activity_ms,
             "consecutive_place_failures": self.consecutive_place_failures,
             "consecutive_cancel_failures": self.consecutive_cancel_failures,
             "last_place_failure_ms": self.last_place_failure_ms,

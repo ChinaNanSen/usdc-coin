@@ -43,9 +43,25 @@ class RiskManager:
                 runtime_state="STOPPED",
             )
 
-        book_age_ms = now_ms() - state.book.last_update_ms
-        if book_age_ms > self.config.stale_book_ms:
-            return RiskStatus(ok=False, reason=f"stale book: {book_age_ms}ms", allow_bid=False, allow_ask=False, runtime_state="PAUSED")
+        public_stream_age_ms = state.stream_activity_age_ms("public_books5")
+        if public_stream_age_ms is None:
+            book_age_ms = now_ms() - state.book.last_update_ms
+            if book_age_ms > self.config.stale_book_ms:
+                return RiskStatus(
+                    ok=False,
+                    reason=f"stale book: {book_age_ms}ms",
+                    allow_bid=False,
+                    allow_ask=False,
+                    runtime_state="PAUSED",
+                )
+        elif public_stream_age_ms > self.config.stale_book_ms:
+            return RiskStatus(
+                ok=False,
+                reason=f"stale public stream: {public_stream_age_ms}ms",
+                allow_bid=False,
+                allow_ask=False,
+                runtime_state="PAUSED",
+            )
 
         reconnect_count = state.reconnect_count_5m()
         if reconnect_count > self.config.max_reconnects_per_5m and not state.streams_ready(

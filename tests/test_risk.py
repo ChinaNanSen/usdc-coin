@@ -44,26 +44,37 @@ def make_state() -> BotState:
     return state
 
 
-def test_risk_blocks_stale_book():
+def test_risk_blocks_stale_public_stream():
     risk = RiskManager(RiskConfig(stale_book_ms=1), TradingConfig(), mode="shadow")
     state = make_state()
-    state.book = BookSnapshot(ts_ms=0, received_ms=0, bids=state.book.bids, asks=state.book.asks)
+    state.mark_stream_activity("public_books5", now_ms() - 10)
     status = risk.evaluate(state)
     assert status.ok is False
-    assert "stale book" in status.reason
+    assert "stale public stream" in status.reason
 
 
-def test_risk_uses_local_book_receive_time():
+def test_risk_allows_quiet_book_when_public_stream_is_alive():
     risk = RiskManager(RiskConfig(stale_book_ms=1000), TradingConfig(), mode="shadow")
     state = make_state()
     state.book = BookSnapshot(
         ts_ms=0,
-        received_ms=now_ms(),
+        received_ms=0,
         bids=state.book.bids,
         asks=state.book.asks,
     )
+    state.mark_stream_activity("public_books5", now_ms())
     status = risk.evaluate(state)
     assert status.ok is True
+
+
+def test_risk_falls_back_to_book_age_without_stream_activity():
+    risk = RiskManager(RiskConfig(stale_book_ms=1), TradingConfig(), mode="shadow")
+    state = make_state()
+    state.stream_last_activity_ms["public_books5"] = 0
+    state.book = BookSnapshot(ts_ms=0, received_ms=0, bids=state.book.bids, asks=state.book.asks)
+    status = risk.evaluate(state)
+    assert status.ok is False
+    assert "stale book" in status.reason
 
 
 def test_risk_blocks_after_daily_loss_limit():

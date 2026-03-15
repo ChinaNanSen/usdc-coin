@@ -157,6 +157,7 @@ class TrendBot6:
             on_reconnect=self._on_reconnect,
             on_status=self._on_stream_status,
             on_error=self._on_stream_error,
+            on_activity=self._on_stream_activity,
             subscribe_trades=True,
         )
         await self.public_stream.start()
@@ -362,6 +363,10 @@ class TrendBot6:
                 "error": str(exc),
             },
         )
+
+    async def _on_stream_activity(self, stream_name: str, activity: str) -> None:
+        del activity
+        self.state.mark_stream_activity(stream_name)
 
     def _exchange_ms_to_local_ms(self, exchange_ms: int) -> int:
         return int(exchange_ms - self.rest.time_offset_ms)

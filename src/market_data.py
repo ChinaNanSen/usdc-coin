@@ -18,10 +18,11 @@ TradeCallback = Callable[[TradeTick], Awaitable[None]]
 ReconnectCallback = Callable[[str], Awaitable[None]]
 StatusCallback = Callable[[str, bool], Awaitable[None]]
 ErrorCallback = Callable[[str, Exception], Awaitable[None]]
+ActivityCallback = Callable[[str, str], Awaitable[None]]
 
 
 class PublicBookStream:
-    HEARTBEAT_INTERVAL_SECONDS = 20.0
+    HEARTBEAT_INTERVAL_SECONDS = 5.0
     RECV_TIMEOUT_SECONDS = 60.0
 
     def __init__(
@@ -34,6 +35,7 @@ class PublicBookStream:
         on_reconnect: ReconnectCallback | None = None,
         on_status: StatusCallback | None = None,
         on_error: ErrorCallback | None = None,
+        on_activity: ActivityCallback | None = None,
         subscribe_trades: bool = False,
     ):
         self.url = url
@@ -43,6 +45,7 @@ class PublicBookStream:
         self.on_reconnect = on_reconnect
         self.on_status = on_status
         self.on_error = on_error
+        self.on_activity = on_activity
         self.subscribe_trades = subscribe_trades
         self.ws = None
         self.running = False
@@ -88,12 +91,14 @@ class PublicBookStream:
                             await ws.send("ping")
                             continue
                         if raw == "pong":
+                            await self._emit_activity("public_books5", "pong")
                             continue
                         data = json.loads(raw)
                         if data.get("event") in {"subscribe", "unsubscribe"}:
                             continue
                         channel = data.get("arg", {}).get("channel")
                         if channel == "books5":
+                            await self._emit_activity("public_books5", "books5")
                             for item in data.get("data", []):
                                 snapshot = BookSnapshot(
                                     ts_ms=int(item["ts"]),
@@ -110,6 +115,7 @@ class PublicBookStream:
                                 await self.on_book(snapshot)
                             continue
                         if channel == "trades" and self.on_trade:
+                            await self._emit_activity("public_books5", "trades")
                             received_ms = now_ms()
                             for item in data.get("data", []):
                                 trade = TradeTick(
@@ -142,3 +148,7 @@ class PublicBookStream:
     async def _emit_status(self, connected: bool) -> None:
         if self.on_status:
             await self.on_status("public_books5", connected)
+
+    async def _emit_activity(self, stream_name: str, activity: str) -> None:
+        if self.on_activity:
+            await self.on_activity(stream_name, activity)
