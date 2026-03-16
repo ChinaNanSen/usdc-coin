@@ -1038,6 +1038,7 @@ def test_executor_preserves_secondary_rebalance_ask_queue_when_still_passive():
     config = BotConfig(mode="live")
     config.risk.min_free_base_buffer = Decimal("0")
     config.strategy.preserve_rebalance_queue = True
+    config.strategy.rebalance_max_order_age_seconds = 0
     state.set_book(
         state.book.__class__(
             ts_ms=1,
@@ -1082,6 +1083,254 @@ def test_executor_preserves_secondary_rebalance_ask_queue_when_still_passive():
     assert rest.amend_calls == []
     assert rest.cancel_calls == []
     assert state.live_orders[sell_id].price == Decimal("1.0000")
+
+
+def test_executor_same_target_rebalance_sell_does_not_force_refresh_when_target_is_unchanged():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_base_buffer = Decimal("0")
+    config.strategy.rebalance_drift_ticks = 2
+    config.strategy.rebalance_max_order_age_seconds = 0
+    state.set_book(
+        state.book.__class__(
+            ts_ms=1,
+            received_ms=1,
+            bids=[
+                state.book.bids[0].__class__(price=Decimal("0.9998"), size=Decimal("100000"), order_count=0),
+            ],
+            asks=[
+                state.book.asks[0].__class__(price=Decimal("1.0000"), size=Decimal("100000"), order_count=0),
+            ],
+        )
+    )
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "1.0000",
+            "fillPx": "1.0000",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0003",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "3",
+            "uTime": "3",
+        },
+        source="test",
+    )
+
+    primary = state.live_orders[sell_id]
+    intent = OrderIntent(
+        side="sell",
+        price=Decimal("1.0003"),
+        quote_notional=Decimal("10003"),
+        reason="rebalance_open_long",
+        base_size=Decimal("10000"),
+    )
+
+    assert executor._same_live_order_target(primary=primary, intent=intent, base_size=Decimal("10000")) is True
+
+
+def test_executor_same_target_rebalance_buy_does_not_force_refresh_when_target_is_unchanged(monkeypatch):
+    monkeypatch.setattr("src.executor.now_ms", lambda: 10_000)
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_quote_buffer = Decimal("0")
+    config.strategy.rebalance_max_order_age_seconds = 5
+    config.strategy.rebalance_drift_ticks = 0
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0001",
+            "fillPx": "1.0001",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "1.0000",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    primary = state.live_orders[buy_id]
+    intent = OrderIntent(
+        side="buy",
+        price=Decimal("1.0000"),
+        quote_notional=Decimal("10000"),
+        reason="rebalance_open_short",
+        base_size=Decimal("10000"),
+    )
+
+    assert executor._same_live_order_target(primary=primary, intent=intent, base_size=Decimal("10000")) is True
+
+
+def test_executor_rebalance_sell_refresh_blocks_preserve_when_price_drifted_farther():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_base_buffer = Decimal("0")
+    config.strategy.preserve_rebalance_queue = True
+    config.strategy.rebalance_drift_ticks = 2
+    config.strategy.rebalance_max_order_age_seconds = 0
+    state.set_book(
+        state.book.__class__(
+            ts_ms=1,
+            received_ms=1,
+            bids=[
+                state.book.bids[0].__class__(price=Decimal("0.9998"), size=Decimal("100000"), order_count=0),
+            ],
+            asks=[
+                state.book.asks[0].__class__(price=Decimal("1.0000"), size=Decimal("100000"), order_count=0),
+            ],
+        )
+    )
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "1.0000",
+            "fillPx": "1.0000",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0003",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "3",
+            "uTime": "3",
+        },
+        source="test",
+    )
+
+    primary = state.live_orders[sell_id]
+    shifted_intent = OrderIntent(
+        side="sell",
+        price=Decimal("1.0001"),
+        quote_notional=Decimal("10001"),
+        reason="rebalance_open_long",
+        base_size=Decimal("10000"),
+    )
+
+    assert executor._should_keep_existing_order(primary=primary, intent=shifted_intent, base_size=Decimal("10000")) is False
+
+
+def test_executor_rebalance_buy_refresh_blocks_preserve_when_order_is_too_old(monkeypatch):
+    monkeypatch.setattr("src.executor.now_ms", lambda: 10_000)
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_quote_buffer = Decimal("0")
+    config.strategy.preserve_rebalance_queue = True
+    config.strategy.rebalance_max_order_age_seconds = 5
+    config.strategy.rebalance_drift_ticks = 0
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0001",
+            "fillPx": "1.0001",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "1.0000",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    primary = state.live_orders[buy_id]
+    shifted_intent = OrderIntent(
+        side="buy",
+        price=Decimal("0.9999"),
+        quote_notional=Decimal("9999"),
+        reason="rebalance_open_short",
+        base_size=Decimal("10000"),
+    )
+
+    assert executor._should_keep_existing_order(primary=primary, intent=shifted_intent, base_size=Decimal("10000")) is False
 
 
 def test_executor_amends_entry_buy_when_old_price_no_longer_matches_new_target():

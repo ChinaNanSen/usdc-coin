@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import traceback
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -92,10 +93,19 @@ class TrendBot6:
                     await self._tick()
                 except Exception as exc:
                     logger.exception("Tick failed: %s", exc)
-                    self.journal.append("tick_error", {"error": str(exc)})
-                    self.state.request_resync(f"tick failure: {exc}")
+                    error_message = self._exception_message(exc)
+                    self.journal.append(
+                        "tick_error",
+                        {
+                            "error": str(exc),
+                            "error_repr": repr(exc),
+                            "error_type": type(exc).__name__,
+                            "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                        },
+                    )
+                    self.state.request_resync(f"tick failure: {error_message}")
                     self.state.set_pause(
-                        reason=f"tick failure: {exc}",
+                        reason=f"tick failure: {error_message}",
                         duration_ms=int(self.config.risk.pause_after_reconnect_seconds * 1000),
                     )
                 await asyncio.sleep(self.config.trading.loop_interval_seconds)
@@ -293,12 +303,33 @@ class TrendBot6:
         self.state.record_consistency_result(report.ok, report.reason)
         self.journal.append("consistency_check", {"context": context, "report": report})
         if report.ok:
+            if context == "resync":
+                self.state.clear_resync_passive_violations()
             return True
 
+        offending_order_ids = report.offending_managed_orders
+        if context == "resync" and offending_order_ids:
+            offending_order_ids = self.state.note_resync_passive_violations(report.offending_managed_orders)
+            if not offending_order_ids:
+                self.state.request_resync(f"{context} consistency failed: {report.reason}")
+                self.state.set_pause(
+                    reason=f"{context} passive price check deferred: {report.reason}",
+                    duration_ms=int(self.config.risk.pause_after_reconnect_seconds * 1000),
+                )
+                self.journal.append(
+                    "consistency_check_deferred",
+                    {
+                        "context": context,
+                        "reason": report.reason,
+                        "offending_managed_orders": report.offending_managed_orders,
+                    },
+                )
+                return False
+
         if self.config.mode == "live" and report.cancel_managed and self.config.risk.cancel_managed_on_consistency_failure:
-            if report.offending_managed_orders:
+            if offending_order_ids:
                 await self.executor.cancel_managed_orders(
-                    cl_ord_ids=report.offending_managed_orders,
+                    cl_ord_ids=offending_order_ids,
                     reason=f"consistency_failure:{context}",
                 )
             else:
@@ -314,6 +345,13 @@ class TrendBot6:
             duration_ms=int(self.config.risk.pause_after_reconnect_seconds * 1000),
         )
         return False
+
+    @staticmethod
+    def _exception_message(exc: Exception) -> str:
+        text = str(exc).strip()
+        if text:
+            return f"{type(exc).__name__}: {text}"
+        return repr(exc)
 
     async def _on_book(self, book) -> None:
         previous_book = self.state.book

@@ -76,7 +76,11 @@ class StrategyConfig:
     min_visible_depth_multiplier: Decimal = Decimal("3")
     rebalance_min_profit_ticks: int = 1
     rebalance_reload_timeout_seconds: float = 180.0
+    rebalance_drift_ticks: int = 2
+    rebalance_max_order_age_seconds: float = 12.0
+    rebalance_release_size_factor: Decimal = Decimal("0.50")
     rebalance_secondary_size_factor: Decimal = Decimal("0.10")
+    rebalance_overlay_floor_factor: Decimal = Decimal("0.10")
     rebalance_secondary_price_offset_ticks: int = 1
     normal_buy_price_cap: Decimal = Decimal("0")
     normal_sell_price_floor: Decimal = Decimal("0")

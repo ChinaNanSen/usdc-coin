@@ -50,6 +50,7 @@ class BotState:
         self.live_position_lots: deque[StrategyLot] = deque()
         self.initial_external_base_inventory: Decimal | None = None
         self.external_base_inventory_remaining: Decimal = Decimal("0")
+        self._resync_passive_violation_counts: dict[str, int] = {}
 
     def set_instrument(self, instrument: InstrumentMeta) -> None:
         self.instrument = instrument
@@ -325,6 +326,21 @@ class BotState:
     def clear_resync(self) -> None:
         self.resync_required = False
         self.resync_reason = ""
+        self.clear_resync_passive_violations()
+
+    def note_resync_passive_violations(self, order_ids: tuple[str, ...]) -> tuple[str, ...]:
+        updated_counts: dict[str, int] = {}
+        escalated: list[str] = []
+        for order_id in order_ids:
+            count = self._resync_passive_violation_counts.get(order_id, 0) + 1
+            updated_counts[order_id] = count
+            if count >= 2:
+                escalated.append(order_id)
+        self._resync_passive_violation_counts = updated_counts
+        return tuple(escalated)
+
+    def clear_resync_passive_violations(self) -> None:
+        self._resync_passive_violation_counts.clear()
 
     def mark_reconnect(self) -> None:
         current = now_ms()
@@ -461,6 +477,42 @@ class BotState:
             return None
         target = min_open_price - tick_size * Decimal(max(profit_ticks, 0))
         return quantize_down(target, tick_size)
+
+    def profitable_rebalance_sell_size(self, sell_price: Decimal, *, tick_size: Decimal, profit_ticks: int) -> Decimal:
+        if sell_price <= 0:
+            return Decimal("0")
+        required_edge = tick_size * Decimal(max(profit_ticks, 0))
+        profitable_size = Decimal("0")
+        matched_prefix = False
+        for lot in self.live_position_lots:
+            if lot.qty <= 0:
+                if matched_prefix:
+                    break
+                continue
+            matched_prefix = True
+            required_price = quantize_up(lot.price + required_edge, tick_size)
+            if sell_price < required_price:
+                break
+            profitable_size += lot.qty
+        return profitable_size
+
+    def profitable_rebalance_buy_size(self, buy_price: Decimal, *, tick_size: Decimal, profit_ticks: int) -> Decimal:
+        if buy_price <= 0:
+            return Decimal("0")
+        required_edge = tick_size * Decimal(max(profit_ticks, 0))
+        profitable_size = Decimal("0")
+        matched_prefix = False
+        for lot in self.live_position_lots:
+            if lot.qty >= 0:
+                if matched_prefix:
+                    break
+                continue
+            matched_prefix = True
+            required_price = quantize_down(lot.price - required_edge, tick_size)
+            if buy_price > required_price:
+                break
+            profitable_size += -lot.qty
+        return profitable_size
 
     def inventory_ratio(self) -> Decimal | None:
         if not self.instrument or not self.book or not self.book.mid:

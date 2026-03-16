@@ -130,12 +130,24 @@ class RiskManager:
         allow_bid = state.free_balance(self.trading.quote_ccy) > self.config.min_free_quote_buffer
         allow_ask = state.free_balance(self.trading.base_ccy) > self.config.min_free_base_buffer
 
-        ratio = state.inventory_ratio()
-        if ratio is not None:
-            if ratio > self.config.hard_inventory_upper_pct:
-                return RiskStatus(ok=allow_ask, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=allow_ask, runtime_state="REDUCE_ONLY")
-            if ratio < self.config.hard_inventory_lower_pct:
-                return RiskStatus(ok=allow_bid, reason="reduce_only_inventory_low", allow_bid=allow_bid, allow_ask=False, runtime_state="REDUCE_ONLY")
+        strategy_position = state.strategy_position_base()
+        min_position_size = state.instrument.min_size if state.instrument else Decimal("0")
+        if strategy_position >= min_position_size and not allow_ask:
+            return RiskStatus(
+                ok=False,
+                reason="bot long rebalance blocked",
+                allow_bid=False,
+                allow_ask=False,
+                runtime_state="PAUSED",
+            )
+        if strategy_position <= -min_position_size and not allow_bid:
+            return RiskStatus(
+                ok=False,
+                reason="bot short rebalance blocked",
+                allow_bid=False,
+                allow_ask=False,
+                runtime_state="PAUSED",
+            )
 
         if not allow_bid and not allow_ask:
             return RiskStatus(ok=False, reason="inventory/balance blocks both sides", allow_bid=False, allow_ask=False, runtime_state="PAUSED")

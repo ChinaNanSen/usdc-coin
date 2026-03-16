@@ -183,13 +183,127 @@ def test_consistency_resync_cancels_only_offending_managed_orders(tmp_path):
     )
 
     try:
-        ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
+        first_ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
+        second_ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
     finally:
         bot.audit_store.close()
 
-    assert ok is False
+    assert first_ok is False
+    assert second_ok is False
     assert selective_calls == [((bad_sell_id,), "consistency_failure:resync")]
     assert all_cancel_calls == []
+
+
+def test_consistency_resync_debounce_clears_after_success(tmp_path):
+    config = BotConfig(mode="live")
+    config.risk.cancel_managed_on_consistency_failure = True
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+    selective_calls: list[tuple[tuple[str, ...], str]] = []
+
+    async def fake_cancel_managed_orders(*, cl_ord_ids, reason: str) -> None:
+        selective_calls.append((tuple(cl_ord_ids), reason))
+
+    bot.executor.cancel_managed_orders = fake_cancel_managed_orders  # type: ignore[method-assign]
+
+    bot.state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    bot.state.set_book(make_book(bid="0.9999", ask="1.0000", ts_ms=1))
+    bot.state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("50000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("50000")),
+        }
+    )
+
+    bad_sell_id = build_cl_ord_id("bot6", "sell")
+    bot.state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": bad_sell_id,
+            "px": "0.9999",
+            "sz": "1000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    try:
+        first_ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
+        bot.state.set_book(make_book(bid="0.9998", ask="0.9999", ts_ms=2))
+        cleared_ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
+        bot.state.set_book(make_book(bid="0.9999", ask="1.0000", ts_ms=3))
+        second_first_ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
+    finally:
+        bot.audit_store.close()
+
+    assert first_ok is False
+    assert cleared_ok is True
+    assert second_first_ok is False
+    assert selective_calls == []
+
+
+def test_run_logs_tick_error_repr_and_traceback(tmp_path):
+    config = BotConfig(mode="shadow")
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+
+    async def fake_bootstrap() -> None:
+        bot.state.set_runtime_state("READY", "test bootstrap")
+
+    async def fake_tick() -> None:
+        raise Exception()
+
+    async def fake_sleep(_: float) -> None:
+        bot.state.set_runtime_state("STOPPED", "done")
+
+    async def fake_shutdown() -> None:
+        return None
+
+    original_sleep = asyncio.sleep
+    bot._bootstrap = fake_bootstrap  # type: ignore[method-assign]
+    bot._tick = fake_tick  # type: ignore[method-assign]
+    bot.shutdown = fake_shutdown  # type: ignore[method-assign]
+    asyncio.sleep = fake_sleep  # type: ignore[assignment]
+
+    try:
+        asyncio.run(bot.run())
+    finally:
+        asyncio.sleep = original_sleep  # type: ignore[assignment]
+        bot.audit_store.close()
+
+    tick_errors = [payload for event, payload in bot.journal.events if event == "tick_error"]
+    assert len(tick_errors) == 1
+    assert tick_errors[0]["error"] == ""
+    assert tick_errors[0]["error_repr"] == "Exception()"
+    assert tick_errors[0]["error_type"] == "Exception"
+    assert "fake_tick" in tick_errors[0]["traceback"]
+    assert bot.state.resync_reason == "tick failure: Exception()"
 
 
 def test_on_book_triggers_debounced_quote_cycle_when_top_price_changes(tmp_path):

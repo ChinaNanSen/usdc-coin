@@ -509,6 +509,8 @@ class OrderExecutor:
             return True
         if self._should_preserve_partial_fill_with_same_price(primary=primary, intent=intent, base_size=base_size):
             return True
+        if self._rebalance_order_requires_refresh(primary=primary, intent=intent):
+            return False
         if self._should_preserve_entry_queue(primary=primary, intent=intent, base_size=base_size):
             return True
         if self._should_preserve_rebalance_queue(primary=primary, intent=intent, base_size=base_size):
@@ -606,6 +608,8 @@ class OrderExecutor:
             return False
         if not self.state.instrument or not self.state.book:
             return False
+        if self._rebalance_order_requires_refresh(primary=primary, intent=intent):
+            return False
         if primary.remaining_size != base_size:
             return False
         if intent.reason == "rebalance_open_long":
@@ -641,6 +645,46 @@ class OrderExecutor:
             if primary.side != "buy" or primary.price < intent.price:
                 return False
             return (best_ask - primary.price) >= min_spread
+        return False
+
+    def _rebalance_order_requires_refresh(self, *, primary: LiveOrder, intent) -> bool:
+        rebalance_reasons = {
+            "rebalance_open_long",
+            "rebalance_open_short",
+            "rebalance_secondary_ask",
+            "rebalance_secondary_bid",
+        }
+        if intent.reason not in rebalance_reasons:
+            return False
+        return self._rebalance_order_age_exceeded(primary=primary) or self._rebalance_order_drift_exceeded(primary=primary)
+
+    def _rebalance_order_age_exceeded(self, *, primary: LiveOrder) -> bool:
+        max_age_ms = int(max(self.config.strategy.rebalance_max_order_age_seconds, 0) * 1000)
+        if max_age_ms <= 0:
+            return False
+        return max(now_ms() - primary.created_at_ms, 0) >= max_age_ms
+
+    def _rebalance_order_drift_exceeded(self, *, primary: LiveOrder) -> bool:
+        if not self.state.instrument or not self.state.book:
+            return False
+        threshold_ticks = max(int(self.config.strategy.rebalance_drift_ticks), 0)
+        if threshold_ticks <= 0:
+            return False
+        tick_size = self.state.instrument.tick_size
+        if tick_size <= 0:
+            return False
+        if primary.side == "sell":
+            best_price = self.state.book.best_ask.price if self.state.book.best_ask else None
+            if best_price is None or primary.price <= best_price:
+                return False
+            drift_ticks = int((primary.price - best_price) / tick_size)
+            return drift_ticks >= threshold_ticks
+        if primary.side == "buy":
+            best_price = self.state.book.best_bid.price if self.state.book.best_bid else None
+            if best_price is None or primary.price >= best_price:
+                return False
+            drift_ticks = int((best_price - primary.price) / tick_size)
+            return drift_ticks >= threshold_ticks
         return False
 
     @staticmethod

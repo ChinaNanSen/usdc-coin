@@ -96,16 +96,110 @@ def test_risk_blocks_when_streams_not_ready_in_live_mode():
     assert status.runtime_state == "INIT"
 
 
-def test_risk_enters_reduce_only_when_inventory_too_high():
+def test_risk_does_not_enter_reduce_only_from_account_inventory_when_bot_is_flat():
     risk = RiskManager(RiskConfig(), TradingConfig(), mode="shadow")
     state = make_state()
     state.balances["USDC"] = Balance(ccy="USDC", total=Decimal("90000"), available=Decimal("90000"))
     state.balances["USDT"] = Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000"))
     status = risk.evaluate(state)
     assert status.ok is True
-    assert status.allow_bid is False
+    assert status.allow_bid is True
     assert status.allow_ask is True
-    assert status.runtime_state == "REDUCE_ONLY"
+    assert status.runtime_state == "READY"
+
+
+def test_risk_allows_bot_short_to_keep_buy_side_even_when_account_inventory_is_high():
+    risk = RiskManager(RiskConfig(), TradingConfig(), mode="shadow")
+    state = make_state()
+    state.balances["USDC"] = Balance(ccy="USDC", total=Decimal("90000"), available=Decimal("90000"))
+    state.balances["USDT"] = Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000"))
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": "bot6ms-test",
+            "px": "1.0000",
+            "fillPx": "1.0000",
+            "sz": "5000",
+            "accFillSz": "5000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    status = risk.evaluate(state)
+
+    assert status.ok is True
+    assert status.allow_bid is True
+    assert status.allow_ask is True
+    assert status.runtime_state == "READY"
+
+
+def test_risk_pauses_when_bot_short_cannot_rebalance_buy_side():
+    risk = RiskManager(
+        RiskConfig(min_free_quote_buffer=Decimal("1000"), daily_loss_limit_quote=Decimal("1000000")),
+        TradingConfig(),
+        mode="shadow",
+    )
+    state = make_state()
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": "bot6ms-test",
+            "px": "1.0000",
+            "fillPx": "1.0000",
+            "sz": "5000",
+            "accFillSz": "5000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    state.balances["USDT"] = Balance(ccy="USDT", total=Decimal("500"), available=Decimal("500"))
+
+    status = risk.evaluate(state)
+
+    assert status.ok is False
+    assert status.reason == "bot short rebalance blocked"
+    assert status.runtime_state == "PAUSED"
+
+
+def test_risk_pauses_when_bot_long_cannot_rebalance_sell_side():
+    risk = RiskManager(
+        RiskConfig(min_free_base_buffer=Decimal("1000"), daily_loss_limit_quote=Decimal("1000000")),
+        TradingConfig(),
+        mode="shadow",
+    )
+    state = make_state()
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": "bot6mb-test",
+            "px": "1.0000",
+            "fillPx": "1.0000",
+            "sz": "5000",
+            "accFillSz": "5000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    state.balances["USDC"] = Balance(ccy="USDC", total=Decimal("500"), available=Decimal("500"))
+
+    status = risk.evaluate(state)
+
+    assert status.ok is False
+    assert status.reason == "bot long rebalance blocked"
+    assert status.runtime_state == "PAUSED"
 
 
 def test_risk_stops_on_fee_gate():

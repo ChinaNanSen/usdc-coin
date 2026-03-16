@@ -44,7 +44,11 @@ strategy:
   min_visible_depth_multiplier: 3
   rebalance_min_profit_ticks: 1
   rebalance_reload_timeout_seconds: 180
+  rebalance_drift_ticks: 2
+  rebalance_max_order_age_seconds: 12
+  rebalance_release_size_factor: 0.50
   rebalance_secondary_size_factor: 0.10
+  rebalance_overlay_floor_factor: 0.10
   rebalance_secondary_price_offset_ticks: 1
   normal_buy_price_cap: 0
   normal_sell_price_floor: 0
