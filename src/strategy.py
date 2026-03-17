@@ -74,6 +74,24 @@ class MicroMakerStrategy:
         ask_quote_size = quote_size
         bid_base_size = fixed_entry_base_size
         ask_base_size = fixed_entry_base_size
+        favorable_size_multiplier = self._favorable_size_multiplier(
+            spread_ticks=spread_ticks,
+            rebalance_buy_base=rebalance_buy_base,
+            rebalance_sell_base=rebalance_sell_base,
+        )
+        if favorable_size_multiplier > Decimal("1"):
+            bid_quote_size *= favorable_size_multiplier
+            ask_quote_size *= favorable_size_multiplier
+            bid_base_size = self._scale_entry_base_size(
+                state=state,
+                base_size=bid_base_size,
+                multiplier=favorable_size_multiplier,
+            )
+            ask_base_size = self._scale_entry_base_size(
+                state=state,
+                base_size=ask_base_size,
+                multiplier=favorable_size_multiplier,
+            )
         skew_high = False
         skew_low = False
         skew_profile = self._bot_position_skew_profile(
@@ -226,6 +244,37 @@ class MicroMakerStrategy:
             reduction = self.config.mild_skew_size_factor * skew_progress
             return True, False, Decimal("1") - reduction
         return False, False, Decimal("1")
+
+    def _favorable_size_multiplier(
+        self,
+        *,
+        spread_ticks: Decimal,
+        rebalance_buy_base: Decimal,
+        rebalance_sell_base: Decimal,
+    ) -> Decimal:
+        min_spread_ticks = max(int(self.config.favorable_size_spread_ticks), 0)
+        multiplier = max(self.config.favorable_size_multiplier, Decimal("1"))
+        if min_spread_ticks <= 0 or multiplier <= Decimal("1"):
+            return Decimal("1")
+        if spread_ticks < Decimal(min_spread_ticks):
+            return Decimal("1")
+        if rebalance_buy_base > 0 or rebalance_sell_base > 0:
+            return Decimal("1")
+        return multiplier
+
+    @staticmethod
+    def _scale_entry_base_size(
+        *,
+        state: BotState,
+        base_size: Decimal | None,
+        multiplier: Decimal,
+    ) -> Decimal | None:
+        if base_size is None or not state.instrument or multiplier <= Decimal("1"):
+            return base_size
+        scaled = quantize_down(base_size * multiplier, state.instrument.lot_size)
+        if scaled < state.instrument.min_size:
+            return base_size
+        return scaled
 
     def _bot_position_skew_profile(
         self,

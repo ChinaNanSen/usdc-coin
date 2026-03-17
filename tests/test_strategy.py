@@ -80,6 +80,59 @@ def test_strategy_can_emit_two_layers_per_side_when_enabled():
     assert decision.ask_layers[1].reason == "join_second_ask"
 
 
+def test_strategy_scales_entry_size_only_when_spread_is_favorable():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            favorable_size_spread_ticks=2,
+            favorable_size_multiplier=Decimal("1.5"),
+        ),
+        TradingConfig(entry_base_size=Decimal("5000"), quote_size=Decimal("5000")),
+        max_orders_per_side=2,
+    )
+    state = build_state("50000", "50000")
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal("0.9998"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
+        )
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.reason == "two_sided"
+    assert decision.bid is not None
+    assert decision.ask is not None
+    assert decision.bid.base_size == Decimal("7500")
+    assert decision.ask.base_size == Decimal("7500")
+    assert decision.bid_layers[1].base_size == Decimal("7500")
+    assert decision.ask_layers[1].base_size == Decimal("7500")
+
+
+def test_strategy_does_not_scale_entry_size_when_spread_is_one_tick():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            favorable_size_spread_ticks=2,
+            favorable_size_multiplier=Decimal("1.5"),
+        ),
+        TradingConfig(entry_base_size=Decimal("5000"), quote_size=Decimal("5000")),
+    )
+
+    decision = strategy.decide(
+        build_state("50000", "50000"),
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.reason == "two_sided"
+    assert decision.bid is not None
+    assert decision.ask is not None
+    assert decision.bid.base_size == Decimal("5000")
+    assert decision.ask.base_size == Decimal("5000")
+
+
 def test_strategy_does_not_emit_second_entry_layer_when_spread_is_one_tick():
     strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig(), max_orders_per_side=2)
     decision = strategy.decide(
@@ -93,6 +146,53 @@ def test_strategy_does_not_emit_second_entry_layer_when_spread_is_one_tick():
     assert len(decision.ask_layers) == 1
     assert decision.bid_layers[0].reason == "join_best_bid"
     assert decision.ask_layers[0].reason == "join_best_ask"
+
+
+def test_strategy_does_not_scale_overlay_size_while_rebalancing_even_if_spread_is_favorable():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            favorable_size_spread_ticks=2,
+            favorable_size_multiplier=Decimal("1.5"),
+        ),
+        TradingConfig(entry_base_size=Decimal("10000"), quote_size=Decimal("10000")),
+    )
+    state = build_state("50000", "50000")
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal("0.9998"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
+        )
+    )
+    cl_ord_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": cl_ord_id,
+            "px": "0.9999",
+            "fillPx": "0.9999",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.reason == "fill_rebalance_sell_biased"
+    assert decision.ask is not None
+    assert decision.ask.base_size == Decimal("10000")
+    assert decision.bid is not None
+    assert decision.bid.reason == "rebalance_secondary_bid"
+    assert decision.bid.base_size == Decimal("500.0000")
 
 
 def test_strategy_uses_bot_position_to_bias_secondary_side_even_when_account_inventory_disagrees():

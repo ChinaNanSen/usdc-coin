@@ -82,6 +82,8 @@ class StrategyConfig:
     rebalance_secondary_size_factor: Decimal = Decimal("0.10")
     rebalance_overlay_floor_factor: Decimal = Decimal("0.10")
     rebalance_secondary_price_offset_ticks: int = 1
+    favorable_size_spread_ticks: int = 0
+    favorable_size_multiplier: Decimal = Decimal("1")
     normal_buy_price_cap: Decimal = Decimal("0")
     normal_sell_price_floor: Decimal = Decimal("0")
     preserve_entry_queue: bool = True
