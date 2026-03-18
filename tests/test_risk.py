@@ -77,14 +77,46 @@ def test_risk_falls_back_to_book_age_without_stream_activity():
     assert "stale book" in status.reason
 
 
-def test_risk_blocks_after_daily_loss_limit():
-    risk = RiskManager(RiskConfig(daily_loss_limit_quote=Decimal("10")), TradingConfig(), mode="shadow")
+def test_risk_does_not_stop_on_daily_nav_drawdown():
     state = make_state()
     state.initial_nav_quote = Decimal("100000")
     state.balances["USDC"] = Balance(ccy="USDC", total=Decimal("49980"), available=Decimal("49980"))
+    risk = RiskManager(RiskConfig(), TradingConfig(), mode="shadow")
+    status = risk.evaluate(state)
+    assert status.ok is True
+    assert status.runtime_state == "READY"
+
+
+def test_risk_stops_after_realized_loss_limit():
+    risk = RiskManager(RiskConfig(realized_loss_shutdown_quote=Decimal("20")), TradingConfig(), mode="shadow")
+    state = make_state()
+    state.live_realized_pnl_quote = Decimal("-20")
     status = risk.evaluate(state)
     assert status.ok is False
-    assert "daily loss limit" in status.reason
+    assert status.runtime_state == "STOPPED"
+    assert "realized loss limit hit" in status.reason
+
+
+def test_risk_pauses_when_peg_deviation_too_high():
+    risk = RiskManager(
+        RiskConfig(max_mid_deviation_bps=Decimal("5"), peg_reference_price=Decimal("1")),
+        TradingConfig(),
+        mode="shadow",
+    )
+    state = make_state()
+    state.set_book(
+        BookSnapshot(
+            ts_ms=now_ms(),
+            bids=[BookLevel(price=Decimal("1.0006"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1.0007"), size=Decimal("100000"))],
+        )
+    )
+
+    status = risk.evaluate(state)
+
+    assert status.ok is False
+    assert status.runtime_state == "PAUSED"
+    assert "peg deviation too high" in status.reason
 
 
 def test_risk_blocks_when_streams_not_ready_in_live_mode():
@@ -140,7 +172,7 @@ def test_risk_allows_bot_short_to_keep_buy_side_even_when_account_inventory_is_h
 
 def test_risk_pauses_when_bot_short_cannot_rebalance_buy_side():
     risk = RiskManager(
-        RiskConfig(min_free_quote_buffer=Decimal("1000"), daily_loss_limit_quote=Decimal("1000000")),
+        RiskConfig(min_free_quote_buffer=Decimal("1000")),
         TradingConfig(),
         mode="shadow",
     )
@@ -172,7 +204,7 @@ def test_risk_pauses_when_bot_short_cannot_rebalance_buy_side():
 
 def test_risk_pauses_when_bot_long_cannot_rebalance_sell_side():
     risk = RiskManager(
-        RiskConfig(min_free_base_buffer=Decimal("1000"), daily_loss_limit_quote=Decimal("1000000")),
+        RiskConfig(min_free_base_buffer=Decimal("1000")),
         TradingConfig(),
         mode="shadow",
     )

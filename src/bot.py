@@ -374,6 +374,10 @@ class TrendBot6:
             if value not in (None, "", "0"):
                 normalized[key] = str(self._exchange_ms_to_local_ms(int(value)))
         order = self.state.apply_order_update(normalized, source="ws_order")
+        amend_resolution = self.state.resolve_pending_amend_update(payload=normalized, order=order)
+        if amend_resolution is not None:
+            event, event_payload = amend_resolution
+            self.journal.append(event, event_payload)
         self.journal.append("order_update", {"order": order, "raw": payload})
 
     async def _on_account(self, payload: dict) -> None:

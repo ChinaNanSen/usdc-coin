@@ -398,3 +398,165 @@ def test_on_book_ignores_same_top_prices(tmp_path):
         bot.audit_store.close()
 
     assert calls == []
+
+
+def test_bot_logs_ws_amend_failure_and_clears_pending(tmp_path):
+    config = BotConfig(mode="live")
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+    bot.state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    bot.state.set_book(make_book(bid="0.9998", ask="0.9999", ts_ms=1))
+    buy_id = build_cl_ord_id("bot6", "buy")
+    bot.state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "0.9998",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+    bot.state.register_pending_amend(
+        cl_ord_id=buy_id,
+        ord_id="b1",
+        side="buy",
+        reason="join_best_bid",
+        previous_price=Decimal("0.9998"),
+        previous_size=Decimal("10000"),
+        previous_remaining_size=Decimal("10000"),
+        target_price=Decimal("0.9999"),
+        target_size=Decimal("10000"),
+        target_remaining_size=Decimal("10000"),
+        filled_size=Decimal("0"),
+    )
+
+    try:
+        asyncio.run(
+            bot._on_order(
+                {
+                    "instId": "USDC-USDT",
+                    "side": "buy",
+                    "ordId": "b1",
+                    "clOrdId": buy_id,
+                    "px": "0.9998",
+                    "sz": "10000",
+                    "accFillSz": "0",
+                    "state": "live",
+                    "cTime": "1",
+                    "uTime": "2",
+                    "code": "51511",
+                    "msg": "",
+                    "amendResult": "-1",
+                }
+            )
+        )
+    finally:
+        bot.audit_store.close()
+
+    assert bot.state.pending_amend(buy_id) is None
+    assert bot.state.live_orders[buy_id].price == Decimal("0.9998")
+    assert any(event == "amend_order_error" for event, _ in bot.journal.events)
+
+
+def test_bot_logs_ws_amend_success_and_clears_pending(tmp_path):
+    config = BotConfig(mode="live")
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+    bot.state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    bot.state.set_book(make_book(bid="0.9998", ask="0.9999", ts_ms=1))
+    buy_id = build_cl_ord_id("bot6", "buy")
+    bot.state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "0.9998",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+    bot.state.register_pending_amend(
+        cl_ord_id=buy_id,
+        ord_id="b1",
+        side="buy",
+        reason="join_best_bid",
+        previous_price=Decimal("0.9998"),
+        previous_size=Decimal("10000"),
+        previous_remaining_size=Decimal("10000"),
+        target_price=Decimal("0.9999"),
+        target_size=Decimal("10000"),
+        target_remaining_size=Decimal("10000"),
+        filled_size=Decimal("0"),
+    )
+
+    try:
+        asyncio.run(
+            bot._on_order(
+                {
+                    "instId": "USDC-USDT",
+                    "side": "buy",
+                    "ordId": "b1",
+                    "clOrdId": buy_id,
+                    "px": "0.9999",
+                    "sz": "10000",
+                    "accFillSz": "0",
+                    "state": "live",
+                    "cTime": "1",
+                    "uTime": "2",
+                    "code": "0",
+                    "msg": "",
+                    "amendResult": "0",
+                }
+            )
+        )
+    finally:
+        bot.audit_store.close()
+
+    assert bot.state.pending_amend(buy_id) is None
+    assert bot.state.live_orders[buy_id].price == Decimal("0.9999")
+    assert any(event == "amend_order" for event, _ in bot.journal.events)

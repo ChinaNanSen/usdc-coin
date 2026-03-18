@@ -78,6 +78,34 @@ class TrackingRest:
         return []
 
 
+class RacingAmendRest(TrackingRest):
+    def __init__(self, state: BotState):
+        super().__init__()
+        self.state = state
+        self.amend_resolutions = []
+
+    async def amend_order(self, **kwargs):
+        self.amend_calls.append(kwargs)
+        payload = {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": kwargs.get("ord_id") or "",
+            "clOrdId": kwargs.get("cl_ord_id") or "",
+            "px": "0.9999",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "2",
+            "code": "0",
+            "msg": "",
+            "amendResult": "0",
+        }
+        order = self.state.apply_order_update(payload, source="ws_order")
+        self.amend_resolutions.append(self.state.resolve_pending_amend_update(payload=payload, order=order))
+        return {}
+
+
 class CapturingPlaceRest:
     def __init__(self):
         self.place_calls = []
@@ -537,7 +565,8 @@ def test_executor_reprices_existing_buy_when_target_moves_even_after_aging(monke
 
     assert len(rest.amend_calls) == 1
     assert rest.cancel_calls == []
-    assert state.live_orders[buy_id].price == Decimal("0.9999")
+    assert state.live_orders[buy_id].price == Decimal("0.9998")
+    assert state.pending_amend(buy_id)["target_price"] == Decimal("0.9999")
 
 
 def test_executor_keeps_order_when_book_is_stale_by_default():
@@ -754,6 +783,7 @@ def test_executor_does_not_preserve_entry_buy_queue_when_inventory_high():
     config = BotConfig(mode="live")
     config.risk.min_free_quote_buffer = Decimal("0")
     config.strategy.preserve_entry_queue = True
+    config.strategy.account_inventory_skew_enabled = True
     state.set_book(
         state.book.__class__(
             ts_ms=1,
@@ -795,7 +825,8 @@ def test_executor_does_not_preserve_entry_buy_queue_when_inventory_high():
     assert len(rest.amend_calls) == 1
     assert rest.cancel_calls == []
     assert buy_id in state.live_orders
-    assert state.live_orders[buy_id].price == Decimal("0.9999")
+    assert state.live_orders[buy_id].price == Decimal("1")
+    assert state.pending_amend(buy_id)["target_price"] == Decimal("0.9999")
 
 
 def test_executor_preserves_entry_buy_queue_when_bot_short_even_if_account_inventory_high():
@@ -938,6 +969,7 @@ def test_executor_does_not_preserve_entry_sell_queue_when_inventory_low():
     config = BotConfig(mode="live")
     config.risk.min_free_base_buffer = Decimal("0")
     config.strategy.preserve_entry_queue = True
+    config.strategy.account_inventory_skew_enabled = True
     state.set_book(
         state.book.__class__(
             ts_ms=1,
@@ -981,7 +1013,8 @@ def test_executor_does_not_preserve_entry_sell_queue_when_inventory_low():
     assert len(rest.amend_calls) == 1
     assert rest.cancel_calls == []
     assert sell_id in state.live_orders
-    assert state.live_orders[sell_id].price == Decimal("1.0001")
+    assert state.live_orders[sell_id].price == Decimal("1.0000")
+    assert state.pending_amend(sell_id)["target_price"] == Decimal("1.0001")
 
 
 def test_executor_preserves_second_bid_queue_when_still_passive():
@@ -1382,7 +1415,8 @@ def test_executor_amends_entry_buy_when_old_price_no_longer_matches_new_target()
     assert rest.cancel_calls == []
     assert buy_id in state.live_orders
     assert state.live_orders[buy_id].cancel_requested is False
-    assert state.live_orders[buy_id].price == Decimal("0.9999")
+    assert state.live_orders[buy_id].price == Decimal("1")
+    assert state.pending_amend(buy_id)["target_price"] == Decimal("0.9999")
 
 
 def test_executor_reprices_existing_rebalance_sell_when_target_price_moves_higher():
@@ -1440,7 +1474,8 @@ def test_executor_reprices_existing_rebalance_sell_when_target_price_moves_highe
     assert rest.cancel_calls == []
     assert sell_id in state.live_orders
     assert state.live_orders[sell_id].cancel_requested is False
-    assert state.live_orders[sell_id].price == Decimal("1.0001")
+    assert state.live_orders[sell_id].price == Decimal("1")
+    assert state.pending_amend(sell_id)["target_price"] == Decimal("1.0001")
 
 
 def test_executor_reprices_existing_buy_when_target_moves_higher_for_dynamic_quote():
@@ -1492,7 +1527,8 @@ def test_executor_reprices_existing_buy_when_target_moves_higher_for_dynamic_quo
     assert rest.cancel_calls == []
     assert buy_id in state.live_orders
     assert state.live_orders[buy_id].cancel_requested is False
-    assert state.live_orders[buy_id].price == Decimal("0.9999")
+    assert state.live_orders[buy_id].price == Decimal("0.9998")
+    assert state.pending_amend(buy_id)["target_price"] == Decimal("0.9999")
 
 
 def test_executor_amends_partially_filled_sell_using_total_order_size():
@@ -1538,9 +1574,11 @@ def test_executor_amends_partially_filled_sell_using_total_order_size():
     assert rest.amend_calls[0]["new_size"] == Decimal("8600")
     assert rest.cancel_calls == []
     assert sell_id in state.live_orders
-    assert state.live_orders[sell_id].price == Decimal("1.0001")
-    assert state.live_orders[sell_id].size == Decimal("8600")
-    assert state.live_orders[sell_id].remaining_size == Decimal("5000")
+    assert state.live_orders[sell_id].price == Decimal("1.0000")
+    assert state.live_orders[sell_id].size == Decimal("10000")
+    assert state.live_orders[sell_id].remaining_size == Decimal("6400")
+    assert state.pending_amend(sell_id)["target_price"] == Decimal("1.0001")
+    assert state.pending_amend(sell_id)["target_size"] == Decimal("8600")
 
 
 def test_executor_falls_back_to_cancel_when_amend_fails():
@@ -1580,6 +1618,85 @@ def test_executor_falls_back_to_cancel_when_amend_fails():
     assert len(rest.cancel_calls) == 1
     assert buy_id in state.live_orders
     assert state.live_orders[buy_id].cancel_requested is True
+    assert state.pending_amend(buy_id) is None
+
+
+def test_executor_does_not_resubmit_same_amend_before_ws_confirms():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_quote_buffer = Decimal("0")
+    config.strategy.preserve_entry_queue = False
+    config.trading.action_cooldown_seconds = 0
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "0.9998",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        intent = OrderIntent(side="buy", price=Decimal("0.9999"), quote_notional=Decimal("9999"), reason="join_best_bid")
+        await executor._reconcile_side("buy", intent)
+        await executor._reconcile_side("buy", intent)
+
+    asyncio.run(run())
+
+    assert len(rest.amend_calls) == 1
+    assert state.pending_amend(buy_id) is not None
+
+
+def test_executor_handles_ws_amend_update_that_arrives_before_rest_returns():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_quote_buffer = Decimal("0")
+    config.strategy.preserve_entry_queue = False
+    config.trading.action_cooldown_seconds = 0
+    journal = StubJournal()
+    rest = RacingAmendRest(state)
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "0.9998",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            OrderIntent(side="buy", price=Decimal("0.9999"), quote_notional=Decimal("9999"), reason="join_best_bid"),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.amend_calls) == 1
+    assert rest.amend_resolutions == [("amend_order", rest.amend_resolutions[0][1])]
+    assert state.pending_amend(buy_id) is None
+    assert state.live_orders[buy_id].price == Decimal("0.9999")
+    assert state.live_orders[buy_id].size == Decimal("10000")
 
 
 def test_executor_caps_buy_size_by_available_quote_balance():

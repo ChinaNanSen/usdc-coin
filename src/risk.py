@@ -94,9 +94,17 @@ class RiskManager:
                 )
             state.reset_cancel_failures()
 
-        pnl = state.daily_pnl_quote()
-        if pnl is not None and pnl <= -self.config.daily_loss_limit_quote:
-            return RiskStatus(ok=False, reason=f"daily loss limit hit: {pnl}", allow_bid=False, allow_ask=False, runtime_state="STOPPED")
+        if (
+            self.config.realized_loss_shutdown_quote > 0
+            and state.live_realized_pnl_quote <= -self.config.realized_loss_shutdown_quote
+        ):
+            return RiskStatus(
+                ok=False,
+                reason=f"realized loss limit hit: {state.live_realized_pnl_quote}",
+                allow_bid=False,
+                allow_ask=False,
+                runtime_state="STOPPED",
+            )
 
         if state.book.mid is not None and self.config.peg_reference_price > 0:
             deviation_bps = (abs(state.book.mid - self.config.peg_reference_price) / self.config.peg_reference_price) * Decimal("10000")
@@ -106,7 +114,7 @@ class RiskManager:
                     reason=f"peg deviation too high: {deviation_bps}bps",
                     allow_bid=False,
                     allow_ask=False,
-                    runtime_state="STOPPED",
+                    runtime_state="PAUSED",
                 )
 
         if self.mode == "live" and self.config.enforce_effective_fee_gate and state.fee_snapshot:

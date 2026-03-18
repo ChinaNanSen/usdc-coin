@@ -1,0 +1,2078 @@
+commit b34dbda477a7059ecfaa2d1ceb544e5266311881
+Author: NanSen <nansen@example.com>
+Date:   Mon Mar 16 21:00:50 2026 +0800
+
+    完美1
+
+diff --git a/config/config.example.yaml b/config/config.example.yaml
+index ed21e14..28646c2 100644
+--- a/config/config.example.yaml
++++ b/config/config.example.yaml
+@@ -44,7 +44,11 @@ strategy:
+   min_visible_depth_multiplier: 3
+   rebalance_min_profit_ticks: 1
+   rebalance_reload_timeout_seconds: 180
++  rebalance_drift_ticks: 2
++  rebalance_max_order_age_seconds: 12
++  rebalance_release_size_factor: 0.50
+   rebalance_secondary_size_factor: 0.10
++  rebalance_overlay_floor_factor: 0.10
+   rebalance_secondary_price_offset_ticks: 1
+   normal_buy_price_cap: 0
+   normal_sell_price_floor: 0
+diff --git a/src/bot.py b/src/bot.py
+index a1445e0..189fcd6 100644
+--- a/src/bot.py
++++ b/src/bot.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import asyncio
+ import contextlib
+ import logging
++import traceback
+ from datetime import datetime, timezone
+ from decimal import Decimal
+ 
+@@ -92,10 +93,19 @@ class TrendBot6:
+                     await self._tick()
+                 except Exception as exc:
+                     logger.exception("Tick failed: %s", exc)
+-                    self.journal.append("tick_error", {"error": str(exc)})
+-                    self.state.request_resync(f"tick failure: {exc}")
++                    error_message = self._exception_message(exc)
++                    self.journal.append(
++                        "tick_error",
++                        {
++                            "error": str(exc),
++                            "error_repr": repr(exc),
++                            "error_type": type(exc).__name__,
++                            "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
++                        },
++                    )
++                    self.state.request_resync(f"tick failure: {error_message}")
+                     self.state.set_pause(
+-                        reason=f"tick failure: {exc}",
++                        reason=f"tick failure: {error_message}",
+                         duration_ms=int(self.config.risk.pause_after_reconnect_seconds * 1000),
+                     )
+                 await asyncio.sleep(self.config.trading.loop_interval_seconds)
+@@ -293,12 +303,33 @@ class TrendBot6:
+         self.state.record_consistency_result(report.ok, report.reason)
+         self.journal.append("consistency_check", {"context": context, "report": report})
+         if report.ok:
++            if context == "resync":
++                self.state.clear_resync_passive_violations()
+             return True
+ 
++        offending_order_ids = report.offending_managed_orders
++        if context == "resync" and offending_order_ids:
++            offending_order_ids = self.state.note_resync_passive_violations(report.offending_managed_orders)
++            if not offending_order_ids:
++                self.state.request_resync(f"{context} consistency failed: {report.reason}")
++                self.state.set_pause(
++                    reason=f"{context} passive price check deferred: {report.reason}",
++                    duration_ms=int(self.config.risk.pause_after_reconnect_seconds * 1000),
++                )
++                self.journal.append(
++                    "consistency_check_deferred",
++                    {
++                        "context": context,
++                        "reason": report.reason,
++                        "offending_managed_orders": report.offending_managed_orders,
++                    },
++                )
++                return False
++
+         if self.config.mode == "live" and report.cancel_managed and self.config.risk.cancel_managed_on_consistency_failure:
+-            if report.offending_managed_orders:
++            if offending_order_ids:
+                 await self.executor.cancel_managed_orders(
+-                    cl_ord_ids=report.offending_managed_orders,
++                    cl_ord_ids=offending_order_ids,
+                     reason=f"consistency_failure:{context}",
+                 )
+             else:
+@@ -315,6 +346,13 @@ class TrendBot6:
+         )
+         return False
+ 
++    @staticmethod
++    def _exception_message(exc: Exception) -> str:
++        text = str(exc).strip()
++        if text:
++            return f"{type(exc).__name__}: {text}"
++        return repr(exc)
++
+     async def _on_book(self, book) -> None:
+         previous_book = self.state.book
+         self.state.set_book(book)
+diff --git a/src/config.py b/src/config.py
+index 134c394..010e3cb 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -76,7 +76,11 @@ class StrategyConfig:
+     min_visible_depth_multiplier: Decimal = Decimal("3")
+     rebalance_min_profit_ticks: int = 1
+     rebalance_reload_timeout_seconds: float = 180.0
++    rebalance_drift_ticks: int = 2
++    rebalance_max_order_age_seconds: float = 12.0
++    rebalance_release_size_factor: Decimal = Decimal("0.50")
+     rebalance_secondary_size_factor: Decimal = Decimal("0.10")
++    rebalance_overlay_floor_factor: Decimal = Decimal("0.10")
+     rebalance_secondary_price_offset_ticks: int = 1
+     normal_buy_price_cap: Decimal = Decimal("0")
+     normal_sell_price_floor: Decimal = Decimal("0")
+diff --git a/src/executor.py b/src/executor.py
+index ce1a9fd..c699f33 100644
+--- a/src/executor.py
++++ b/src/executor.py
+@@ -509,6 +509,8 @@ class OrderExecutor:
+             return True
+         if self._should_preserve_partial_fill_with_same_price(primary=primary, intent=intent, base_size=base_size):
+             return True
++        if self._rebalance_order_requires_refresh(primary=primary, intent=intent):
++            return False
+         if self._should_preserve_entry_queue(primary=primary, intent=intent, base_size=base_size):
+             return True
+         if self._should_preserve_rebalance_queue(primary=primary, intent=intent, base_size=base_size):
+@@ -606,6 +608,8 @@ class OrderExecutor:
+             return False
+         if not self.state.instrument or not self.state.book:
+             return False
++        if self._rebalance_order_requires_refresh(primary=primary, intent=intent):
++            return False
+         if primary.remaining_size != base_size:
+             return False
+         if intent.reason == "rebalance_open_long":
+@@ -643,6 +647,46 @@ class OrderExecutor:
+             return (best_ask - primary.price) >= min_spread
+         return False
+ 
++    def _rebalance_order_requires_refresh(self, *, primary: LiveOrder, intent) -> bool:
++        rebalance_reasons = {
++            "rebalance_open_long",
++            "rebalance_open_short",
++            "rebalance_secondary_ask",
++            "rebalance_secondary_bid",
++        }
++        if intent.reason not in rebalance_reasons:
++            return False
++        return self._rebalance_order_age_exceeded(primary=primary) or self._rebalance_order_drift_exceeded(primary=primary)
++
++    def _rebalance_order_age_exceeded(self, *, primary: LiveOrder) -> bool:
++        max_age_ms = int(max(self.config.strategy.rebalance_max_order_age_seconds, 0) * 1000)
++        if max_age_ms <= 0:
++            return False
++        return max(now_ms() - primary.created_at_ms, 0) >= max_age_ms
++
++    def _rebalance_order_drift_exceeded(self, *, primary: LiveOrder) -> bool:
++        if not self.state.instrument or not self.state.book:
++            return False
++        threshold_ticks = max(int(self.config.strategy.rebalance_drift_ticks), 0)
++        if threshold_ticks <= 0:
++            return False
++        tick_size = self.state.instrument.tick_size
++        if tick_size <= 0:
++            return False
++        if primary.side == "sell":
++            best_price = self.state.book.best_ask.price if self.state.book.best_ask else None
++            if best_price is None or primary.price <= best_price:
++                return False
++            drift_ticks = int((primary.price - best_price) / tick_size)
++            return drift_ticks >= threshold_ticks
++        if primary.side == "buy":
++            best_price = self.state.book.best_bid.price if self.state.book.best_bid else None
++            if best_price is None or primary.price >= best_price:
++                return False
++            drift_ticks = int((best_price - primary.price) / tick_size)
++            return drift_ticks >= threshold_ticks
++        return False
++
+     @staticmethod
+     def _is_benign_terminal_cancel_error(exc: Exception) -> bool:
+         if not isinstance(exc, OKXAPIError):
+diff --git a/src/risk.py b/src/risk.py
+index c5a3966..d2e6976 100644
+--- a/src/risk.py
++++ b/src/risk.py
+@@ -130,12 +130,24 @@ class RiskManager:
+         allow_bid = state.free_balance(self.trading.quote_ccy) > self.config.min_free_quote_buffer
+         allow_ask = state.free_balance(self.trading.base_ccy) > self.config.min_free_base_buffer
+ 
+-        ratio = state.inventory_ratio()
+-        if ratio is not None:
+-            if ratio > self.config.hard_inventory_upper_pct:
+-                return RiskStatus(ok=allow_ask, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=allow_ask, runtime_state="REDUCE_ONLY")
+-            if ratio < self.config.hard_inventory_lower_pct:
+-                return RiskStatus(ok=allow_bid, reason="reduce_only_inventory_low", allow_bid=allow_bid, allow_ask=False, runtime_state="REDUCE_ONLY")
++        strategy_position = state.strategy_position_base()
++        min_position_size = state.instrument.min_size if state.instrument else Decimal("0")
++        if strategy_position >= min_position_size and not allow_ask:
++            return RiskStatus(
++                ok=False,
++                reason="bot long rebalance blocked",
++                allow_bid=False,
++                allow_ask=False,
++                runtime_state="PAUSED",
++            )
++        if strategy_position <= -min_position_size and not allow_bid:
++            return RiskStatus(
++                ok=False,
++                reason="bot short rebalance blocked",
++                allow_bid=False,
++                allow_ask=False,
++                runtime_state="PAUSED",
++            )
+ 
+         if not allow_bid and not allow_ask:
+             return RiskStatus(ok=False, reason="inventory/balance blocks both sides", allow_bid=False, allow_ask=False, runtime_state="PAUSED")
+diff --git a/src/state.py b/src/state.py
+index 0e165e2..e286960 100644
+--- a/src/state.py
++++ b/src/state.py
+@@ -50,6 +50,7 @@ class BotState:
+         self.live_position_lots: deque[StrategyLot] = deque()
+         self.initial_external_base_inventory: Decimal | None = None
+         self.external_base_inventory_remaining: Decimal = Decimal("0")
++        self._resync_passive_violation_counts: dict[str, int] = {}
+ 
+     def set_instrument(self, instrument: InstrumentMeta) -> None:
+         self.instrument = instrument
+@@ -325,6 +326,21 @@ class BotState:
+     def clear_resync(self) -> None:
+         self.resync_required = False
+         self.resync_reason = ""
++        self.clear_resync_passive_violations()
++
++    def note_resync_passive_violations(self, order_ids: tuple[str, ...]) -> tuple[str, ...]:
++        updated_counts: dict[str, int] = {}
++        escalated: list[str] = []
++        for order_id in order_ids:
++            count = self._resync_passive_violation_counts.get(order_id, 0) + 1
++            updated_counts[order_id] = count
++            if count >= 2:
++                escalated.append(order_id)
++        self._resync_passive_violation_counts = updated_counts
++        return tuple(escalated)
++
++    def clear_resync_passive_violations(self) -> None:
++        self._resync_passive_violation_counts.clear()
+ 
+     def mark_reconnect(self) -> None:
+         current = now_ms()
+@@ -462,6 +478,42 @@ class BotState:
+         target = min_open_price - tick_size * Decimal(max(profit_ticks, 0))
+         return quantize_down(target, tick_size)
+ 
++    def profitable_rebalance_sell_size(self, sell_price: Decimal, *, tick_size: Decimal, profit_ticks: int) -> Decimal:
++        if sell_price <= 0:
++            return Decimal("0")
++        required_edge = tick_size * Decimal(max(profit_ticks, 0))
++        profitable_size = Decimal("0")
++        matched_prefix = False
++        for lot in self.live_position_lots:
++            if lot.qty <= 0:
++                if matched_prefix:
++                    break
++                continue
++            matched_prefix = True
++            required_price = quantize_up(lot.price + required_edge, tick_size)
++            if sell_price < required_price:
++                break
++            profitable_size += lot.qty
++        return profitable_size
++
++    def profitable_rebalance_buy_size(self, buy_price: Decimal, *, tick_size: Decimal, profit_ticks: int) -> Decimal:
++        if buy_price <= 0:
++            return Decimal("0")
++        required_edge = tick_size * Decimal(max(profit_ticks, 0))
++        profitable_size = Decimal("0")
++        matched_prefix = False
++        for lot in self.live_position_lots:
++            if lot.qty >= 0:
++                if matched_prefix:
++                    break
++                continue
++            matched_prefix = True
++            required_price = quantize_down(lot.price - required_edge, tick_size)
++            if buy_price > required_price:
++                break
++            profitable_size += -lot.qty
++        return profitable_size
++
+     def inventory_ratio(self) -> Decimal | None:
+         if not self.instrument or not self.book or not self.book.mid:
+             return None
+diff --git a/src/strategy.py b/src/strategy.py
+index d9238ff..e1fff0f 100644
+--- a/src/strategy.py
++++ b/src/strategy.py
+@@ -38,6 +38,12 @@ class MicroMakerStrategy:
+             rebalance_buy_base=rebalance_buy_base,
+             rebalance_sell_base=rebalance_sell_base,
+         )
++        rebalance_mode = self._rebalance_mode(
++            state=state,
++            rebalance_buy_base=rebalance_buy_base,
++            rebalance_sell_base=rebalance_sell_base,
++            profit_ticks=rebalance_profit_ticks,
++        )
+         inventory_repair_steps = self._inventory_repair_step_count(
+             state=state,
+             rebalance_buy_base=rebalance_buy_base,
+@@ -60,6 +66,7 @@ class MicroMakerStrategy:
+                 rebalance_buy_base=rebalance_buy_base,
+                 rebalance_sell_base=rebalance_sell_base,
+                 rebalance_profit_ticks=rebalance_profit_ticks,
++                rebalance_mode=rebalance_mode,
+                 inventory_repair_steps=inventory_repair_steps,
+             )
+ 
+@@ -91,24 +98,26 @@ class MicroMakerStrategy:
+         ask = None
+         if risk_status.allow_bid:
+             if rebalance_buy_base > 0:
+-                bid_price = self._rebalance_bid_price(
++                bid_base_size, bid_price = self._rebalance_buy_target(
+                     state=state,
+-                    base_size=rebalance_buy_base,
++                    rebalance_buy_base=rebalance_buy_base,
+                     profit_ticks=rebalance_profit_ticks,
++                    rebalance_mode=rebalance_mode,
+                     inventory_repair_steps=inventory_repair_steps,
+                 )
+                 bid = OrderIntent(
+                     side="buy",
+                     price=bid_price,
+-                    quote_notional=rebalance_buy_base * bid_price,
++                    quote_notional=bid_base_size * bid_price,
+                     reason="rebalance_open_short",
+-                    base_size=rebalance_buy_base,
++                    base_size=bid_base_size,
+                 )
+             elif rebalance_sell_base > 0:
+                 bid = self._secondary_rebalance_bid_intent(
+                     state=state,
+                     base_size=bid_base_size,
+                     quote_notional=bid_quote_size,
++                    rebalance_mode=rebalance_mode,
+                     inventory_repair_steps=inventory_repair_steps,
+                 )
+             else:
+@@ -130,24 +139,26 @@ class MicroMakerStrategy:
+                 )
+         if risk_status.allow_ask:
+             if rebalance_sell_base > 0:
+-                ask_price = self._rebalance_ask_price(
++                ask_base_size, ask_price = self._rebalance_sell_target(
+                     state=state,
+-                    base_size=rebalance_sell_base,
++                    rebalance_sell_base=rebalance_sell_base,
+                     profit_ticks=rebalance_profit_ticks,
++                    rebalance_mode=rebalance_mode,
+                     inventory_repair_steps=inventory_repair_steps,
+                 )
+                 ask = OrderIntent(
+                     side="sell",
+                     price=ask_price,
+-                    quote_notional=rebalance_sell_base * ask_price,
++                    quote_notional=ask_base_size * ask_price,
+                     reason="rebalance_open_long",
+-                    base_size=rebalance_sell_base,
++                    base_size=ask_base_size,
+                 )
+             elif rebalance_buy_base > 0:
+                 ask = self._secondary_rebalance_ask_intent(
+                     state=state,
+                     base_size=ask_base_size,
+                     quote_notional=ask_quote_size,
++                    rebalance_mode=rebalance_mode,
+                     inventory_repair_steps=inventory_repair_steps,
+                 )
+             else:
+@@ -254,6 +265,7 @@ class MicroMakerStrategy:
+         rebalance_buy_base: Decimal,
+         rebalance_sell_base: Decimal,
+         rebalance_profit_ticks: int,
++        rebalance_mode: str,
+         inventory_repair_steps: int,
+     ) -> QuoteDecision:
+         target_side = self._strict_target_side(
+@@ -269,18 +281,19 @@ class MicroMakerStrategy:
+ 
+         if target_side == "buy" and risk_status.allow_bid:
+             if rebalance_buy_base > 0:
+-                bid_price = self._rebalance_bid_price(
++                bid_base_size, bid_price = self._rebalance_buy_target(
+                     state=state,
+-                    base_size=rebalance_buy_base,
++                    rebalance_buy_base=rebalance_buy_base,
+                     profit_ticks=rebalance_profit_ticks,
++                    rebalance_mode=rebalance_mode,
+                     inventory_repair_steps=inventory_repair_steps,
+                 )
+                 bid = OrderIntent(
+                     side="buy",
+                     price=bid_price,
+-                    quote_notional=rebalance_buy_base * bid_price,
++                    quote_notional=bid_base_size * bid_price,
+                     reason="rebalance_open_short",
+-                    base_size=rebalance_buy_base,
++                    base_size=bid_base_size,
+                 )
+             else:
+                 bid_price = state.book.best_bid.price
+@@ -297,18 +310,19 @@ class MicroMakerStrategy:
+ 
+         if target_side == "sell" and risk_status.allow_ask:
+             if rebalance_sell_base > 0:
+-                ask_price = self._rebalance_ask_price(
++                ask_base_size, ask_price = self._rebalance_sell_target(
+                     state=state,
+-                    base_size=rebalance_sell_base,
++                    rebalance_sell_base=rebalance_sell_base,
+                     profit_ticks=rebalance_profit_ticks,
++                    rebalance_mode=rebalance_mode,
+                     inventory_repair_steps=inventory_repair_steps,
+                 )
+                 ask = OrderIntent(
+                     side="sell",
+                     price=ask_price,
+-                    quote_notional=rebalance_sell_base * ask_price,
++                    quote_notional=ask_base_size * ask_price,
+                     reason="rebalance_open_long",
+-                    base_size=rebalance_sell_base,
++                    base_size=ask_base_size,
+                 )
+             else:
+                 ask_price = state.book.best_ask.price
+@@ -387,11 +401,135 @@ class MicroMakerStrategy:
+         profit_ticks: int,
+         inventory_repair_steps: int = 0,
+     ) -> Decimal:
++        bid_price = self._rebalance_bid_market_price(
++            state=state,
++            profit_ticks=profit_ticks,
++            inventory_repair_steps=inventory_repair_steps,
++        )
+         buy_price_cap = state.max_rebalance_buy_price(
+             base_size,
+             tick_size=state.instrument.tick_size,
+             profit_ticks=profit_ticks,
+         )
++        if buy_price_cap is not None:
++            bid_price = min(bid_price, buy_price_cap)
++        return quantize_down(bid_price, state.instrument.tick_size)
++
++    def _rebalance_ask_price(
++        self,
++        *,
++        state: BotState,
++        base_size: Decimal,
++        profit_ticks: int,
++        inventory_repair_steps: int = 0,
++    ) -> Decimal:
++        ask_price = self._rebalance_ask_market_price(
++            state=state,
++            profit_ticks=profit_ticks,
++            inventory_repair_steps=inventory_repair_steps,
++        )
++        sell_price_floor = state.min_rebalance_sell_price(
++            base_size,
++            tick_size=state.instrument.tick_size,
++            profit_ticks=profit_ticks,
++        )
++        if sell_price_floor is not None:
++            ask_price = max(ask_price, sell_price_floor)
++        return quantize_up(ask_price, state.instrument.tick_size)
++
++    def _rebalance_buy_target(
++        self,
++        *,
++        state: BotState,
++        rebalance_buy_base: Decimal,
++        profit_ticks: int,
++        rebalance_mode: str,
++        inventory_repair_steps: int = 0,
++    ) -> tuple[Decimal, Decimal]:
++        bid_market_price = self._rebalance_bid_market_price(
++            state=state,
++            profit_ticks=profit_ticks,
++            inventory_repair_steps=inventory_repair_steps,
++        )
++        bid_base_size = state.profitable_rebalance_buy_size(
++            bid_market_price,
++            tick_size=state.instrument.tick_size,
++            profit_ticks=profit_ticks,
++        )
++        if bid_base_size >= state.instrument.min_size:
++            bid_price = self._rebalance_bid_price(
++                state=state,
++                base_size=bid_base_size,
++                profit_ticks=profit_ticks,
++                inventory_repair_steps=inventory_repair_steps,
++            )
++            return bid_base_size, bid_price
++        if profit_ticks <= 0:
++            bid_base_size = self._competitive_rebalance_base_size(
++                state=state,
++                rebalance_base=rebalance_buy_base,
++                rebalance_mode=rebalance_mode,
++                inventory_repair_steps=inventory_repair_steps,
++            )
++            return bid_base_size, bid_market_price
++        bid_price = self._rebalance_bid_price(
++            state=state,
++            base_size=rebalance_buy_base,
++            profit_ticks=profit_ticks,
++            inventory_repair_steps=inventory_repair_steps,
++        )
++        return rebalance_buy_base, bid_price
++
++    def _rebalance_sell_target(
++        self,
++        *,
++        state: BotState,
++        rebalance_sell_base: Decimal,
++        profit_ticks: int,
++        rebalance_mode: str,
++        inventory_repair_steps: int = 0,
++    ) -> tuple[Decimal, Decimal]:
++        ask_market_price = self._rebalance_ask_market_price(
++            state=state,
++            profit_ticks=profit_ticks,
++            inventory_repair_steps=inventory_repair_steps,
++        )
++        ask_base_size = state.profitable_rebalance_sell_size(
++            ask_market_price,
++            tick_size=state.instrument.tick_size,
++            profit_ticks=profit_ticks,
++        )
++        if ask_base_size >= state.instrument.min_size:
++            ask_price = self._rebalance_ask_price(
++                state=state,
++                base_size=ask_base_size,
++                profit_ticks=profit_ticks,
++                inventory_repair_steps=inventory_repair_steps,
++            )
++            return ask_base_size, ask_price
++        if profit_ticks <= 0:
++            ask_base_size = self._competitive_rebalance_base_size(
++                state=state,
++                rebalance_base=rebalance_sell_base,
++                rebalance_mode=rebalance_mode,
++                inventory_repair_steps=inventory_repair_steps,
++            )
++            return ask_base_size, ask_market_price
++        ask_price = self._rebalance_ask_price(
++            state=state,
++            base_size=rebalance_sell_base,
++            profit_ticks=profit_ticks,
++            inventory_repair_steps=inventory_repair_steps,
++        )
++        return rebalance_sell_base, ask_price
++
++    def _rebalance_bid_market_price(
++        self,
++        *,
++        state: BotState,
++        profit_ticks: int,
++        inventory_repair_steps: int = 0,
++    ) -> Decimal:
+         bid_price = state.book.best_bid.price
+         bid_price = self._apply_rebalance_buy_improvement(
+             state=state,
+@@ -399,26 +537,18 @@ class MicroMakerStrategy:
+             inventory_repair_steps=inventory_repair_steps,
+             allow_inside_spread=profit_ticks <= 0,
+         )
+-        if buy_price_cap is not None:
+-            bid_price = min(bid_price, buy_price_cap)
+         hard_buy_cap = self._buy_price_cap(state=state)
+         if hard_buy_cap is not None:
+             bid_price = min(bid_price, hard_buy_cap)
+         return quantize_down(bid_price, state.instrument.tick_size)
+ 
+-    def _rebalance_ask_price(
++    def _rebalance_ask_market_price(
+         self,
+         *,
+         state: BotState,
+-        base_size: Decimal,
+         profit_ticks: int,
+         inventory_repair_steps: int = 0,
+     ) -> Decimal:
+-        sell_price_floor = state.min_rebalance_sell_price(
+-            base_size,
+-            tick_size=state.instrument.tick_size,
+-            profit_ticks=profit_ticks,
+-        )
+         ask_price = state.book.best_ask.price
+         ask_price = self._apply_rebalance_sell_improvement(
+             state=state,
+@@ -426,8 +556,6 @@ class MicroMakerStrategy:
+             inventory_repair_steps=inventory_repair_steps,
+             allow_inside_spread=profit_ticks <= 0,
+         )
+-        if sell_price_floor is not None:
+-            ask_price = max(ask_price, sell_price_floor)
+         return quantize_up(ask_price, state.instrument.tick_size)
+ 
+     def _entry_bid_price(
+@@ -441,6 +569,8 @@ class MicroMakerStrategy:
+         bid_price = state.book.best_bid.price
+         tick_size = state.instrument.tick_size
+         if skew_high:
++            if spread_ticks <= Decimal(self.config.min_spread_ticks):
++                return bid_price
+             passive_pull = bid_price - tick_size
+             return quantize_down(max(passive_pull, tick_size), tick_size)
+         if skew_low and spread_ticks > Decimal(self.config.min_spread_ticks):
+@@ -467,6 +597,8 @@ class MicroMakerStrategy:
+         ask_price = state.book.best_ask.price
+         tick_size = state.instrument.tick_size
+         if skew_low:
++            if spread_ticks <= Decimal(self.config.min_spread_ticks):
++                return ask_price
+             return quantize_up(ask_price + tick_size, tick_size)
+         if skew_high and spread_ticks > Decimal(self.config.min_spread_ticks):
+             improved = ask_price - tick_size
+@@ -480,9 +612,14 @@ class MicroMakerStrategy:
+         state: BotState,
+         base_size: Decimal | None,
+         quote_notional: Decimal,
++        rebalance_mode: str,
+         inventory_repair_steps: int = 0,
+     ) -> OrderIntent | None:
+-        tick_offset = max(self.config.rebalance_secondary_price_offset_ticks, 0)
++        tick_offset = self._secondary_rebalance_price_offset_ticks(
++            state=state,
++            side="buy",
++            rebalance_mode=rebalance_mode,
++        )
+         tick_size = state.instrument.tick_size
+         bid_price = state.book.best_bid.price - tick_size * Decimal(tick_offset)
+         bid_price = quantize_down(max(bid_price, tick_size), tick_size)
+@@ -496,6 +633,7 @@ class MicroMakerStrategy:
+             base_size=base_size,
+             quote_notional=quote_notional,
+             reason="rebalance_secondary_bid",
++            rebalance_mode=rebalance_mode,
+             inventory_repair_steps=inventory_repair_steps,
+         )
+ 
+@@ -505,9 +643,14 @@ class MicroMakerStrategy:
+         state: BotState,
+         base_size: Decimal | None,
+         quote_notional: Decimal,
++        rebalance_mode: str,
+         inventory_repair_steps: int = 0,
+     ) -> OrderIntent | None:
+-        tick_offset = max(self.config.rebalance_secondary_price_offset_ticks, 0)
++        tick_offset = self._secondary_rebalance_price_offset_ticks(
++            state=state,
++            side="sell",
++            rebalance_mode=rebalance_mode,
++        )
+         tick_size = state.instrument.tick_size
+         ask_price = state.book.best_ask.price + tick_size * Decimal(tick_offset)
+         ask_price = quantize_up(ask_price, tick_size)
+@@ -518,6 +661,7 @@ class MicroMakerStrategy:
+             base_size=base_size,
+             quote_notional=quote_notional,
+             reason="rebalance_secondary_ask",
++            rebalance_mode=rebalance_mode,
+             inventory_repair_steps=inventory_repair_steps,
+         )
+ 
+@@ -530,11 +674,17 @@ class MicroMakerStrategy:
+         base_size: Decimal | None,
+         quote_notional: Decimal,
+         reason: str,
++        rebalance_mode: str,
+         inventory_repair_steps: int = 0,
+     ) -> OrderIntent | None:
+         if not state.instrument or price <= 0:
+             return None
+-        factor = self._secondary_rebalance_size_factor(inventory_repair_steps=inventory_repair_steps)
++        factor = self._secondary_rebalance_size_factor(
++            state=state,
++            side=side,
++            rebalance_mode=rebalance_mode,
++            inventory_repair_steps=inventory_repair_steps,
++        )
+         if factor <= 0:
+             return None
+ 
+@@ -555,19 +705,6 @@ class MicroMakerStrategy:
+         if projected_base_size is None:
+             return None
+ 
+-        projected_ratio = self._projected_inventory_ratio(
+-            state=state,
+-            side=side,
+-            base_size=projected_base_size,
+-            price=price,
+-        )
+-        if projected_ratio is None:
+-            return None
+-        if side == "buy" and projected_ratio > self.config.inventory_target_pct:
+-            return None
+-        if side == "sell" and projected_ratio < self.config.inventory_target_pct:
+-            return None
+-
+         return self._entry_intent(
+             side=side,
+             price=price,
+@@ -597,6 +734,9 @@ class MicroMakerStrategy:
+         if not state.instrument:
+             return None
+         tick_size = state.instrument.tick_size
++        spread_ticks = state.book.spread / tick_size if state.book and tick_size > 0 else Decimal("0")
++        if spread_ticks < Decimal("2"):
++            return None
+         if primary.reason == "join_best_bid":
+             layered_price = quantize_down(max(primary.price - tick_size, tick_size), tick_size)
+             hard_buy_cap = self._buy_price_cap(state=state)
+@@ -653,6 +793,32 @@ class MicroMakerStrategy:
+             return profit_ticks
+         return 0
+ 
++    def _rebalance_mode(
++        self,
++        *,
++        state: BotState,
++        rebalance_buy_base: Decimal,
++        rebalance_sell_base: Decimal,
++        profit_ticks: int,
++    ) -> str:
++        if rebalance_buy_base <= 0 and rebalance_sell_base <= 0:
++            return "fresh"
++        if profit_ticks > 0:
++            return "fresh"
++        rebalance_side = "buy" if rebalance_buy_base > 0 else "sell"
++        lot_age_ms = state.oldest_rebalance_lot_age_ms(rebalance_side, reference_ms=now_ms())
++        oldest_lot = state.oldest_rebalance_lot(rebalance_side)
++        if lot_age_ms is None or oldest_lot is None:
++            return "aged"
++
++        max_age_ms = int(max(self.config.rebalance_max_order_age_seconds, 0) * 1000)
++        drift_ticks = self._rebalance_lot_drift_ticks(state=state, lot=oldest_lot)
++        if max_age_ms > 0 and lot_age_ms >= max_age_ms:
++            return "release"
++        if drift_ticks >= max(int(self.config.rebalance_drift_ticks), 0):
++            return "release"
++        return "aged"
++
+     @staticmethod
+     def _rebalance_reload_condition_changed(*, state: BotState, rebalance_side: str, lot) -> bool:
+         if not state.book or not state.book.best_bid or not state.book.best_ask:
+@@ -665,6 +831,20 @@ class MicroMakerStrategy:
+             return True
+         return False
+ 
++    @staticmethod
++    def _rebalance_lot_drift_ticks(*, state: BotState, lot) -> int:
++        if not state.instrument or not state.book or not state.book.best_bid or not state.book.best_ask:
++            return 0
++        tick_size = state.instrument.tick_size
++        if tick_size <= 0:
++            return 0
++        drift_ticks = Decimal("0")
++        if lot.reference_best_bid is not None:
++            drift_ticks = max(drift_ticks, abs(state.book.best_bid.price - lot.reference_best_bid) / tick_size)
++        if lot.reference_best_ask is not None:
++            drift_ticks = max(drift_ticks, abs(state.book.best_ask.price - lot.reference_best_ask) / tick_size)
++        return int(drift_ticks)
++
+     def _inventory_repair_step_count(
+         self,
+         *,
+@@ -686,10 +866,95 @@ class MicroMakerStrategy:
+             return 0
+         return int(lot_age_ms // step_ms)
+ 
+-    def _secondary_rebalance_size_factor(self, *, inventory_repair_steps: int) -> Decimal:
+-        factor = self.config.rebalance_secondary_size_factor
++    def _secondary_rebalance_size_factor(
++        self,
++        *,
++        state: BotState,
++        side: str,
++        rebalance_mode: str,
++        inventory_repair_steps: int,
++    ) -> Decimal:
++        factor = max(self.config.rebalance_secondary_size_factor, Decimal("0"))
++        if factor <= 0 or rebalance_mode == "release":
++            return Decimal("0")
++        if inventory_repair_steps > 1 and rebalance_mode != "fresh":
++            repair_penalty = min(Decimal("0.50"), Decimal(inventory_repair_steps - 1) * Decimal("0.10"))
++            factor *= Decimal("1") - repair_penalty
++        factor *= self._secondary_rebalance_position_taper(
++            state=state,
++            side=side,
++            rebalance_mode=rebalance_mode,
++        )
+         return factor
+ 
++    def _competitive_rebalance_base_size(
++        self,
++        *,
++        state: BotState,
++        rebalance_base: Decimal,
++        rebalance_mode: str,
++        inventory_repair_steps: int,
++    ) -> Decimal:
++        if not state.instrument:
++            return rebalance_base
++        reference_base_size = self._entry_base_size(state=state)
++        if reference_base_size is None or reference_base_size <= 0:
++            return rebalance_base
++        release_factor = min(max(self.config.rebalance_release_size_factor, Decimal("0")), Decimal("1"))
++        if rebalance_mode == "release":
++            step_bonus = Decimal(max(inventory_repair_steps - 1, 0)) * Decimal("0.25")
++            release_factor = min(Decimal("1"), release_factor + step_bonus)
++        target_base_size = reference_base_size * release_factor
++        unwind_base_size = quantize_down(min(rebalance_base, target_base_size), state.instrument.lot_size)
++        if unwind_base_size < state.instrument.min_size:
++            return rebalance_base
++        return unwind_base_size
++
++    def _secondary_rebalance_position_taper(self, *, state: BotState, side: str, rebalance_mode: str) -> Decimal:
++        if rebalance_mode == "release":
++            return Decimal("0")
++        reference_base_size = self._entry_base_size(state=state)
++        if reference_base_size is None or reference_base_size <= 0:
++            return Decimal("1")
++
++        adverse_position = self._secondary_rebalance_adverse_position(state=state, side=side)
++        if adverse_position <= reference_base_size:
++            return Decimal("1")
++
++        fade_limit = reference_base_size * Decimal("2")
++        if adverse_position >= fade_limit:
++            return Decimal("0")
++
++        base_factor = max(self.config.rebalance_secondary_size_factor, Decimal("0"))
++        if base_factor <= 0:
++            return Decimal("0")
++        floor_factor = min(max(self.config.rebalance_overlay_floor_factor, Decimal("0")), base_factor)
++        floor_ratio = floor_factor / base_factor
++        progress = (adverse_position - reference_base_size) / reference_base_size
++        taper = Decimal("1") - progress * (Decimal("1") - floor_ratio)
++        return max(floor_ratio, taper)
++
++    def _secondary_rebalance_price_offset_ticks(self, *, state: BotState, side: str, rebalance_mode: str) -> int:
++        offset = max(self.config.rebalance_secondary_price_offset_ticks, 0)
++        if rebalance_mode == "release":
++            return offset + 1
++        reference_base_size = self._entry_base_size(state=state)
++        if reference_base_size is None or reference_base_size <= 0:
++            return offset
++        adverse_position = self._secondary_rebalance_adverse_position(state=state, side=side)
++        if adverse_position > reference_base_size:
++            return offset + 1
++        return offset
++
++    @staticmethod
++    def _secondary_rebalance_adverse_position(*, state: BotState, side: str) -> Decimal:
++        strategy_position = state.strategy_position_base()
++        if side == "buy":
++            return max(strategy_position, Decimal("0"))
++        if side == "sell":
++            return max(-strategy_position, Decimal("0"))
++        return Decimal("0")
++
+     @staticmethod
+     def _available_passive_improvement_ticks(*, best_price: Decimal, opposite_price: Decimal, tick_size: Decimal) -> int:
+         if tick_size <= 0:
+@@ -705,6 +970,26 @@ class MicroMakerStrategy:
+         inventory_repair_steps: int,
+         allow_inside_spread: bool,
+     ) -> Decimal:
++        if not allow_inside_spread or inventory_repair_steps <= 0 or not state.instrument or not state.book:
++            return price
++        best_bid = state.book.best_bid.price if state.book.best_bid else None
++        best_ask = state.book.best_ask.price if state.book.best_ask else None
++        if best_bid is None or best_ask is None:
++            return price
++        improvement_ticks = min(
++            inventory_repair_steps,
++            self._available_passive_improvement_ticks(
++                best_price=best_bid,
++                opposite_price=best_ask,
++                tick_size=state.instrument.tick_size,
++            ),
++        )
++        if improvement_ticks <= 0:
++            return price
++        improved = price + state.instrument.tick_size * Decimal(improvement_ticks)
++        improved = min(improved, best_ask - state.instrument.tick_size)
++        return quantize_down(improved, state.instrument.tick_size)
++
+         return price
+ 
+     def _apply_rebalance_sell_improvement(
+@@ -715,6 +1000,26 @@ class MicroMakerStrategy:
+         inventory_repair_steps: int,
+         allow_inside_spread: bool,
+     ) -> Decimal:
++        if not allow_inside_spread or inventory_repair_steps <= 0 or not state.instrument or not state.book:
++            return price
++        best_bid = state.book.best_bid.price if state.book.best_bid else None
++        best_ask = state.book.best_ask.price if state.book.best_ask else None
++        if best_bid is None or best_ask is None:
++            return price
++        improvement_ticks = min(
++            inventory_repair_steps,
++            self._available_passive_improvement_ticks(
++                best_price=best_bid,
++                opposite_price=best_ask,
++                tick_size=state.instrument.tick_size,
++            ),
++        )
++        if improvement_ticks <= 0:
++            return price
++        improved = price - state.instrument.tick_size * Decimal(improvement_ticks)
++        improved = max(improved, best_bid + state.instrument.tick_size)
++        return quantize_up(improved, state.instrument.tick_size)
++
+         return price
+ 
+     @staticmethod
+diff --git a/tests/test_bot.py b/tests/test_bot.py
+index c24b8b6..06ac4d9 100644
+--- a/tests/test_bot.py
++++ b/tests/test_bot.py
+@@ -183,15 +183,129 @@ def test_consistency_resync_cancels_only_offending_managed_orders(tmp_path):
+     )
+ 
+     try:
+-        ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
++        first_ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
++        second_ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
+     finally:
+         bot.audit_store.close()
+ 
+-    assert ok is False
++    assert first_ok is False
++    assert second_ok is False
+     assert selective_calls == [((bad_sell_id,), "consistency_failure:resync")]
+     assert all_cancel_calls == []
+ 
+ 
++def test_consistency_resync_debounce_clears_after_success(tmp_path):
++    config = BotConfig(mode="live")
++    config.risk.cancel_managed_on_consistency_failure = True
++    config.telemetry.sqlite_enabled = False
++    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
++    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
++    config.telemetry.state_path = str(tmp_path / "state.json")
++
++    bot = TrendBot6(config)
++    selective_calls: list[tuple[tuple[str, ...], str]] = []
++
++    async def fake_cancel_managed_orders(*, cl_ord_ids, reason: str) -> None:
++        selective_calls.append((tuple(cl_ord_ids), reason))
++
++    bot.executor.cancel_managed_orders = fake_cancel_managed_orders  # type: ignore[method-assign]
++
++    bot.state.set_instrument(
++        InstrumentMeta(
++            inst_id="USDC-USDT",
++            inst_type="SPOT",
++            base_ccy="USDC",
++            quote_ccy="USDT",
++            tick_size=Decimal("0.0001"),
++            lot_size=Decimal("0.000001"),
++            min_size=Decimal("1"),
++            max_market_amount=Decimal("1000000"),
++            max_limit_amount=Decimal("20000000"),
++        )
++    )
++    bot.state.set_book(make_book(bid="0.9999", ask="1.0000", ts_ms=1))
++    bot.state.set_balances(
++        {
++            "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("50000")),
++            "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("50000")),
++        }
++    )
++
++    bad_sell_id = build_cl_ord_id("bot6", "sell")
++    bot.state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "1",
++            "clOrdId": bad_sell_id,
++            "px": "0.9999",
++            "sz": "1000",
++            "accFillSz": "0",
++            "state": "live",
++            "cTime": "1",
++            "uTime": "1",
++        },
++        source="test",
++    )
++
++    try:
++        first_ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
++        bot.state.set_book(make_book(bid="0.9998", ask="0.9999", ts_ms=2))
++        cleared_ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
++        bot.state.set_book(make_book(bid="0.9999", ask="1.0000", ts_ms=3))
++        second_first_ok = asyncio.run(bot._run_consistency_check(context="resync", stop_on_failure=False))
++    finally:
++        bot.audit_store.close()
++
++    assert first_ok is False
++    assert cleared_ok is True
++    assert second_first_ok is False
++    assert selective_calls == []
++
++
++def test_run_logs_tick_error_repr_and_traceback(tmp_path):
++    config = BotConfig(mode="shadow")
++    config.telemetry.sqlite_enabled = False
++    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
++    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
++    config.telemetry.state_path = str(tmp_path / "state.json")
++
++    bot = TrendBot6(config)
++    bot.journal = StubJournal()
++
++    async def fake_bootstrap() -> None:
++        bot.state.set_runtime_state("READY", "test bootstrap")
++
++    async def fake_tick() -> None:
++        raise Exception()
++
++    async def fake_sleep(_: float) -> None:
++        bot.state.set_runtime_state("STOPPED", "done")
++
++    async def fake_shutdown() -> None:
++        return None
++
++    original_sleep = asyncio.sleep
++    bot._bootstrap = fake_bootstrap  # type: ignore[method-assign]
++    bot._tick = fake_tick  # type: ignore[method-assign]
++    bot.shutdown = fake_shutdown  # type: ignore[method-assign]
++    asyncio.sleep = fake_sleep  # type: ignore[assignment]
++
++    try:
++        asyncio.run(bot.run())
++    finally:
++        asyncio.sleep = original_sleep  # type: ignore[assignment]
++        bot.audit_store.close()
++
++    tick_errors = [payload for event, payload in bot.journal.events if event == "tick_error"]
++    assert len(tick_errors) == 1
++    assert tick_errors[0]["error"] == ""
++    assert tick_errors[0]["error_repr"] == "Exception()"
++    assert tick_errors[0]["error_type"] == "Exception"
++    assert "fake_tick" in tick_errors[0]["traceback"]
++    assert bot.state.resync_reason == "tick failure: Exception()"
++
++
+ def test_on_book_triggers_debounced_quote_cycle_when_top_price_changes(tmp_path):
+     config = BotConfig(mode="shadow")
+     config.telemetry.sqlite_enabled = False
+diff --git a/tests/test_okx_rest.py b/tests/test_okx_rest.py
+index 3ea6589..80e2393 100644
+--- a/tests/test_okx_rest.py
++++ b/tests/test_okx_rest.py
+@@ -1038,6 +1038,7 @@ def test_executor_preserves_secondary_rebalance_ask_queue_when_still_passive():
+     config = BotConfig(mode="live")
+     config.risk.min_free_base_buffer = Decimal("0")
+     config.strategy.preserve_rebalance_queue = True
++    config.strategy.rebalance_max_order_age_seconds = 0
+     state.set_book(
+         state.book.__class__(
+             ts_ms=1,
+@@ -1084,6 +1085,254 @@ def test_executor_preserves_secondary_rebalance_ask_queue_when_still_passive():
+     assert state.live_orders[sell_id].price == Decimal("1.0000")
+ 
+ 
++def test_executor_same_target_rebalance_sell_does_not_force_refresh_when_target_is_unchanged():
++    state = make_state()
++    config = BotConfig(mode="live")
++    config.risk.min_free_base_buffer = Decimal("0")
++    config.strategy.rebalance_drift_ticks = 2
++    config.strategy.rebalance_max_order_age_seconds = 0
++    state.set_book(
++        state.book.__class__(
++            ts_ms=1,
++            received_ms=1,
++            bids=[
++                state.book.bids[0].__class__(price=Decimal("0.9998"), size=Decimal("100000"), order_count=0),
++            ],
++            asks=[
++                state.book.asks[0].__class__(price=Decimal("1.0000"), size=Decimal("100000"), order_count=0),
++            ],
++        )
++    )
++    journal = StubJournal()
++    rest = TrackingRest()
++    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
++    buy_id = build_cl_ord_id("bot6", "buy")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "b1",
++            "clOrdId": buy_id,
++            "px": "1.0000",
++            "fillPx": "1.0000",
++            "sz": "10000",
++            "accFillSz": "10000",
++            "state": "filled",
++            "cTime": "1",
++            "uTime": "2",
++        },
++        source="test",
++    )
++    sell_id = build_cl_ord_id("bot6", "sell")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "s1",
++            "clOrdId": sell_id,
++            "px": "1.0003",
++            "sz": "10000",
++            "accFillSz": "0",
++            "state": "live",
++            "cTime": "3",
++            "uTime": "3",
++        },
++        source="test",
++    )
++
++    primary = state.live_orders[sell_id]
++    intent = OrderIntent(
++        side="sell",
++        price=Decimal("1.0003"),
++        quote_notional=Decimal("10003"),
++        reason="rebalance_open_long",
++        base_size=Decimal("10000"),
++    )
++
++    assert executor._same_live_order_target(primary=primary, intent=intent, base_size=Decimal("10000")) is True
++
++
++def test_executor_same_target_rebalance_buy_does_not_force_refresh_when_target_is_unchanged(monkeypatch):
++    monkeypatch.setattr("src.executor.now_ms", lambda: 10_000)
++    state = make_state()
++    config = BotConfig(mode="live")
++    config.risk.min_free_quote_buffer = Decimal("0")
++    config.strategy.rebalance_max_order_age_seconds = 5
++    config.strategy.rebalance_drift_ticks = 0
++    journal = StubJournal()
++    rest = TrackingRest()
++    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
++    sell_id = build_cl_ord_id("bot6", "sell")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "s1",
++            "clOrdId": sell_id,
++            "px": "1.0001",
++            "fillPx": "1.0001",
++            "sz": "10000",
++            "accFillSz": "10000",
++            "state": "filled",
++            "cTime": "1",
++            "uTime": "2",
++        },
++        source="test",
++    )
++    buy_id = build_cl_ord_id("bot6", "buy")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "b1",
++            "clOrdId": buy_id,
++            "px": "1.0000",
++            "sz": "10000",
++            "accFillSz": "0",
++            "state": "live",
++            "cTime": "1",
++            "uTime": "1",
++        },
++        source="test",
++    )
++
++    primary = state.live_orders[buy_id]
++    intent = OrderIntent(
++        side="buy",
++        price=Decimal("1.0000"),
++        quote_notional=Decimal("10000"),
++        reason="rebalance_open_short",
++        base_size=Decimal("10000"),
++    )
++
++    assert executor._same_live_order_target(primary=primary, intent=intent, base_size=Decimal("10000")) is True
++
++
++def test_executor_rebalance_sell_refresh_blocks_preserve_when_price_drifted_farther():
++    state = make_state()
++    config = BotConfig(mode="live")
++    config.risk.min_free_base_buffer = Decimal("0")
++    config.strategy.preserve_rebalance_queue = True
++    config.strategy.rebalance_drift_ticks = 2
++    config.strategy.rebalance_max_order_age_seconds = 0
++    state.set_book(
++        state.book.__class__(
++            ts_ms=1,
++            received_ms=1,
++            bids=[
++                state.book.bids[0].__class__(price=Decimal("0.9998"), size=Decimal("100000"), order_count=0),
++            ],
++            asks=[
++                state.book.asks[0].__class__(price=Decimal("1.0000"), size=Decimal("100000"), order_count=0),
++            ],
++        )
++    )
++    journal = StubJournal()
++    rest = TrackingRest()
++    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
++    buy_id = build_cl_ord_id("bot6", "buy")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "b1",
++            "clOrdId": buy_id,
++            "px": "1.0000",
++            "fillPx": "1.0000",
++            "sz": "10000",
++            "accFillSz": "10000",
++            "state": "filled",
++            "cTime": "1",
++            "uTime": "2",
++        },
++        source="test",
++    )
++    sell_id = build_cl_ord_id("bot6", "sell")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "s1",
++            "clOrdId": sell_id,
++            "px": "1.0003",
++            "sz": "10000",
++            "accFillSz": "0",
++            "state": "live",
++            "cTime": "3",
++            "uTime": "3",
++        },
++        source="test",
++    )
++
++    primary = state.live_orders[sell_id]
++    shifted_intent = OrderIntent(
++        side="sell",
++        price=Decimal("1.0001"),
++        quote_notional=Decimal("10001"),
++        reason="rebalance_open_long",
++        base_size=Decimal("10000"),
++    )
++
++    assert executor._should_keep_existing_order(primary=primary, intent=shifted_intent, base_size=Decimal("10000")) is False
++
++
++def test_executor_rebalance_buy_refresh_blocks_preserve_when_order_is_too_old(monkeypatch):
++    monkeypatch.setattr("src.executor.now_ms", lambda: 10_000)
++    state = make_state()
++    config = BotConfig(mode="live")
++    config.risk.min_free_quote_buffer = Decimal("0")
++    config.strategy.preserve_rebalance_queue = True
++    config.strategy.rebalance_max_order_age_seconds = 5
++    config.strategy.rebalance_drift_ticks = 0
++    journal = StubJournal()
++    rest = TrackingRest()
++    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
++    sell_id = build_cl_ord_id("bot6", "sell")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "s1",
++            "clOrdId": sell_id,
++            "px": "1.0001",
++            "fillPx": "1.0001",
++            "sz": "10000",
++            "accFillSz": "10000",
++            "state": "filled",
++            "cTime": "1",
++            "uTime": "2",
++        },
++        source="test",
++    )
++    buy_id = build_cl_ord_id("bot6", "buy")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "b1",
++            "clOrdId": buy_id,
++            "px": "1.0000",
++            "sz": "10000",
++            "accFillSz": "0",
++            "state": "live",
++            "cTime": "1",
++            "uTime": "1",
++        },
++        source="test",
++    )
++
++    primary = state.live_orders[buy_id]
++    shifted_intent = OrderIntent(
++        side="buy",
++        price=Decimal("0.9999"),
++        quote_notional=Decimal("9999"),
++        reason="rebalance_open_short",
++        base_size=Decimal("10000"),
++    )
++
++    assert executor._should_keep_existing_order(primary=primary, intent=shifted_intent, base_size=Decimal("10000")) is False
++
++
+ def test_executor_amends_entry_buy_when_old_price_no_longer_matches_new_target():
+     state = make_state()
+     config = BotConfig(mode="live")
+diff --git a/tests/test_risk.py b/tests/test_risk.py
+index 847f838..129941d 100644
+--- a/tests/test_risk.py
++++ b/tests/test_risk.py
+@@ -96,16 +96,110 @@ def test_risk_blocks_when_streams_not_ready_in_live_mode():
+     assert status.runtime_state == "INIT"
+ 
+ 
+-def test_risk_enters_reduce_only_when_inventory_too_high():
++def test_risk_does_not_enter_reduce_only_from_account_inventory_when_bot_is_flat():
+     risk = RiskManager(RiskConfig(), TradingConfig(), mode="shadow")
+     state = make_state()
+     state.balances["USDC"] = Balance(ccy="USDC", total=Decimal("90000"), available=Decimal("90000"))
+     state.balances["USDT"] = Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000"))
+     status = risk.evaluate(state)
+     assert status.ok is True
+-    assert status.allow_bid is False
++    assert status.allow_bid is True
+     assert status.allow_ask is True
+-    assert status.runtime_state == "REDUCE_ONLY"
++    assert status.runtime_state == "READY"
++
++
++def test_risk_allows_bot_short_to_keep_buy_side_even_when_account_inventory_is_high():
++    risk = RiskManager(RiskConfig(), TradingConfig(), mode="shadow")
++    state = make_state()
++    state.balances["USDC"] = Balance(ccy="USDC", total=Decimal("90000"), available=Decimal("90000"))
++    state.balances["USDT"] = Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000"))
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "1",
++            "clOrdId": "bot6ms-test",
++            "px": "1.0000",
++            "fillPx": "1.0000",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1",
++            "uTime": "2",
++        },
++        source="test",
++    )
++
++    status = risk.evaluate(state)
++
++    assert status.ok is True
++    assert status.allow_bid is True
++    assert status.allow_ask is True
++    assert status.runtime_state == "READY"
++
++
++def test_risk_pauses_when_bot_short_cannot_rebalance_buy_side():
++    risk = RiskManager(
++        RiskConfig(min_free_quote_buffer=Decimal("1000"), daily_loss_limit_quote=Decimal("1000000")),
++        TradingConfig(),
++        mode="shadow",
++    )
++    state = make_state()
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "1",
++            "clOrdId": "bot6ms-test",
++            "px": "1.0000",
++            "fillPx": "1.0000",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1",
++            "uTime": "2",
++        },
++        source="test",
++    )
++    state.balances["USDT"] = Balance(ccy="USDT", total=Decimal("500"), available=Decimal("500"))
++
++    status = risk.evaluate(state)
++
++    assert status.ok is False
++    assert status.reason == "bot short rebalance blocked"
++    assert status.runtime_state == "PAUSED"
++
++
++def test_risk_pauses_when_bot_long_cannot_rebalance_sell_side():
++    risk = RiskManager(
++        RiskConfig(min_free_base_buffer=Decimal("1000"), daily_loss_limit_quote=Decimal("1000000")),
++        TradingConfig(),
++        mode="shadow",
++    )
++    state = make_state()
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "1",
++            "clOrdId": "bot6mb-test",
++            "px": "1.0000",
++            "fillPx": "1.0000",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1",
++            "uTime": "2",
++        },
++        source="test",
++    )
++    state.balances["USDC"] = Balance(ccy="USDC", total=Decimal("500"), available=Decimal("500"))
++
++    status = risk.evaluate(state)
++
++    assert status.ok is False
++    assert status.reason == "bot long rebalance blocked"
++    assert status.runtime_state == "PAUSED"
+ 
+ 
+ def test_risk_stops_on_fee_gate():
+diff --git a/tests/test_strategy.py b/tests/test_strategy.py
+index 292b375..57ffd08 100644
+--- a/tests/test_strategy.py
++++ b/tests/test_strategy.py
+@@ -55,8 +55,16 @@ def test_strategy_quotes_both_sides_near_target_inventory():
+ 
+ def test_strategy_can_emit_two_layers_per_side_when_enabled():
+     strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig(), max_orders_per_side=2)
++    state = build_state("50000", "50000")
++    state.set_book(
++        BookSnapshot(
++            ts_ms=9999999999999,
++            bids=[BookLevel(price=Decimal("0.9998"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
++        )
++    )
+     decision = strategy.decide(
+-        build_state("50000", "50000"),
++        state,
+         RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+     )
+ 
+@@ -64,14 +72,29 @@ def test_strategy_can_emit_two_layers_per_side_when_enabled():
+     assert decision.ask is not None
+     assert len(decision.bid_layers) == 2
+     assert len(decision.ask_layers) == 2
+-    assert decision.bid_layers[0].price == Decimal("0.9999")
+-    assert decision.bid_layers[1].price == Decimal("0.9998")
++    assert decision.bid_layers[0].price == Decimal("0.9998")
++    assert decision.bid_layers[1].price == Decimal("0.9997")
+     assert decision.ask_layers[0].price == Decimal("1.0000")
+     assert decision.ask_layers[1].price == Decimal("1.0001")
+     assert decision.bid_layers[1].reason == "join_second_bid"
+     assert decision.ask_layers[1].reason == "join_second_ask"
+ 
+ 
++def test_strategy_does_not_emit_second_entry_layer_when_spread_is_one_tick():
++    strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig(), max_orders_per_side=2)
++    decision = strategy.decide(
++        build_state("50000", "50000"),
++        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
++    )
++
++    assert decision.bid is not None
++    assert decision.ask is not None
++    assert len(decision.bid_layers) == 1
++    assert len(decision.ask_layers) == 1
++    assert decision.bid_layers[0].reason == "join_best_bid"
++    assert decision.ask_layers[0].reason == "join_best_ask"
++
++
+ def test_strategy_uses_bot_position_to_bias_secondary_side_even_when_account_inventory_disagrees():
+     strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig(entry_base_size=Decimal("5000"), quote_size=Decimal("5000")))
+     state = build_state("70000", "30000")
+@@ -352,7 +375,7 @@ def test_strategy_uses_soft_band_to_reduce_bid_and_keep_two_sided_quotes():
+     )
+     assert decision.bid is not None
+     assert decision.ask is not None
+-    assert decision.bid.price == Decimal("0.9998")
++    assert decision.bid.price == Decimal("0.9999")
+     assert decision.bid.quote_notional == Decimal("5000")
+     assert decision.reason == "two_sided"
+ 
+@@ -400,7 +423,7 @@ def test_strategy_starts_reducing_bid_after_crossing_soft_upper_band():
+ 
+     assert decision.bid is not None
+     assert decision.ask is not None
+-    assert decision.bid.price == Decimal("0.9998")
++    assert decision.bid.price == Decimal("0.9999")
+     assert Decimal("5000") < decision.bid.quote_notional < Decimal("5100")
+     assert decision.ask.price == Decimal("1.0000")
+     assert decision.ask.quote_notional == Decimal("10000")
+@@ -427,11 +450,34 @@ def test_strategy_starts_reducing_ask_after_crossing_soft_lower_band():
+     assert decision.ask is not None
+     assert decision.bid.price == Decimal("0.9999")
+     assert decision.bid.quote_notional == Decimal("10000")
+-    assert decision.ask.price == Decimal("1.0001")
++    assert decision.ask.price == Decimal("1.0000")
+     assert decision.ask.quote_notional == Decimal("5000")
+     assert decision.reason == "two_sided"
+ 
+ 
++def test_strategy_still_uses_price_skew_when_spread_exceeds_one_tick():
++    strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig())
++    state = build_state("70000", "30000")
++    state.set_book(
++        BookSnapshot(
++            ts_ms=9999999999999,
++            bids=[BookLevel(price=Decimal("0.9998"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
++        )
++    )
++
++    decision = strategy.decide(
++        state,
++        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
++    )
++
++    assert decision.bid is not None
++    assert decision.ask is not None
++    assert decision.bid.price == Decimal("0.9997")
++    assert decision.ask.price == Decimal("0.9999")
++    assert decision.reason == "two_sided"
++
++
+ def test_strategy_uses_exact_fill_size_to_rebalance_open_long():
+     strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig())
+     state = build_state("50000", "50000")
+@@ -462,11 +508,14 @@ def test_strategy_uses_exact_fill_size_to_rebalance_open_long():
+ 
+     decision = strategy.decide(state, RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True))
+ 
+-    assert decision.bid is None
++    assert decision.bid is not None
++    assert decision.bid.reason == "rebalance_secondary_bid"
++    assert decision.bid.price == Decimal("0.9999")
++    assert decision.bid.quote_notional == Decimal("500.0000")
+     assert decision.ask is not None
+     assert decision.ask.base_size == Decimal("10000")
+     assert decision.ask.quote_notional == Decimal("10001")
+-    assert decision.reason == "fill_rebalance_sell_only"
++    assert decision.reason == "fill_rebalance_sell_biased"
+ 
+ 
+ def test_strategy_rebalance_sell_respects_min_profit_ticks():
+@@ -758,7 +807,8 @@ def test_strategy_rebalance_sell_downgrades_only_after_timeout_and_top_change(mo
+ 
+     assert decision.bid is None
+     assert decision.ask is not None
+-    assert decision.ask.price == Decimal("1")
++    assert decision.ask.base_size == Decimal("10000")
++    assert decision.ask.price == Decimal("0.9999")
+     assert decision.reason == "fill_rebalance_sell_only"
+ 
+ 
+@@ -886,6 +936,102 @@ def test_strategy_rebalance_buy_does_not_move_inside_spread_after_timeout(monkey
+     assert decision.bid.price == Decimal("0.9999")
+ 
+ 
++def test_strategy_rebalance_sell_moves_passively_inside_spread_after_timeout_and_book_change(monkeypatch):
++    monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_013_000)
++    strategy = MicroMakerStrategy(
++        StrategyConfig(rebalance_min_profit_ticks=1, rebalance_reload_timeout_seconds=5),
++        TradingConfig(order_ttl_seconds=6),
++    )
++    state = build_state("50000", "50000")
++    state.set_book(
++        BookSnapshot(
++            ts_ms=1,
++            bids=[BookLevel(price=Decimal("0.9995"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("0.9996"), size=Decimal("100000"))],
++        )
++    )
++    cl_ord_id = build_cl_ord_id("bot6", "buy")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "1",
++            "clOrdId": cl_ord_id,
++            "px": "0.9996",
++            "fillPx": "0.9996",
++            "sz": "10000",
++            "accFillSz": "10000",
++            "state": "filled",
++            "cTime": "1700000000000",
++            "uTime": "1700000000000",
++        },
++        source="test",
++    )
++    state.set_book(
++        BookSnapshot(
++            ts_ms=2,
++            bids=[BookLevel(price=Decimal("0.9997"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
++        )
++    )
++
++    decision = strategy.decide(
++        state,
++        RiskStatus(ok=True, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"),
++    )
++
++    assert decision.ask is not None
++    assert decision.ask.price == Decimal("0.9998")
++
++
++def test_strategy_rebalance_buy_moves_passively_inside_spread_after_timeout_and_book_change(monkeypatch):
++    monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_013_000)
++    strategy = MicroMakerStrategy(
++        StrategyConfig(rebalance_min_profit_ticks=1, rebalance_reload_timeout_seconds=5),
++        TradingConfig(order_ttl_seconds=6),
++    )
++    state = build_state("50000", "50000")
++    state.set_book(
++        BookSnapshot(
++            ts_ms=1,
++            bids=[BookLevel(price=Decimal("1.0002"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1.0003"), size=Decimal("100000"))],
++        )
++    )
++    cl_ord_id = build_cl_ord_id("bot6", "sell")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "1",
++            "clOrdId": cl_ord_id,
++            "px": "1.0002",
++            "fillPx": "1.0002",
++            "sz": "10000",
++            "accFillSz": "10000",
++            "state": "filled",
++            "cTime": "1700000000000",
++            "uTime": "1700000000000",
++        },
++        source="test",
++    )
++    state.set_book(
++        BookSnapshot(
++            ts_ms=2,
++            bids=[BookLevel(price=Decimal("0.9999"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1.0002"), size=Decimal("100000"))],
++        )
++    )
++
++    decision = strategy.decide(
++        state,
++        RiskStatus(ok=True, reason="reduce_only_inventory_low", allow_bid=True, allow_ask=False, runtime_state="REDUCE_ONLY"),
++    )
++
++    assert decision.bid is not None
++    assert decision.bid.price == Decimal("1.0001")
++
++
+ def test_strategy_rebalance_buy_can_keep_small_passive_ask_when_inventory_stays_above_target():
+     strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig(entry_base_size=Decimal("10000")))
+     state = build_state("28000", "5000")
+@@ -928,6 +1074,327 @@ def test_strategy_rebalance_buy_can_keep_small_passive_ask_when_inventory_stays_
+     assert decision.reason == "fill_rebalance_buy_biased"
+ 
+ 
++def test_strategy_rebalance_sell_uses_profitable_fifo_tranche_before_full_position():
++    strategy = MicroMakerStrategy(StrategyConfig(rebalance_min_profit_ticks=1), TradingConfig(entry_base_size=Decimal("5000")))
++    state = build_state("50000", "50000")
++    state.set_book(
++        BookSnapshot(
++            ts_ms=9999999999999,
++            bids=[BookLevel(price=Decimal("0.9996"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("0.9997"), size=Decimal("100000"))],
++        )
++    )
++    first_buy = build_cl_ord_id("bot6", "buy")
++    second_buy = build_cl_ord_id("bot6", "buy")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "1",
++            "clOrdId": first_buy,
++            "px": "0.9995",
++            "fillPx": "0.9995",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1",
++            "uTime": "2",
++        },
++        source="test",
++    )
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "2",
++            "clOrdId": second_buy,
++            "px": "0.9998",
++            "fillPx": "0.9998",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "3",
++            "uTime": "4",
++        },
++        source="test",
++    )
++
++    decision = strategy.decide(
++        state,
++        RiskStatus(ok=True, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"),
++    )
++
++    assert decision.bid is None
++    assert decision.ask is not None
++    assert decision.ask.base_size == Decimal("5000")
++    assert decision.ask.price == Decimal("0.9997")
++    assert decision.reason == "fill_rebalance_sell_only"
++
++
++def test_strategy_rebalance_sell_uses_competitive_chunk_when_zero_profitable_prefix_after_reload(monkeypatch):
++    monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_013_000)
++    strategy = MicroMakerStrategy(
++        StrategyConfig(rebalance_min_profit_ticks=1, rebalance_reload_timeout_seconds=5),
++        TradingConfig(entry_base_size=Decimal("5000"), order_ttl_seconds=6),
++    )
++    state = build_state("50000", "50000")
++    state.set_book(
++        BookSnapshot(
++            ts_ms=1,
++            bids=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1.0001"), size=Decimal("100000"))],
++        )
++    )
++    first_buy = build_cl_ord_id("bot6", "buy")
++    second_buy = build_cl_ord_id("bot6", "buy")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "1",
++            "clOrdId": first_buy,
++            "px": "1.0001",
++            "fillPx": "1.0001",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1700000000000",
++            "uTime": "1700000000000",
++        },
++        source="test",
++    )
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "2",
++            "clOrdId": second_buy,
++            "px": "0.9998",
++            "fillPx": "0.9998",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1700000001000",
++            "uTime": "1700000001000",
++        },
++        source="test",
++    )
++    state.set_book(
++        BookSnapshot(
++            ts_ms=2,
++            bids=[BookLevel(price=Decimal("0.9997"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("0.9998"), size=Decimal("100000"))],
++        )
++    )
++
++    decision = strategy.decide(
++        state,
++        RiskStatus(ok=True, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"),
++    )
++
++    assert decision.ask is not None
++    assert decision.ask.base_size == Decimal("3750.00")
++    assert decision.ask.price == Decimal("0.9998")
++    assert decision.reason == "fill_rebalance_sell_only"
++
++
++def test_strategy_rebalance_sell_uses_smaller_aged_chunk_before_release(monkeypatch):
++    monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_013_000)
++    strategy = MicroMakerStrategy(
++        StrategyConfig(
++            rebalance_min_profit_ticks=1,
++            rebalance_reload_timeout_seconds=5,
++            rebalance_drift_ticks=5,
++            rebalance_max_order_age_seconds=60,
++            rebalance_release_size_factor=Decimal("0.50"),
++        ),
++        TradingConfig(entry_base_size=Decimal("5000"), order_ttl_seconds=6),
++    )
++    state = build_state("50000", "50000")
++    state.set_book(
++        BookSnapshot(
++            ts_ms=1,
++            bids=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1.0001"), size=Decimal("100000"))],
++        )
++    )
++    first_buy = build_cl_ord_id("bot6", "buy")
++    second_buy = build_cl_ord_id("bot6", "buy")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "1",
++            "clOrdId": first_buy,
++            "px": "1.0001",
++            "fillPx": "1.0001",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1700000000000",
++            "uTime": "1700000000000",
++        },
++        source="test",
++    )
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "2",
++            "clOrdId": second_buy,
++            "px": "0.9998",
++            "fillPx": "0.9998",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1700000001000",
++            "uTime": "1700000001000",
++        },
++        source="test",
++    )
++    state.set_book(
++        BookSnapshot(
++            ts_ms=2,
++            bids=[BookLevel(price=Decimal("0.9999"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
++        )
++    )
++
++    decision = strategy.decide(
++        state,
++        RiskStatus(ok=True, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"),
++    )
++
++    assert decision.ask is not None
++    assert decision.ask.base_size == Decimal("2500.00")
++    assert decision.ask.price == Decimal("1.0000")
++    assert decision.reason == "fill_rebalance_sell_only"
++
++
++def test_strategy_rebalance_buy_uses_profitable_fifo_tranche_before_full_position():
++    strategy = MicroMakerStrategy(StrategyConfig(rebalance_min_profit_ticks=1), TradingConfig(entry_base_size=Decimal("5000")))
++    state = build_state("50000", "50000")
++    state.set_book(
++        BookSnapshot(
++            ts_ms=9999999999999,
++            bids=[BookLevel(price=Decimal("1.0002"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1.0003"), size=Decimal("100000"))],
++        )
++    )
++    first_sell = build_cl_ord_id("bot6", "sell")
++    second_sell = build_cl_ord_id("bot6", "sell")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "1",
++            "clOrdId": first_sell,
++            "px": "1.0003",
++            "fillPx": "1.0003",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1",
++            "uTime": "2",
++        },
++        source="test",
++    )
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "2",
++            "clOrdId": second_sell,
++            "px": "1.0000",
++            "fillPx": "1.0000",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "3",
++            "uTime": "4",
++        },
++        source="test",
++    )
++
++    decision = strategy.decide(
++        state,
++        RiskStatus(ok=True, reason="reduce_only_inventory_low", allow_bid=True, allow_ask=False, runtime_state="REDUCE_ONLY"),
++    )
++
++    assert decision.ask is None
++    assert decision.bid is not None
++    assert decision.bid.base_size == Decimal("5000")
++    assert decision.bid.price == Decimal("1.0002")
++    assert decision.reason == "fill_rebalance_buy_only"
++
++
++def test_strategy_rebalance_buy_uses_competitive_chunk_when_zero_profitable_prefix_after_reload(monkeypatch):
++    monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_013_000)
++    strategy = MicroMakerStrategy(
++        StrategyConfig(rebalance_min_profit_ticks=1, rebalance_reload_timeout_seconds=5),
++        TradingConfig(entry_base_size=Decimal("5000"), order_ttl_seconds=6),
++    )
++    state = build_state("50000", "50000")
++    state.set_book(
++        BookSnapshot(
++            ts_ms=1,
++            bids=[BookLevel(price=Decimal("0.9995"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("0.9996"), size=Decimal("100000"))],
++        )
++    )
++    first_sell = build_cl_ord_id("bot6", "sell")
++    second_sell = build_cl_ord_id("bot6", "sell")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "1",
++            "clOrdId": first_sell,
++            "px": "0.9995",
++            "fillPx": "0.9995",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1700000000000",
++            "uTime": "1700000000000",
++        },
++        source="test",
++    )
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "sell",
++            "ordId": "2",
++            "clOrdId": second_sell,
++            "px": "1.0002",
++            "fillPx": "1.0002",
++            "sz": "5000",
++            "accFillSz": "5000",
++            "state": "filled",
++            "cTime": "1700000001000",
++            "uTime": "1700000001000",
++        },
++        source="test",
++    )
++    state.set_book(
++        BookSnapshot(
++            ts_ms=2,
++            bids=[BookLevel(price=Decimal("1.0002"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1.0003"), size=Decimal("100000"))],
++        )
++    )
++
++    decision = strategy.decide(
++        state,
++        RiskStatus(ok=True, reason="reduce_only_inventory_low", allow_bid=True, allow_ask=False, runtime_state="REDUCE_ONLY"),
++    )
++
++    assert decision.bid is not None
++    assert decision.bid.base_size == Decimal("3750.00")
++    assert decision.bid.price == Decimal("1.0002")
++    assert decision.reason == "fill_rebalance_buy_only"
++
++
+ def test_strategy_rebalance_sell_can_keep_small_passive_bid_when_inventory_stays_below_target():
+     strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig(entry_base_size=Decimal("10000")))
+     state = build_state("5000", "28000")
+@@ -970,6 +1437,49 @@ def test_strategy_rebalance_sell_can_keep_small_passive_bid_when_inventory_stays
+     assert decision.reason == "fill_rebalance_sell_biased"
+ 
+ 
++def test_strategy_rebalance_sell_keeps_overlay_when_account_inventory_is_near_target():
++    strategy = MicroMakerStrategy(StrategyConfig(), TradingConfig(entry_base_size=Decimal("10000")))
++    state = build_state("50000", "50000")
++    state.set_book(
++        BookSnapshot(
++            ts_ms=9999999999999,
++            bids=[BookLevel(price=Decimal("0.9999"), size=Decimal("100000"))],
++            asks=[BookLevel(price=Decimal("1"), size=Decimal("100000"))],
++        )
++    )
++    cl_ord_id = build_cl_ord_id("bot6", "buy")
++    state.apply_order_update(
++        {
++            "instId": "USDC-USDT",
++            "side": "buy",
++            "ordId": "1",
++            "clOrdId": cl_ord_id,
++            "px": "1",
++            "fillPx": "1",
++            "sz": "10000",
++            "accFillSz": "10000",
++            "state": "filled",
++            "cTime": "1",
++            "uTime": "2",
++        },
++        source="test",
++    )
++
++    decision = strategy.decide(
++        state,
++        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
++    )
++
++    assert decision.ask is not None
++    assert decision.ask.base_size == Decimal("10000")
++    assert decision.ask.price == Decimal("1.0001")
++    assert decision.bid is not None
++    assert decision.bid.reason == "rebalance_secondary_bid"
++    assert decision.bid.base_size == Decimal("500.0000")
++    assert decision.bid.price == Decimal("0.9998")
++    assert decision.reason == "fill_rebalance_sell_biased"
++
++
+ def test_strategy_inventory_review_does_not_push_secondary_ask_farther_away(monkeypatch):
+     monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_012_000)
+     strategy = MicroMakerStrategy(

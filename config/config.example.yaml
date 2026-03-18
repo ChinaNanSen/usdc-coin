@@ -38,6 +38,7 @@ strategy:
   inventory_target_pct: 0.50
   inventory_soft_lower_pct: 0.40
   inventory_soft_upper_pct: 0.60
+  account_inventory_skew_enabled: false
   mild_skew_threshold_pct: 0.03
   mild_skew_size_factor: 0.50
   visible_depth_levels: 5
@@ -61,7 +62,7 @@ risk:
   stale_book_ms: 15000
   cancel_orders_on_stale_book: false
   max_reconnects_per_5m: 3
-  daily_loss_limit_quote: 50
+  realized_loss_shutdown_quote: 20
   min_free_quote_buffer: 1000
   min_free_base_buffer: 1000
   fail_on_foreign_pending_orders: true

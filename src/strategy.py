@@ -99,7 +99,7 @@ class MicroMakerStrategy:
             entry_base_size=fixed_entry_base_size,
             quote_size=quote_size,
         )
-        if skew_profile is None and inventory_ratio is not None:
+        if skew_profile is None and self.config.account_inventory_skew_enabled and inventory_ratio is not None:
             skew_profile = self._inventory_skew_profile(inventory_ratio=inventory_ratio)
         if skew_profile is not None:
             skew_low, skew_high, size_multiplier = skew_profile
@@ -924,15 +924,22 @@ class MicroMakerStrategy:
         inventory_repair_steps: int,
     ) -> Decimal:
         factor = max(self.config.rebalance_secondary_size_factor, Decimal("0"))
-        if factor <= 0 or rebalance_mode == "release":
+        if factor <= 0:
             return Decimal("0")
         if inventory_repair_steps > 1 and rebalance_mode != "fresh":
             repair_penalty = min(Decimal("0.50"), Decimal(inventory_repair_steps - 1) * Decimal("0.10"))
             factor *= Decimal("1") - repair_penalty
+        if rebalance_mode == "release":
+            overlay_floor = min(max(self.config.rebalance_overlay_floor_factor, Decimal("0")), factor)
+            factor = overlay_floor
         factor *= self._secondary_rebalance_position_taper(
             state=state,
             side=side,
             rebalance_mode=rebalance_mode,
+        )
+        factor *= self._secondary_rebalance_direction_taper(
+            state=state,
+            side=side,
         )
         return factor
 
@@ -960,8 +967,6 @@ class MicroMakerStrategy:
         return unwind_base_size
 
     def _secondary_rebalance_position_taper(self, *, state: BotState, side: str, rebalance_mode: str) -> Decimal:
-        if rebalance_mode == "release":
-            return Decimal("0")
         reference_base_size = self._entry_base_size(state=state)
         if reference_base_size is None or reference_base_size <= 0:
             return Decimal("1")
@@ -974,12 +979,27 @@ class MicroMakerStrategy:
         if adverse_position >= fade_limit:
             return Decimal("0")
 
+        floor_ratio = self._secondary_rebalance_overlay_floor_ratio()
+        progress = (adverse_position - reference_base_size) / reference_base_size
+        taper = Decimal("1") - progress * (Decimal("1") - floor_ratio)
+        return max(floor_ratio, taper)
+
+    def _secondary_rebalance_overlay_floor_ratio(self) -> Decimal:
         base_factor = max(self.config.rebalance_secondary_size_factor, Decimal("0"))
         if base_factor <= 0:
             return Decimal("0")
         floor_factor = min(max(self.config.rebalance_overlay_floor_factor, Decimal("0")), base_factor)
-        floor_ratio = floor_factor / base_factor
-        progress = (adverse_position - reference_base_size) / reference_base_size
+        return floor_factor / base_factor
+
+    def _secondary_rebalance_direction_taper(self, *, state: BotState, side: str) -> Decimal:
+        drift_limit = max(int(self.config.rebalance_drift_ticks), 0)
+        adverse_drift_ticks = self._secondary_rebalance_adverse_drift_ticks(state=state, side=side)
+        if drift_limit <= 0 or adverse_drift_ticks <= 0:
+            return Decimal("1")
+        floor_ratio = self._secondary_rebalance_overlay_floor_ratio()
+        if adverse_drift_ticks >= drift_limit:
+            return floor_ratio
+        progress = Decimal(adverse_drift_ticks) / Decimal(drift_limit)
         taper = Decimal("1") - progress * (Decimal("1") - floor_ratio)
         return max(floor_ratio, taper)
 
@@ -1003,6 +1023,31 @@ class MicroMakerStrategy:
         if side == "sell":
             return max(-strategy_position, Decimal("0"))
         return Decimal("0")
+
+    @staticmethod
+    def _secondary_rebalance_adverse_drift_ticks(*, state: BotState, side: str) -> int:
+        if not state.instrument or not state.book or not state.book.best_bid or not state.book.best_ask:
+            return 0
+        rebalance_side = "sell" if side == "buy" else "buy"
+        lot = state.oldest_rebalance_lot(rebalance_side)
+        if lot is None:
+            return 0
+        tick_size = state.instrument.tick_size
+        if tick_size <= 0:
+            return 0
+
+        adverse_ticks = Decimal("0")
+        if side == "buy":
+            if lot.reference_best_bid is not None:
+                adverse_ticks = max(adverse_ticks, (lot.reference_best_bid - state.book.best_bid.price) / tick_size)
+            if lot.reference_best_ask is not None:
+                adverse_ticks = max(adverse_ticks, (lot.reference_best_ask - state.book.best_ask.price) / tick_size)
+        elif side == "sell":
+            if lot.reference_best_bid is not None:
+                adverse_ticks = max(adverse_ticks, (state.book.best_bid.price - lot.reference_best_bid) / tick_size)
+            if lot.reference_best_ask is not None:
+                adverse_ticks = max(adverse_ticks, (state.book.best_ask.price - lot.reference_best_ask) / tick_size)
+        return max(int(adverse_ticks), 0)
 
     @staticmethod
     def _available_passive_improvement_ticks(*, best_price: Decimal, opposite_price: Decimal, tick_size: Decimal) -> int:

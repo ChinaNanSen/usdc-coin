@@ -51,6 +51,7 @@ class BotState:
         self.initial_external_base_inventory: Decimal | None = None
         self.external_base_inventory_remaining: Decimal = Decimal("0")
         self._resync_passive_violation_counts: dict[str, int] = {}
+        self._pending_amendments: dict[str, dict[str, object]] = {}
 
     def set_instrument(self, instrument: InstrumentMeta) -> None:
         self.instrument = instrument
@@ -188,9 +189,124 @@ class BotState:
             self.last_fill_ms = order.updated_at_ms
         if order.is_terminal:
             self.live_orders.pop(cl_ord_id, None)
+            self._pending_amendments.pop(cl_ord_id, None)
         else:
             self.live_orders[cl_ord_id] = order
         return order
+
+    def register_pending_amend(
+        self,
+        *,
+        cl_ord_id: str,
+        ord_id: str,
+        side: str,
+        reason: str,
+        previous_price: Decimal,
+        previous_size: Decimal,
+        previous_remaining_size: Decimal,
+        target_price: Decimal,
+        target_size: Decimal,
+        target_remaining_size: Decimal,
+        filled_size: Decimal,
+    ) -> None:
+        self._pending_amendments[cl_ord_id] = {
+            "cl_ord_id": cl_ord_id,
+            "ord_id": ord_id,
+            "side": side,
+            "reason": reason,
+            "previous_price": previous_price,
+            "previous_size": previous_size,
+            "previous_remaining_size": previous_remaining_size,
+            "target_price": target_price,
+            "target_size": target_size,
+            "target_remaining_size": target_remaining_size,
+            "filled_size": filled_size,
+            "requested_at_ms": now_ms(),
+        }
+
+    def pending_amend(self, cl_ord_id: str) -> dict[str, object] | None:
+        pending = self._pending_amendments.get(cl_ord_id)
+        if pending is None:
+            return None
+        return dict(pending)
+
+    def has_pending_amend(self, cl_ord_id: str) -> bool:
+        return cl_ord_id in self._pending_amendments
+
+    def clear_pending_amend(self, cl_ord_id: str) -> dict[str, object] | None:
+        return self._pending_amendments.pop(cl_ord_id, None)
+
+    def update_pending_amend_identity(
+        self,
+        *,
+        previous_cl_ord_id: str,
+        cl_ord_id: str,
+        ord_id: str,
+    ) -> None:
+        pending = self._pending_amendments.pop(previous_cl_ord_id, None)
+        if pending is None:
+            return
+        pending["cl_ord_id"] = cl_ord_id
+        pending["ord_id"] = ord_id
+        self._pending_amendments[cl_ord_id] = pending
+
+    def resolve_pending_amend_update(self, *, payload: dict, order: LiveOrder) -> tuple[str, dict[str, object]] | None:
+        pending = self._pending_amendments.get(order.cl_ord_id)
+        if pending is None:
+            return None
+
+        code = str(payload.get("code") or "0")
+        amend_result = str(payload.get("amendResult") or "")
+        if code != "0" or amend_result not in {"", "0"}:
+            self._pending_amendments.pop(order.cl_ord_id, None)
+            return (
+                "amend_order_error",
+                {
+                    "cl_ord_id": pending["cl_ord_id"],
+                    "ord_id": pending["ord_id"],
+                    "side": pending["side"],
+                    "reason": pending["reason"],
+                    "old_price": pending["previous_price"],
+                    "new_price": pending["target_price"],
+                    "old_size": pending["previous_size"],
+                    "new_size": pending["target_size"],
+                    "old_remaining_size": pending["previous_remaining_size"],
+                    "new_remaining_size": pending["target_remaining_size"],
+                    "filled_size": order.filled_size,
+                    "exchange_price": order.price,
+                    "exchange_size": order.size,
+                    "exchange_state": order.state,
+                    "error_source": "ws_order_update",
+                    "okx": {
+                        "code": code,
+                        "msg": str(payload.get("msg") or ""),
+                        "amendResult": amend_result,
+                    },
+                },
+            )
+
+        target_price = pending["target_price"]
+        target_size = pending["target_size"]
+        if amend_result == "0" or (order.price == target_price and order.size == target_size):
+            self._pending_amendments.pop(order.cl_ord_id, None)
+            return (
+                "amend_order",
+                {
+                    "cl_ord_id": pending["cl_ord_id"],
+                    "ord_id": pending["ord_id"],
+                    "side": pending["side"],
+                    "reason": pending["reason"],
+                    "old_price": pending["previous_price"],
+                    "new_price": order.price,
+                    "old_size": pending["previous_size"],
+                    "new_size": order.size,
+                    "old_remaining_size": pending["previous_remaining_size"],
+                    "new_remaining_size": order.remaining_size,
+                    "filled_size": order.filled_size,
+                    "confirmed_by_ws": True,
+                },
+            )
+        return None
 
     def bot_orders(self, side: str | None = None) -> list[LiveOrder]:
         orders = [order for order in self.live_orders.values() if is_managed_cl_ord_id(order.cl_ord_id, self.managed_prefix)]

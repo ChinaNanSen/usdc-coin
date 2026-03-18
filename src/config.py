@@ -70,6 +70,7 @@ class StrategyConfig:
     inventory_target_pct: Decimal = Decimal("0.50")
     inventory_soft_lower_pct: Decimal = Decimal("0.45")
     inventory_soft_upper_pct: Decimal = Decimal("0.55")
+    account_inventory_skew_enabled: bool = False
     mild_skew_threshold_pct: Decimal = Decimal("0.03")
     mild_skew_size_factor: Decimal = Decimal("0.50")
     visible_depth_levels: int = 5
@@ -96,6 +97,7 @@ class RiskConfig:
     cancel_orders_on_stale_book: bool = False
     max_reconnects_per_5m: int = 3
     daily_loss_limit_quote: Decimal = Decimal("50")
+    realized_loss_shutdown_quote: Decimal = Decimal("0")
     min_free_quote_buffer: Decimal = Decimal("1000")
     min_free_base_buffer: Decimal = Decimal("1000")
     fail_on_foreign_pending_orders: bool = True

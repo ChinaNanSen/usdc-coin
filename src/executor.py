@@ -295,6 +295,21 @@ class OrderExecutor:
             self._last_action_by_side[primary.side] = now_ms()
             return True
 
+        pending_cl_ord_id = str(update_payload["clOrdId"])
+        pending_ord_id = str(update_payload["ordId"])
+        self.state.register_pending_amend(
+            cl_ord_id=pending_cl_ord_id,
+            ord_id=pending_ord_id,
+            side=primary.side,
+            reason=intent.reason,
+            previous_price=primary.price,
+            previous_size=primary.size,
+            previous_remaining_size=primary.remaining_size,
+            target_price=intent.price,
+            target_size=new_total_size,
+            target_remaining_size=base_size,
+            filled_size=primary.filled_size,
+        )
         try:
             response = await amend_order(
                 inst_id=primary.inst_id,
@@ -316,6 +331,7 @@ class OrderExecutor:
                 "new_size": new_total_size,
                 "error": str(exc),
             }
+            self.state.clear_pending_amend(pending_cl_ord_id)
             if isinstance(exc, OKXAPIError):
                 payload["okx"] = exc.to_dict()
                 payload["okx_zh"] = summarize_okx_error(payload["okx"])
@@ -327,8 +343,14 @@ class OrderExecutor:
             update_payload["ordId"] = str(response["ordId"])
         if response.get("clOrdId"):
             update_payload["clOrdId"] = str(response["clOrdId"])
-        self.state.apply_order_update(update_payload, source="rest_amend")
-        self.journal.append("amend_order", journal_payload)
+        journal_payload["cl_ord_id"] = str(update_payload["clOrdId"])
+        journal_payload["ord_id"] = str(update_payload["ordId"])
+        self.state.update_pending_amend_identity(
+            previous_cl_ord_id=pending_cl_ord_id,
+            cl_ord_id=str(update_payload["clOrdId"]),
+            ord_id=str(update_payload["ordId"]),
+        )
+        self.journal.append("amend_order_submitted", journal_payload)
         self._last_action_by_side[primary.side] = now_ms()
         return True
 
@@ -496,6 +518,8 @@ class OrderExecutor:
     def _should_keep_order_without_intent(self, *, primary: LiveOrder, risk_status: RiskStatus | None) -> bool:
         if risk_status is None:
             return False
+        if self.state.has_pending_amend(primary.cl_ord_id):
+            return True
         if risk_status.runtime_state in {"INIT", "PAUSED"}:
             return True
         if risk_status.reason.startswith("stale book:") and not self.config.risk.cancel_orders_on_stale_book:
@@ -506,6 +530,8 @@ class OrderExecutor:
 
     def _should_keep_existing_order(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
         if self._same_live_order_target(primary=primary, intent=intent, base_size=base_size):
+            return True
+        if self.state.has_pending_amend(primary.cl_ord_id):
             return True
         if self._should_preserve_partial_fill_with_same_price(primary=primary, intent=intent, base_size=base_size):
             return True
@@ -582,6 +608,8 @@ class OrderExecutor:
             return side != "buy"
         if strategy_position < 0:
             return side != "sell"
+        if not self.config.strategy.account_inventory_skew_enabled:
+            return True
 
         inventory_ratio = self.state.inventory_ratio()
         if inventory_ratio is None:

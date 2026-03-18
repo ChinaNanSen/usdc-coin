@@ -188,6 +188,30 @@ def test_do_not_keep_partial_fill_when_risk_not_ok():
     assert result is False, "Partial-fill should not be kept when risk.ok is False and not PAUSED"
 
 
+def test_entry_queue_preserve_ignores_account_inventory_when_bot_is_flat():
+    state = make_state()
+    state.balances["USDC"] = Balance(ccy="USDC", total=Decimal("90000"), available=Decimal("90000"))
+    state.balances["USDT"] = Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000"))
+    config = BotConfig(mode="shadow", strategy=StrategyConfig(account_inventory_skew_enabled=False))
+    executor, journal = make_executor(state, config)
+
+    result = executor._entry_queue_preserve_allowed(side="buy")
+
+    assert result is True
+
+
+def test_entry_queue_preserve_can_still_use_account_inventory_when_enabled():
+    state = make_state()
+    state.balances["USDC"] = Balance(ccy="USDC", total=Decimal("90000"), available=Decimal("90000"))
+    state.balances["USDT"] = Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000"))
+    config = BotConfig(mode="shadow", strategy=StrategyConfig(account_inventory_skew_enabled=True))
+    executor, journal = make_executor(state, config)
+
+    result = executor._entry_queue_preserve_allowed(side="buy")
+
+    assert result is False
+
+
 # ============================================================
 # Part 2: _reconcile_side integration — verify cancel is skipped
 # ============================================================
