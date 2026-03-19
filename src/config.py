@@ -56,6 +56,8 @@ class TradingConfig:
     order_ttl_seconds: float = 8.0
     cancel_on_ttl_expiry: bool = False
     action_cooldown_seconds: float = 0.2
+    same_price_amend_min_remaining_change_ratio: Decimal = Decimal("0.10")
+    same_price_amend_min_remaining_change_base: Decimal = Decimal("250")
     event_driven_requote: bool = True
     book_requote_debounce_ms: int = 150
     bootstrap_depth: int = 5
@@ -80,9 +82,16 @@ class StrategyConfig:
     rebalance_drift_ticks: int = 2
     rebalance_max_order_age_seconds: float = 12.0
     rebalance_release_size_factor: Decimal = Decimal("0.50")
+    rebalance_release_excess_only: bool = True
+    rebalance_release_max_negative_ticks: int = 1
     rebalance_secondary_size_factor: Decimal = Decimal("0.10")
     rebalance_overlay_floor_factor: Decimal = Decimal("0.10")
+    rebalance_overlay_preserve_tolerance_ticks: int = 1
     rebalance_secondary_price_offset_ticks: int = 1
+    toxic_flow_min_observation_ms: int = 300
+    toxic_flow_max_observation_ms: int = 1000
+    toxic_flow_adverse_ticks: int = 1
+    toxic_flow_cooldown_seconds: float = 2.0
     favorable_size_spread_ticks: int = 0
     favorable_size_multiplier: Decimal = Decimal("1")
     normal_buy_price_cap: Decimal = Decimal("0")

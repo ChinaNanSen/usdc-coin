@@ -123,9 +123,79 @@ def test_live_pnl_tracks_realized_and_unrealized_from_managed_fills():
     assert state.strategy_position_base() == Decimal("0")
     assert state.live_realized_pnl_quote == Decimal("1")
     assert state.live_unrealized_pnl_quote() == Decimal("0")
+
+
+def test_state_marks_side_toxic_flow_cooldown_after_adverse_fill(monkeypatch):
+    fill_ts = 1_700_000_000_000
+    monkeypatch.setattr("src.state.now_ms", lambda: fill_ts + 500)
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=1,
+            received_ms=1,
+            bids=[BookLevel(price=Decimal("0.9999"), size=Decimal("1000"))],
+            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("1000"))],
+        )
+    )
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("50000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("50000")),
+        }
+    )
+
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": sell_id,
+            "px": "1.0000",
+            "fillPx": "1.0000",
+            "sz": "5000",
+            "accFillSz": "5000",
+            "state": "filled",
+            "cTime": str(fill_ts),
+            "uTime": str(fill_ts),
+        },
+        source="test",
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=2,
+            received_ms=2,
+            bids=[BookLevel(price=Decimal("1.0001"), size=Decimal("1000"))],
+            asks=[BookLevel(price=Decimal("1.0002"), size=Decimal("1000"))],
+        )
+    )
+
+    events = state.evaluate_toxic_flow(
+        min_observation_ms=300,
+        max_observation_ms=1000,
+        adverse_ticks=1,
+        cooldown_ms=2000,
+    )
+
+    assert len(events) == 1
+    assert events[0]["side"] == "sell"
+    assert state.is_toxic_flow_side_cooling_down("sell")
     assert state.last_trade is not None
-    assert state.last_trade.order_price == Decimal("1.0001")
-    assert state.last_trade.price == Decimal("1.0001")
+    assert state.last_trade.order_price == Decimal("1.0000")
+    assert state.last_trade.price == Decimal("1.0000")
 
 
 def test_managed_buy_fill_updates_local_balances_immediately():
@@ -322,3 +392,59 @@ def test_replace_live_orders_does_not_double_count_partial_fill_on_resync():
     assert state.strategy_position_base() == Decimal("4193.903316")
     assert sell_id in state.live_orders
     assert state.live_orders[sell_id].filled_size == Decimal("5806.096684")
+
+
+def test_pending_amend_req_id_mismatch_does_not_clear_newer_pending():
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    buy_id = build_cl_ord_id("bot6", "buy")
+    order = state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "0.9998",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+    state.register_pending_amend(
+        cl_ord_id=buy_id,
+        ord_id="b1",
+        side="buy",
+        reason="join_best_bid",
+        previous_price=Decimal("0.9998"),
+        previous_size=Decimal("10000"),
+        previous_remaining_size=Decimal("10000"),
+        target_price=Decimal("0.9999"),
+        target_size=Decimal("10000"),
+        target_remaining_size=Decimal("10000"),
+        filled_size=Decimal("0"),
+        req_id="newer_req",
+    )
+
+    resolution = state.resolve_pending_amend_update(
+        payload={"code": "0", "amendResult": "0", "reqId": "older_req"},
+        order=order,
+    )
+
+    assert resolution is None
+    assert state.pending_amend(buy_id) is not None
+    assert state.pending_amend(buy_id)["req_id"] == "newer_req"

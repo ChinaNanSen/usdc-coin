@@ -68,6 +68,15 @@ def build_cl_ord_id(prefix: str, side: str) -> str:
     return f"{token}{side_code}{random_part}"
 
 
+def build_req_id(prefix: str, action: str) -> str:
+    token = managed_id_token(prefix)
+    action_sanitized = re.sub(r"[^A-Za-z0-9]", "", action or "").lower()
+    action_code = (action_sanitized[:4] or "req")
+    max_random_len = max(8, 32 - len(token) - len(action_code))
+    random_part = uuid.uuid4().hex[: min(20, max_random_len)]
+    return f"{token}{action_code}{random_part}"
+
+
 def is_managed_cl_ord_id(cl_ord_id: str, prefix: str) -> bool:
     token = managed_id_token(prefix)
     return str(cl_ord_id or "").startswith(token)

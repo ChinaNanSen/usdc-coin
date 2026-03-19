@@ -12,7 +12,7 @@ from .log_labels import summarize_okx_error, translate_reason
 from .models import InstrumentMeta, LiveOrder, QuoteDecision, RiskStatus
 from .okx_rest import OKXAPIError, OKXRestClient
 from .state import BotState
-from .utils import build_cl_ord_id, decimal_to_str, is_managed_cl_ord_id, now_ms, quantize_down, to_jsonable
+from .utils import build_cl_ord_id, build_req_id, decimal_to_str, is_managed_cl_ord_id, now_ms, quantize_down, to_jsonable
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,10 @@ class OrderExecutor:
         self.journal = journal
         self.shadow_simulator = shadow_simulator
         self._last_action_by_side: dict[str, int] = {}
+        self.trade_client = rest
+
+    def attach_trade_client(self, trade_client) -> None:
+        self.trade_client = trade_client
 
     async def bootstrap_pending_orders(self) -> None:
         await self._sync_pending_orders(
@@ -84,20 +88,32 @@ class OrderExecutor:
         await self._sync_pending_orders(fail_on_foreign=False, cancel_managed=False)
 
     async def reconcile(self, decision: QuoteDecision, risk_status: RiskStatus | None = None) -> None:
+        if await self._try_batch_cross_side_amend(decision, risk_status=risk_status):
+            return
         await self._reconcile_side("buy", decision.bid_layers, risk_status=risk_status)
         await self._reconcile_side("sell", decision.ask_layers, risk_status=risk_status)
 
     async def cancel_all_managed_orders(self, *, reason: str) -> None:
-        for order in list(self.state.bot_orders()):
+        orders = [order for order in list(self.state.bot_orders()) if not order.cancel_requested]
+        if await self._batch_cancel_orders(orders=orders, reason=reason):
+            return
+        for order in orders:
             await self._cancel_order(order, reason=reason, ignore_cooldown=True)
 
     async def cancel_managed_orders(self, *, cl_ord_ids: tuple[str, ...] | list[str], reason: str) -> None:
+        orders: list[LiveOrder] = []
         for cl_ord_id in cl_ord_ids:
             order = self.state.live_orders.get(cl_ord_id)
             if order is None:
                 continue
             if not is_managed_cl_ord_id(order.cl_ord_id, self.config.managed_prefix):
                 continue
+            if order.cancel_requested:
+                continue
+            orders.append(order)
+        if await self._batch_cancel_orders(orders=orders, reason=reason):
+            return
+        for order in orders:
             await self._cancel_order(order, reason=reason, ignore_cooldown=True)
 
     async def _sync_pending_orders(self, *, fail_on_foreign: bool, cancel_managed: bool) -> None:
@@ -214,19 +230,23 @@ class OrderExecutor:
             return
 
         cl_ord_id = build_cl_ord_id(self.config.managed_prefix, side)
+        req_id = build_req_id(self.config.managed_prefix, f"pl{side}")
         try:
-            response = await self.rest.place_limit_order(
+            response = await self._trade_client().place_limit_order(
                 inst_id=self.config.trading.inst_id,
                 side=side,
                 price=intent.price,
                 size=base_size,
                 cl_ord_id=cl_ord_id,
                 post_only=self.config.trading.post_only,
+                req_id=req_id,
+                inst_id_code=self._trade_inst_id_code(),
             )
         except Exception as exc:
             self.state.record_place_result(False)
             payload = {
                 "side": side,
+                "req_id": req_id,
                 "reason": str(exc),
                 "reason_zh": "下单失败",
                 "side_zh": "买单" if side == "buy" else "卖单",
@@ -243,6 +263,7 @@ class OrderExecutor:
             "side": side,
             "ordId": response.get("ordId", ""),
             "clOrdId": cl_ord_id,
+            "reqId": req_id,
             "px": decimal_to_str(intent.price),
             "sz": decimal_to_str(base_size),
             "accFillSz": "0",
@@ -256,16 +277,19 @@ class OrderExecutor:
         self._last_action_by_side[side] = now_ms()
 
     async def _amend_order(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
-        amend_order = getattr(self.rest, "amend_order", None)
+        trade_client = self._trade_client()
+        amend_order = getattr(trade_client, "amend_order", None)
         if self.config.mode != "shadow" and not callable(amend_order):
             return False
 
         new_total_size = primary.filled_size + base_size
+        req_id = build_req_id(self.config.managed_prefix, f"am{primary.side}")
         update_payload = {
             "instId": primary.inst_id,
             "side": primary.side,
             "ordId": primary.ord_id,
             "clOrdId": primary.cl_ord_id,
+            "reqId": req_id,
             "px": decimal_to_str(intent.price),
             "sz": decimal_to_str(new_total_size),
             "accFillSz": decimal_to_str(primary.filled_size),
@@ -285,6 +309,7 @@ class OrderExecutor:
             "filled_size": primary.filled_size,
             "old_remaining_size": primary.remaining_size,
             "new_remaining_size": base_size,
+            "req_id": req_id,
         }
 
         if self.config.mode == "shadow":
@@ -309,6 +334,7 @@ class OrderExecutor:
             target_size=new_total_size,
             target_remaining_size=base_size,
             filled_size=primary.filled_size,
+            req_id=req_id,
         )
         try:
             response = await amend_order(
@@ -318,6 +344,8 @@ class OrderExecutor:
                 new_price=intent.price,
                 new_size=new_total_size,
                 cxl_on_fail=False,
+                req_id=req_id,
+                inst_id_code=self._trade_inst_id_code(),
             )
         except Exception as exc:
             payload = {
@@ -325,6 +353,7 @@ class OrderExecutor:
                 "ord_id": primary.ord_id,
                 "side": primary.side,
                 "reason": intent.reason,
+                "req_id": req_id,
                 "old_price": primary.price,
                 "new_price": intent.price,
                 "old_size": primary.size,
@@ -373,13 +402,21 @@ class OrderExecutor:
             self.state.record_cancel_result(True)
             self._last_action_by_side[order.side] = now_ms()
             return
+        req_id = build_req_id(self.config.managed_prefix, f"cx{order.side}")
         try:
-            await self.rest.cancel_order(inst_id=order.inst_id, ord_id=order.ord_id or None, cl_ord_id=order.cl_ord_id or None)
+            await self._trade_client().cancel_order(
+                inst_id=order.inst_id,
+                ord_id=order.ord_id or None,
+                cl_ord_id=order.cl_ord_id or None,
+                req_id=req_id,
+                inst_id_code=self._trade_inst_id_code(),
+            )
         except Exception as exc:
             if self._is_benign_terminal_cancel_error(exc):
                 payload = {
                     "cl_ord_id": order.cl_ord_id,
                     "ord_id": order.ord_id,
+                    "req_id": req_id,
                     "reason": reason,
                     "reason_zh": translate_reason(reason),
                     "error": str(exc),
@@ -397,6 +434,7 @@ class OrderExecutor:
             payload = {
                 "cl_ord_id": order.cl_ord_id,
                 "ord_id": order.ord_id,
+                "req_id": req_id,
                 "reason": reason,
                 "reason_zh": translate_reason(reason),
                 "error": str(exc),
@@ -416,12 +454,220 @@ class OrderExecutor:
             {
                 "cl_ord_id": order.cl_ord_id,
                 "ord_id": order.ord_id,
+                "req_id": req_id,
                 "reason": reason,
                 "reason_zh": translate_reason(reason),
             },
         )
         self.state.mark_cancel_requested(order.cl_ord_id)
         self._last_action_by_side[order.side] = now_ms()
+
+    def _trade_client(self):
+        client = self.trade_client
+        ready = getattr(client, "trade_ready", None)
+        if client is not self.rest and callable(ready):
+            try:
+                if ready():
+                    return client
+            except Exception:
+                pass
+        return self.rest
+
+    def _trade_inst_id_code(self) -> str | None:
+        if not self.config.exchange.simulated or not self.state.instrument:
+            return None
+        inst_id_code = str(self.state.instrument.inst_id_code or "")
+        return inst_id_code or None
+
+    async def _batch_cancel_orders(self, *, orders: list[LiveOrder], reason: str) -> bool:
+        if self.config.mode == "shadow" or len(orders) < 2:
+            return False
+        trade_client = self._trade_client()
+        batch_cancel_orders = getattr(trade_client, "batch_cancel_orders", None)
+        if trade_client is self.rest or not callable(batch_cancel_orders):
+            return False
+        inst_id_code = self._trade_inst_id_code()
+        request_id = build_req_id(self.config.managed_prefix, "bcxl")
+        payloads = []
+        for order in orders:
+            payload = {"instIdCode": inst_id_code} if inst_id_code else {"instId": order.inst_id}
+            if order.ord_id:
+                payload["ordId"] = order.ord_id
+            if order.cl_ord_id:
+                payload["clOrdId"] = order.cl_ord_id
+            payloads.append(payload)
+        try:
+            results = await batch_cancel_orders(orders=payloads, request_id=request_id)
+        except Exception as exc:
+            self.journal.append(
+                "batch_cancel_order_error",
+                {
+                    "req_id": request_id,
+                    "reason": reason,
+                    "reason_zh": translate_reason(reason),
+                    "orders": [{"cl_ord_id": order.cl_ord_id, "ord_id": order.ord_id} for order in orders],
+                    "error": str(exc),
+                },
+            )
+            logger.warning("批量撤单失败 | %s | %s", translate_reason(reason), str(exc))
+            return True
+
+        results_by_cl_ord_id = {str(item.get("clOrdId") or ""): item for item in results}
+        results_by_ord_id = {str(item.get("ordId") or ""): item for item in results}
+        for order in orders:
+            item = results_by_cl_ord_id.get(order.cl_ord_id) or results_by_ord_id.get(order.ord_id or "")
+            if item is None:
+                continue
+            if str(item.get("sCode") or "0") != "0":
+                self.journal.append(
+                    "cancel_order_error",
+                    {
+                        "cl_ord_id": order.cl_ord_id,
+                        "ord_id": order.ord_id,
+                        "req_id": request_id,
+                        "reason": reason,
+                        "reason_zh": translate_reason(reason),
+                        "okx": {"code": str(item.get("sCode") or ""), "msg": str(item.get("sMsg") or "")},
+                        "error": str(item.get("sMsg") or "batch cancel order failed"),
+                    },
+                )
+                continue
+            self.state.record_cancel_result(True)
+            self.journal.append(
+                "cancel_order",
+                {
+                    "cl_ord_id": order.cl_ord_id,
+                    "ord_id": order.ord_id,
+                    "req_id": request_id,
+                    "reason": reason,
+                    "reason_zh": translate_reason(reason),
+                },
+            )
+            self.state.mark_cancel_requested(order.cl_ord_id)
+            self._last_action_by_side[order.side] = now_ms()
+        return True
+
+    def _single_amend_candidate_for_side(self, *, side: str, intents):
+        live_orders = self.state.bot_orders(side)
+        targets = self._resolved_targets_for_side(side=side, intents=intents)
+        if len(live_orders) != 1 or len(targets) != 1:
+            return None
+        order = live_orders[0]
+        intent, base_size = targets[0]
+        if order.cancel_requested or not self._cooldown_ok(side):
+            return None
+        if self._same_live_order_target(primary=order, intent=intent, base_size=base_size):
+            return None
+        if self._should_keep_existing_order(primary=order, intent=intent, base_size=base_size):
+            return None
+        return order, intent, base_size
+
+    async def _try_batch_cross_side_amend(self, decision: QuoteDecision, *, risk_status: RiskStatus | None = None) -> bool:
+        del risk_status
+        if self.config.mode == "shadow":
+            return False
+        trade_client = self._trade_client()
+        batch_amend_orders = getattr(trade_client, "batch_amend_orders", None)
+        if trade_client is self.rest or not callable(batch_amend_orders):
+            return False
+        buy_candidate = self._single_amend_candidate_for_side(side="buy", intents=decision.bid_layers)
+        sell_candidate = self._single_amend_candidate_for_side(side="sell", intents=decision.ask_layers)
+        if buy_candidate is None or sell_candidate is None:
+            return False
+
+        inst_id_code = self._trade_inst_id_code()
+        request_id = build_req_id(self.config.managed_prefix, "bamd")
+        batch_payloads: list[dict] = []
+        journal_payloads: list[dict] = []
+        candidates = [buy_candidate, sell_candidate]
+        for order, intent, base_size in candidates:
+            new_total_size = order.filled_size + base_size
+            req_id = build_req_id(self.config.managed_prefix, f"am{order.side}")
+            self.state.register_pending_amend(
+                cl_ord_id=order.cl_ord_id,
+                ord_id=order.ord_id,
+                side=order.side,
+                reason=intent.reason,
+                previous_price=order.price,
+                previous_size=order.size,
+                previous_remaining_size=order.remaining_size,
+                target_price=intent.price,
+                target_size=new_total_size,
+                target_remaining_size=base_size,
+                filled_size=order.filled_size,
+                req_id=req_id,
+            )
+            payload = {"instIdCode": inst_id_code} if inst_id_code else {"instId": order.inst_id}
+            if order.ord_id:
+                payload["ordId"] = order.ord_id
+            if order.cl_ord_id:
+                payload["clOrdId"] = order.cl_ord_id
+            payload["newPx"] = decimal_to_str(intent.price)
+            payload["newSz"] = decimal_to_str(new_total_size)
+            payload["cxlOnFail"] = "false"
+            payload["reqId"] = req_id
+            batch_payloads.append(payload)
+            journal_payloads.append(
+                {
+                    "cl_ord_id": order.cl_ord_id,
+                    "ord_id": order.ord_id,
+                    "side": order.side,
+                    "reason": intent.reason,
+                    "old_price": order.price,
+                    "new_price": intent.price,
+                    "old_size": order.size,
+                    "new_size": new_total_size,
+                    "filled_size": order.filled_size,
+                    "old_remaining_size": order.remaining_size,
+                    "new_remaining_size": base_size,
+                    "req_id": req_id,
+                }
+            )
+        try:
+            results = await batch_amend_orders(orders=batch_payloads, request_id=request_id)
+        except Exception as exc:
+            for order, _, _ in candidates:
+                self.state.clear_pending_amend(order.cl_ord_id)
+            self.journal.append(
+                "batch_amend_order_error",
+                {
+                    "req_id": request_id,
+                    "orders": journal_payloads,
+                    "error": str(exc),
+                },
+            )
+            logger.warning("批量改单失败 | %s", str(exc))
+            return True
+
+        results_by_cl_ord_id = {str(item.get("clOrdId") or ""): item for item in results}
+        results_by_ord_id = {str(item.get("ordId") or ""): item for item in results}
+        for payload in journal_payloads:
+            item = results_by_cl_ord_id.get(payload["cl_ord_id"]) or results_by_ord_id.get(payload["ord_id"] or "")
+            if item is None:
+                continue
+            if str(item.get("sCode") or "0") != "0":
+                self.state.clear_pending_amend(payload["cl_ord_id"])
+                self.journal.append(
+                    "amend_order_error",
+                    {
+                        **payload,
+                        "okx": {"code": str(item.get("sCode") or ""), "msg": str(item.get("sMsg") or "")},
+                        "error": str(item.get("sMsg") or "batch amend order failed"),
+                    },
+                )
+                continue
+            resolved_cl_ord_id = str(item.get("clOrdId") or payload["cl_ord_id"])
+            resolved_ord_id = str(item.get("ordId") or payload["ord_id"] or "")
+            self.state.update_pending_amend_identity(
+                previous_cl_ord_id=payload["cl_ord_id"],
+                cl_ord_id=resolved_cl_ord_id,
+                ord_id=resolved_ord_id,
+            )
+            payload["cl_ord_id"] = resolved_cl_ord_id
+            payload["ord_id"] = resolved_ord_id
+            self.journal.append("amend_order_submitted", payload)
+            self._last_action_by_side[payload["side"]] = now_ms()
+        return True
 
     def _cooldown_ok(self, side: str) -> bool:
         last = self._last_action_by_side.get(side, 0)
@@ -533,6 +779,8 @@ class OrderExecutor:
             return True
         if self.state.has_pending_amend(primary.cl_ord_id):
             return True
+        if self._should_suppress_same_price_amend(primary=primary, intent=intent, base_size=base_size):
+            return True
         if self._should_preserve_partial_fill_with_same_price(primary=primary, intent=intent, base_size=base_size):
             return True
         if self._rebalance_order_requires_refresh(primary=primary, intent=intent):
@@ -550,6 +798,22 @@ class OrderExecutor:
         if primary.price != intent.price:
             return False
         return primary.remaining_size == base_size
+
+    def _should_suppress_same_price_amend(self, *, primary: LiveOrder, intent, base_size: Decimal) -> bool:
+        if primary.side != intent.side:
+            return False
+        if primary.price != intent.price:
+            return False
+        current_remaining = primary.remaining_size
+        if current_remaining <= 0:
+            return False
+        size_delta = abs(current_remaining - base_size)
+        if size_delta <= 0:
+            return True
+        min_delta_base = max(self.config.trading.same_price_amend_min_remaining_change_base, Decimal("0"))
+        min_delta_ratio = max(self.config.trading.same_price_amend_min_remaining_change_ratio, Decimal("0"))
+        threshold = max(min_delta_base, current_remaining * min_delta_ratio)
+        return size_delta < threshold
 
     @staticmethod
     def _side_allowed_by_risk(side: str, risk_status: RiskStatus) -> bool:
@@ -660,20 +924,49 @@ class OrderExecutor:
             return primary.side == "buy" and primary.price >= intent.price and primary.price <= cap
         min_spread = self.state.instrument.tick_size * Decimal(self.config.strategy.min_spread_ticks)
         if intent.reason == "rebalance_secondary_ask":
+            return self._should_preserve_overlay_queue(primary=primary, intent=intent)
+        if intent.reason == "rebalance_secondary_bid":
+            return self._should_preserve_overlay_queue(primary=primary, intent=intent)
+        return False
+
+    def _should_preserve_overlay_queue(self, *, primary: LiveOrder, intent) -> bool:
+        if not self.state.instrument or not self.state.book:
+            return False
+        tick_size = self.state.instrument.tick_size
+        if tick_size <= 0:
+            return False
+
+        side = primary.side
+        if self.state.is_toxic_flow_side_cooling_down(side):
+            return False
+
+        tolerance_ticks = max(int(self.config.strategy.rebalance_overlay_preserve_tolerance_ticks), 0)
+        min_edge_ticks = max(
+            int(self.config.strategy.min_spread_ticks),
+            max(int(self.config.strategy.rebalance_min_profit_ticks), 0),
+        )
+
+        if intent.reason == "rebalance_secondary_ask":
             best_bid = self.state.book.best_bid.price if self.state.book.best_bid else None
             if best_bid is None:
                 return False
-            if primary.side != "sell" or primary.price > intent.price:
+            if side != "sell" or primary.price > intent.price:
                 return False
-            return (primary.price - best_bid) >= min_spread
-        if intent.reason == "rebalance_secondary_bid":
+            current_edge_ticks = int((primary.price - best_bid) / tick_size)
+            target_edge_ticks = int((intent.price - best_bid) / tick_size)
+        elif intent.reason == "rebalance_secondary_bid":
             best_ask = self.state.book.best_ask.price if self.state.book.best_ask else None
             if best_ask is None:
                 return False
-            if primary.side != "buy" or primary.price < intent.price:
+            if side != "buy" or primary.price < intent.price:
                 return False
-            return (best_ask - primary.price) >= min_spread
-        return False
+            current_edge_ticks = int((best_ask - primary.price) / tick_size)
+            target_edge_ticks = int((best_ask - intent.price) / tick_size)
+        else:
+            return False
+
+        required_edge_ticks = max(min_edge_ticks, target_edge_ticks - tolerance_ticks)
+        return current_edge_ticks >= required_edge_ticks
 
     def _rebalance_order_requires_refresh(self, *, primary: LiveOrder, intent) -> bool:
         rebalance_reasons = {

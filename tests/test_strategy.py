@@ -1314,7 +1314,7 @@ def test_strategy_rebalance_sell_uses_competitive_chunk_when_zero_profitable_pre
 
     assert decision.ask is not None
     assert decision.ask.base_size == Decimal("3750.00")
-    assert decision.ask.price == Decimal("0.9998")
+    assert decision.ask.price == Decimal("1.0000")
     assert decision.reason == "fill_rebalance_sell_only"
 
 
@@ -1387,7 +1387,7 @@ def test_strategy_rebalance_sell_uses_smaller_aged_chunk_before_release(monkeypa
 
     assert decision.ask is not None
     assert decision.ask.base_size == Decimal("2500.00")
-    assert decision.ask.price == Decimal("1.0000")
+    assert decision.ask.price == Decimal("1.0001")
     assert decision.reason == "fill_rebalance_sell_only"
 
 
@@ -1511,8 +1511,216 @@ def test_strategy_rebalance_buy_uses_competitive_chunk_when_zero_profitable_pref
 
     assert decision.bid is not None
     assert decision.bid.base_size == Decimal("3750.00")
-    assert decision.bid.price == Decimal("1.0002")
+    assert decision.bid.price == Decimal("0.9996")
     assert decision.reason == "fill_rebalance_buy_only"
+
+
+def test_strategy_release_sell_only_uses_excess_inventory_chunk(monkeypatch):
+    monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_013_000)
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            rebalance_min_profit_ticks=1,
+            rebalance_reload_timeout_seconds=5,
+            rebalance_max_order_age_seconds=5,
+            rebalance_release_excess_only=True,
+            rebalance_release_max_negative_ticks=1,
+        ),
+        TradingConfig(entry_base_size=Decimal("5000"), order_ttl_seconds=6),
+    )
+    state = build_state("50000", "50000")
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": buy_id,
+            "px": "1.0002",
+            "fillPx": "1.0002",
+            "sz": "5407.775",
+            "accFillSz": "5407.775",
+            "state": "filled",
+            "cTime": "1700000000000",
+            "uTime": "1700000000000",
+        },
+        source="test",
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=2,
+            bids=[BookLevel(price=Decimal("0.9995"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("0.9996"), size=Decimal("100000"))],
+        )
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"),
+    )
+
+    assert decision.ask is not None
+    assert decision.ask.base_size == Decimal("407.775")
+    assert decision.ask.price == Decimal("1.0001")
+    assert decision.reason == "fill_rebalance_sell_only"
+
+
+def test_strategy_release_sell_keeps_core_inventory_at_cost_floor_when_no_excess(monkeypatch):
+    monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_013_000)
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            rebalance_min_profit_ticks=1,
+            rebalance_reload_timeout_seconds=5,
+            rebalance_max_order_age_seconds=5,
+            rebalance_release_excess_only=True,
+            rebalance_release_max_negative_ticks=1,
+        ),
+        TradingConfig(entry_base_size=Decimal("5000"), order_ttl_seconds=6),
+    )
+    state = build_state("50000", "50000")
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": buy_id,
+            "px": "1.0002",
+            "fillPx": "1.0002",
+            "sz": "5000",
+            "accFillSz": "5000",
+            "state": "filled",
+            "cTime": "1700000000000",
+            "uTime": "1700000000000",
+        },
+        source="test",
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=2,
+            bids=[BookLevel(price=Decimal("0.9995"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("0.9996"), size=Decimal("100000"))],
+        )
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"),
+    )
+
+    assert decision.ask is not None
+    assert decision.ask.base_size == Decimal("5000")
+    assert decision.ask.price == Decimal("1.0002")
+    assert decision.reason == "fill_rebalance_sell_only"
+
+
+def test_strategy_suppresses_secondary_sell_side_during_toxic_flow_cooldown(monkeypatch):
+    fill_ts = 1_700_000_000_000
+    monkeypatch.setattr("src.state.now_ms", lambda: fill_ts + 500)
+    monkeypatch.setattr("src.strategy.now_ms", lambda: fill_ts + 500)
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            toxic_flow_min_observation_ms=300,
+            toxic_flow_max_observation_ms=1000,
+            toxic_flow_adverse_ticks=1,
+            toxic_flow_cooldown_seconds=2,
+        ),
+        TradingConfig(entry_base_size=Decimal("5000")),
+    )
+    state = build_state("50000", "50000")
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": sell_id,
+            "px": "1.0001",
+            "fillPx": "1.0001",
+            "sz": "5000",
+            "accFillSz": "5000",
+            "state": "filled",
+            "cTime": str(fill_ts),
+            "uTime": str(fill_ts),
+        },
+        source="test",
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=2,
+            bids=[BookLevel(price=Decimal("1.0002"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1.0003"), size=Decimal("100000"))],
+        )
+    )
+    state.evaluate_toxic_flow(
+        min_observation_ms=300,
+        max_observation_ms=1000,
+        adverse_ticks=1,
+        cooldown_ms=2000,
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is not None
+    assert decision.ask is None
+    assert decision.reason == "fill_rebalance_buy_only"
+
+
+def test_strategy_suppresses_secondary_buy_side_during_toxic_flow_cooldown(monkeypatch):
+    fill_ts = 1_700_000_000_000
+    monkeypatch.setattr("src.state.now_ms", lambda: fill_ts + 500)
+    monkeypatch.setattr("src.strategy.now_ms", lambda: fill_ts + 500)
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            toxic_flow_min_observation_ms=300,
+            toxic_flow_max_observation_ms=1000,
+            toxic_flow_adverse_ticks=1,
+            toxic_flow_cooldown_seconds=2,
+        ),
+        TradingConfig(entry_base_size=Decimal("5000")),
+    )
+    state = build_state("50000", "50000")
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": buy_id,
+            "px": "1.0000",
+            "fillPx": "1.0000",
+            "sz": "5000",
+            "accFillSz": "5000",
+            "state": "filled",
+            "cTime": str(fill_ts),
+            "uTime": str(fill_ts),
+        },
+        source="test",
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=2,
+            bids=[BookLevel(price=Decimal("0.9997"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("0.9998"), size=Decimal("100000"))],
+        )
+    )
+    state.evaluate_toxic_flow(
+        min_observation_ms=300,
+        max_observation_ms=1000,
+        adverse_ticks=1,
+        cooldown_ms=2000,
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is None
+    assert decision.ask is not None
+    assert decision.reason == "fill_rebalance_sell_only"
 
 
 def test_strategy_rebalance_sell_can_keep_small_passive_bid_when_inventory_stays_below_target():

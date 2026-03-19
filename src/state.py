@@ -52,6 +52,8 @@ class BotState:
         self.external_base_inventory_remaining: Decimal = Decimal("0")
         self._resync_passive_violation_counts: dict[str, int] = {}
         self._pending_amendments: dict[str, dict[str, object]] = {}
+        self._pending_toxic_flow_fills: deque[TradeTick] = deque()
+        self._toxic_flow_cooldown_until_ms: dict[str, int] = {"buy": 0, "sell": 0}
 
     def set_instrument(self, instrument: InstrumentMeta) -> None:
         self.instrument = instrument
@@ -104,6 +106,15 @@ class BotState:
         self.live_realized_pnl_quote = parse_decimal(payload.get("live_realized_pnl_quote") or "0")
         self.initial_external_base_inventory = self._optional_decimal(payload.get("initial_external_base_inventory"))
         self.external_base_inventory_remaining = parse_decimal(payload.get("external_base_inventory_remaining") or "0")
+        cooldown_payload = payload.get("toxic_flow_cooldown_until_ms") or {}
+        now_ref = now_ms()
+        self._toxic_flow_cooldown_until_ms = {
+            "buy": max(self._optional_int(cooldown_payload.get("buy")) or 0, 0),
+            "sell": max(self._optional_int(cooldown_payload.get("sell")) or 0, 0),
+        }
+        for side, until_ms in list(self._toxic_flow_cooldown_until_ms.items()):
+            if until_ms <= now_ref:
+                self._toxic_flow_cooldown_until_ms[side] = 0
 
         restored_lots: deque[StrategyLot] = deque()
         for item in payload.get("live_position_lots", []):
@@ -208,6 +219,7 @@ class BotState:
         target_size: Decimal,
         target_remaining_size: Decimal,
         filled_size: Decimal,
+        req_id: str | None = None,
     ) -> None:
         self._pending_amendments[cl_ord_id] = {
             "cl_ord_id": cl_ord_id,
@@ -221,6 +233,7 @@ class BotState:
             "target_size": target_size,
             "target_remaining_size": target_remaining_size,
             "filled_size": filled_size,
+            "req_id": req_id or "",
             "requested_at_ms": now_ms(),
         }
 
@@ -255,6 +268,11 @@ class BotState:
         if pending is None:
             return None
 
+        pending_req_id = str(pending.get("req_id") or "")
+        payload_req_id = str(payload.get("reqId") or "")
+        if pending_req_id and payload_req_id and payload_req_id != pending_req_id:
+            return None
+
         code = str(payload.get("code") or "0")
         amend_result = str(payload.get("amendResult") or "")
         if code != "0" or amend_result not in {"", "0"}:
@@ -277,6 +295,7 @@ class BotState:
                     "exchange_size": order.size,
                     "exchange_state": order.state,
                     "error_source": "ws_order_update",
+                    "req_id": pending_req_id,
                     "okx": {
                         "code": code,
                         "msg": str(payload.get("msg") or ""),
@@ -304,6 +323,7 @@ class BotState:
                     "new_remaining_size": order.remaining_size,
                     "filled_size": order.filled_size,
                     "confirmed_by_ws": True,
+                    "req_id": pending_req_id,
                 },
             )
         return None
@@ -522,6 +542,75 @@ class BotState:
     def strategy_position_base(self) -> Decimal:
         return sum((lot.qty for lot in self.live_position_lots), Decimal("0"))
 
+    def toxic_flow_cooldown_remaining_ms(self, side: str, *, reference_ms: int | None = None) -> int:
+        until_ms = self._toxic_flow_cooldown_until_ms.get(side, 0)
+        if until_ms <= 0:
+            return 0
+        now_ref = reference_ms if reference_ms is not None else now_ms()
+        return max(until_ms - now_ref, 0)
+
+    def is_toxic_flow_side_cooling_down(self, side: str, *, reference_ms: int | None = None) -> bool:
+        return self.toxic_flow_cooldown_remaining_ms(side, reference_ms=reference_ms) > 0
+
+    def evaluate_toxic_flow(
+        self,
+        *,
+        min_observation_ms: int,
+        max_observation_ms: int,
+        adverse_ticks: int,
+        cooldown_ms: int,
+        reference_ms: int | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        if adverse_ticks <= 0 or cooldown_ms <= 0:
+            return ()
+        if not self.instrument or not self.book or self.book.mid is None:
+            return ()
+        tick_size = self.instrument.tick_size
+        if tick_size <= 0:
+            return ()
+
+        now_ref = reference_ms if reference_ms is not None else now_ms()
+        remaining: deque[TradeTick] = deque()
+        events: list[dict[str, object]] = []
+        while self._pending_toxic_flow_fills:
+            fill = self._pending_toxic_flow_fills.popleft()
+            age_ms = max(now_ref - fill.ts_ms, 0)
+            if age_ms < min_observation_ms:
+                remaining.append(fill)
+                continue
+            if age_ms > max_observation_ms:
+                continue
+
+            adverse_move = Decimal("0")
+            if fill.side == "buy":
+                adverse_move = fill.price - self.book.mid
+            elif fill.side == "sell":
+                adverse_move = self.book.mid - fill.price
+            adverse_move = max(adverse_move, Decimal("0"))
+            adverse_move_ticks = int(adverse_move / tick_size)
+            if adverse_move_ticks < adverse_ticks:
+                remaining.append(fill)
+                continue
+
+            cooldown_until_ms = now_ref + cooldown_ms
+            self._toxic_flow_cooldown_until_ms[fill.side] = max(
+                self._toxic_flow_cooldown_until_ms.get(fill.side, 0),
+                cooldown_until_ms,
+            )
+            events.append(
+                {
+                    "side": fill.side,
+                    "fill_ts_ms": fill.ts_ms,
+                    "fill_price": fill.price,
+                    "current_mid": self.book.mid,
+                    "adverse_ticks": adverse_move_ticks,
+                    "cooldown_until_ms": self._toxic_flow_cooldown_until_ms[fill.side],
+                }
+            )
+
+        self._pending_toxic_flow_fills = remaining
+        return tuple(events)
+
     def rebalance_base_size(self, side: str) -> Decimal:
         position = self.strategy_position_base()
         if side == "sell" and position > 0:
@@ -571,7 +660,7 @@ class BotState:
                 break
         if max_cost is None:
             return None
-        target = max_cost + tick_size * Decimal(max(profit_ticks, 0))
+        target = max_cost + tick_size * Decimal(profit_ticks)
         return quantize_up(target, tick_size)
 
     def max_rebalance_buy_price(self, base_size: Decimal, *, tick_size: Decimal, profit_ticks: int) -> Decimal | None:
@@ -591,7 +680,7 @@ class BotState:
                 break
         if min_open_price is None:
             return None
-        target = min_open_price - tick_size * Decimal(max(profit_ticks, 0))
+        target = min_open_price - tick_size * Decimal(profit_ticks)
         return quantize_down(target, tick_size)
 
     def profitable_rebalance_sell_size(self, sell_price: Decimal, *, tick_size: Decimal, profit_ticks: int) -> Decimal:
@@ -712,6 +801,7 @@ class BotState:
             "live_position_lots": list(self.live_position_lots),
             "initial_external_base_inventory": self.initial_external_base_inventory,
             "external_base_inventory_remaining": self.external_base_inventory_remaining,
+            "toxic_flow_cooldown_until_ms": self._toxic_flow_cooldown_until_ms,
         }
         self.state_path.write_text(json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -908,4 +998,15 @@ class BotState:
             side=side,
             trade_id=cl_ord_id,
             order_price=order_price,
+        )
+        self._pending_toxic_flow_fills.append(
+            TradeTick(
+                ts_ms=fill_ts_ms,
+                received_ms=fill_ts_ms,
+                price=fill_price,
+                size=fill_size,
+                side=side,
+                trade_id=cl_ord_id,
+                order_price=order_price,
+            )
         )

@@ -263,7 +263,10 @@ class OKXRestClient:
         size: Decimal,
         cl_ord_id: str,
         post_only: bool = False,
+        req_id: str | None = None,
+        inst_id_code: str | None = None,
     ) -> dict[str, Any]:
+        del req_id, inst_id_code
         payload = {
             "instId": inst_id,
             "tdMode": "cash",
@@ -290,7 +293,10 @@ class OKXRestClient:
         ord_id: str | None = None,
         cl_ord_id: str | None = None,
         cxl_on_fail: bool = False,
+        req_id: str | None = None,
+        inst_id_code: str | None = None,
     ) -> dict[str, Any]:
+        del req_id, inst_id_code
         payload = {
             "instId": inst_id,
             "newPx": str(new_price),
@@ -309,7 +315,16 @@ class OKXRestClient:
             failure_msg="amend order failed",
         )
 
-    async def cancel_order(self, *, inst_id: str, ord_id: str | None = None, cl_ord_id: str | None = None) -> dict[str, Any]:
+    async def cancel_order(
+        self,
+        *,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        req_id: str | None = None,
+        inst_id_code: str | None = None,
+    ) -> dict[str, Any]:
+        del req_id, inst_id_code
         payload = {"instId": inst_id}
         if ord_id:
             payload["ordId"] = ord_id

@@ -114,6 +114,8 @@ class MicroMakerStrategy:
 
         bid = None
         ask = None
+        bid_toxic_cooldown = state.is_toxic_flow_side_cooling_down("buy")
+        ask_toxic_cooldown = state.is_toxic_flow_side_cooling_down("sell")
         if risk_status.allow_bid:
             if rebalance_buy_base > 0:
                 bid_base_size, bid_price = self._rebalance_buy_target(
@@ -130,7 +132,7 @@ class MicroMakerStrategy:
                     reason="rebalance_open_short",
                     base_size=bid_base_size,
                 )
-            elif rebalance_sell_base > 0:
+            elif rebalance_sell_base > 0 and not bid_toxic_cooldown:
                 bid = self._secondary_rebalance_bid_intent(
                     state=state,
                     base_size=bid_base_size,
@@ -138,7 +140,7 @@ class MicroMakerStrategy:
                     rebalance_mode=rebalance_mode,
                     inventory_repair_steps=inventory_repair_steps,
                 )
-            else:
+            elif not bid_toxic_cooldown:
                 bid_price = self._entry_bid_price(
                     state=state,
                     spread_ticks=spread_ticks,
@@ -171,7 +173,7 @@ class MicroMakerStrategy:
                     reason="rebalance_open_long",
                     base_size=ask_base_size,
                 )
-            elif rebalance_buy_base > 0:
+            elif rebalance_buy_base > 0 and not ask_toxic_cooldown:
                 ask = self._secondary_rebalance_ask_intent(
                     state=state,
                     base_size=ask_base_size,
@@ -179,7 +181,7 @@ class MicroMakerStrategy:
                     rebalance_mode=rebalance_mode,
                     inventory_repair_steps=inventory_repair_steps,
                 )
-            else:
+            elif not ask_toxic_cooldown:
                 ask_price = self._entry_ask_price(
                     state=state,
                     spread_ticks=spread_ticks,
@@ -520,7 +522,23 @@ class MicroMakerStrategy:
                 rebalance_mode=rebalance_mode,
                 inventory_repair_steps=inventory_repair_steps,
             )
-            return bid_base_size, bid_market_price
+            if bid_base_size >= state.instrument.min_size:
+                bid_price = bid_market_price
+                if rebalance_mode == "release":
+                    buy_price_cap = state.max_rebalance_buy_price(
+                        bid_base_size,
+                        tick_size=state.instrument.tick_size,
+                        profit_ticks=-max(self.config.rebalance_release_max_negative_ticks, 0),
+                    )
+                else:
+                    buy_price_cap = state.max_rebalance_buy_price(
+                        bid_base_size,
+                        tick_size=state.instrument.tick_size,
+                        profit_ticks=0,
+                    )
+                if buy_price_cap is not None:
+                    bid_price = min(bid_price, buy_price_cap)
+                return bid_base_size, quantize_down(bid_price, state.instrument.tick_size)
         bid_price = self._rebalance_bid_price(
             state=state,
             base_size=rebalance_buy_base,
@@ -563,7 +581,23 @@ class MicroMakerStrategy:
                 rebalance_mode=rebalance_mode,
                 inventory_repair_steps=inventory_repair_steps,
             )
-            return ask_base_size, ask_market_price
+            if ask_base_size >= state.instrument.min_size:
+                ask_price = ask_market_price
+                if rebalance_mode == "release":
+                    sell_price_floor = state.min_rebalance_sell_price(
+                        ask_base_size,
+                        tick_size=state.instrument.tick_size,
+                        profit_ticks=-max(self.config.rebalance_release_max_negative_ticks, 0),
+                    )
+                else:
+                    sell_price_floor = state.min_rebalance_sell_price(
+                        ask_base_size,
+                        tick_size=state.instrument.tick_size,
+                        profit_ticks=0,
+                    )
+                if sell_price_floor is not None:
+                    ask_price = max(ask_price, sell_price_floor)
+                return ask_base_size, quantize_up(ask_price, state.instrument.tick_size)
         ask_price = self._rebalance_ask_price(
             state=state,
             base_size=rebalance_sell_base,
@@ -961,8 +995,18 @@ class MicroMakerStrategy:
             step_bonus = Decimal(max(inventory_repair_steps - 1, 0)) * Decimal("0.25")
             release_factor = min(Decimal("1"), release_factor + step_bonus)
         target_base_size = reference_base_size * release_factor
+        if rebalance_mode == "release" and self.config.rebalance_release_excess_only:
+            excess_base_size = quantize_down(
+                max(rebalance_base - reference_base_size, Decimal("0")),
+                state.instrument.lot_size,
+            )
+            if excess_base_size < state.instrument.min_size:
+                return Decimal("0")
+            target_base_size = min(target_base_size, excess_base_size)
         unwind_base_size = quantize_down(min(rebalance_base, target_base_size), state.instrument.lot_size)
         if unwind_base_size < state.instrument.min_size:
+            if rebalance_mode == "release" and self.config.rebalance_release_excess_only:
+                return Decimal("0")
             return rebalance_base
         return unwind_base_size
 

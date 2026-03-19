@@ -184,6 +184,7 @@ class TrendBot6:
                 on_status=self._on_stream_status,
                 on_error=self._on_stream_error,
             )
+            self.executor.attach_trade_client(self.private_stream)
             await self.private_stream.start()
 
     async def _tick(self) -> None:
@@ -356,6 +357,14 @@ class TrendBot6:
     async def _on_book(self, book) -> None:
         previous_book = self.state.book
         self.state.set_book(book)
+        toxic_events = self.state.evaluate_toxic_flow(
+            min_observation_ms=max(int(self.config.strategy.toxic_flow_min_observation_ms), 0),
+            max_observation_ms=max(int(self.config.strategy.toxic_flow_max_observation_ms), 0),
+            adverse_ticks=max(int(self.config.strategy.toxic_flow_adverse_ticks), 0),
+            cooldown_ms=int(max(self.config.strategy.toxic_flow_cooldown_seconds, 0) * 1000),
+        )
+        for event in toxic_events:
+            self.journal.append("toxic_flow_cooldown", event)
         if self.shadow_simulator:
             await self.shadow_simulator.on_book(book)
         reason = self._book_requote_reason(previous_book, book)
