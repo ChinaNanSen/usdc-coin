@@ -77,6 +77,27 @@ def build_req_id(prefix: str, action: str) -> str:
     return f"{token}{action_code}{random_part}"
 
 
+def passive_edge_ticks(
+    *,
+    side: str,
+    price: Decimal,
+    best_bid: Decimal | None,
+    best_ask: Decimal | None,
+    tick_size: Decimal,
+) -> int | None:
+    if tick_size <= 0 or price <= 0:
+        return None
+    if side == "buy":
+        if best_ask is None:
+            return None
+        return max(int((best_ask - price) / tick_size), 0)
+    if side == "sell":
+        if best_bid is None:
+            return None
+        return max(int((price - best_bid) / tick_size), 0)
+    return None
+
+
 def is_managed_cl_ord_id(cl_ord_id: str, prefix: str) -> bool:
     token = managed_id_token(prefix)
     return str(cl_ord_id or "").startswith(token)

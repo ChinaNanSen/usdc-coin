@@ -87,6 +87,10 @@ class StrategyConfig:
     rebalance_secondary_size_factor: Decimal = Decimal("0.10")
     rebalance_overlay_floor_factor: Decimal = Decimal("0.10")
     rebalance_overlay_preserve_tolerance_ticks: int = 1
+    secondary_min_positive_edge_ticks: int = 1
+    secondary_full_size_edge_ticks: int = 2
+    secondary_thin_edge_size_factor: Decimal = Decimal("0.10")
+    secondary_entry_layer_min_edge_ticks: int = 2
     rebalance_secondary_price_offset_ticks: int = 1
     toxic_flow_min_observation_ms: int = 300
     toxic_flow_max_observation_ms: int = 1000

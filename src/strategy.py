@@ -5,7 +5,7 @@ from decimal import Decimal
 from .config import StrategyConfig, TradingConfig
 from .models import OrderIntent, QuoteDecision, RiskStatus
 from .state import BotState
-from .utils import now_ms, quantize_down, quantize_up
+from .utils import now_ms, passive_edge_ticks, quantize_down, quantize_up
 
 
 class MicroMakerStrategy:
@@ -770,6 +770,16 @@ class MicroMakerStrategy:
         )
         if factor <= 0:
             return None
+        edge_factor = self._secondary_positive_edge_size_factor(
+            state=state,
+            side=side,
+            price=price,
+        )
+        if edge_factor is None:
+            return None
+        factor *= edge_factor
+        if factor <= 0:
+            return None
 
         scaled_base_size: Decimal | None = None
         scaled_quote_notional = quote_notional * factor
@@ -827,6 +837,8 @@ class MicroMakerStrategy:
                 layered_price = min(layered_price, hard_buy_cap)
             if layered_price <= 0 or layered_price == primary.price:
                 return None
+            if not self._secondary_entry_layer_passes_edge_filter(state=state, side="buy", price=layered_price):
+                return None
             return self._entry_intent(
                 side="buy",
                 price=layered_price,
@@ -840,6 +852,8 @@ class MicroMakerStrategy:
             if sell_floor is not None:
                 layered_price = max(layered_price, sell_floor)
             if layered_price == primary.price:
+                return None
+            if not self._secondary_entry_layer_passes_edge_filter(state=state, side="sell", price=layered_price):
                 return None
             return self._entry_intent(
                 side="sell",
@@ -1034,6 +1048,56 @@ class MicroMakerStrategy:
             return Decimal("0")
         floor_factor = min(max(self.config.rebalance_overlay_floor_factor, Decimal("0")), base_factor)
         return floor_factor / base_factor
+
+    def _secondary_positive_edge_size_factor(
+        self,
+        *,
+        state: BotState,
+        side: str,
+        price: Decimal,
+    ) -> Decimal | None:
+        edge_ticks = self._passive_edge_ticks(state=state, side=side, price=price)
+        if edge_ticks is None:
+            return None
+        min_edge_ticks = max(int(self.config.secondary_min_positive_edge_ticks), 0)
+        if edge_ticks < min_edge_ticks:
+            return None
+        full_size_edge_ticks = max(int(self.config.secondary_full_size_edge_ticks), min_edge_ticks)
+        if edge_ticks >= full_size_edge_ticks:
+            return Decimal("1")
+        thin_factor = min(max(self.config.secondary_thin_edge_size_factor, Decimal("0")), Decimal("1"))
+        if thin_factor <= 0:
+            return None
+        return thin_factor
+
+    def _secondary_entry_layer_passes_edge_filter(
+        self,
+        *,
+        state: BotState,
+        side: str,
+        price: Decimal,
+    ) -> bool:
+        required_edge_ticks = max(int(self.config.secondary_entry_layer_min_edge_ticks), 0)
+        if required_edge_ticks <= 0:
+            return True
+        edge_ticks = self._passive_edge_ticks(state=state, side=side, price=price)
+        if edge_ticks is None:
+            return False
+        return edge_ticks >= required_edge_ticks
+
+    @staticmethod
+    def _passive_edge_ticks(*, state: BotState, side: str, price: Decimal) -> int | None:
+        if not state.instrument or not state.book:
+            return None
+        best_bid = state.book.best_bid.price if state.book.best_bid else None
+        best_ask = state.book.best_ask.price if state.book.best_ask else None
+        return passive_edge_ticks(
+            side=side,
+            price=price,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            tick_size=state.instrument.tick_size,
+        )
 
     def _secondary_rebalance_direction_taper(self, *, state: BotState, side: str) -> Decimal:
         drift_limit = max(int(self.config.rebalance_drift_ticks), 0)

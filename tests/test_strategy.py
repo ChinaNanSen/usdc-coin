@@ -80,6 +80,30 @@ def test_strategy_can_emit_two_layers_per_side_when_enabled():
     assert decision.ask_layers[1].reason == "join_second_ask"
 
 
+def test_strategy_join_second_layers_require_configured_edge():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(secondary_entry_layer_min_edge_ticks=4),
+        TradingConfig(),
+        max_orders_per_side=2,
+    )
+    state = build_state("50000", "50000")
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal("0.9998"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
+        )
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert len(decision.bid_layers) == 1
+    assert len(decision.ask_layers) == 1
+
+
 def test_strategy_scales_entry_size_only_when_spread_is_favorable():
     strategy = MicroMakerStrategy(
         StrategyConfig(
@@ -636,6 +660,92 @@ def test_strategy_uses_exact_fill_size_to_rebalance_open_long():
     assert decision.ask.base_size == Decimal("10000")
     assert decision.ask.quote_notional == Decimal("10001")
     assert decision.reason == "fill_rebalance_sell_biased"
+
+
+def test_strategy_secondary_bid_scales_down_when_edge_is_thin():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            rebalance_secondary_size_factor=Decimal("0.25"),
+            secondary_min_positive_edge_ticks=1,
+            secondary_full_size_edge_ticks=2,
+            secondary_thin_edge_size_factor=Decimal("0.50"),
+        ),
+        TradingConfig(entry_base_size=Decimal("10000")),
+    )
+    state = build_state("50000", "50000")
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal("0.9999"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
+        )
+    )
+    cl_ord_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": cl_ord_id,
+            "px": "1",
+            "fillPx": "1",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    decision = strategy.decide(state, RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True))
+
+    assert decision.bid is not None
+    assert decision.bid.reason == "rebalance_secondary_bid"
+    assert decision.bid.base_size == Decimal("1250.00000")
+    assert decision.reason == "fill_rebalance_sell_biased"
+
+
+def test_strategy_secondary_bid_is_suppressed_when_edge_is_below_threshold():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            rebalance_secondary_size_factor=Decimal("0.25"),
+            secondary_min_positive_edge_ticks=3,
+            secondary_full_size_edge_ticks=3,
+        ),
+        TradingConfig(entry_base_size=Decimal("10000")),
+    )
+    state = build_state("50000", "50000")
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal("0.9999"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
+        )
+    )
+    cl_ord_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": cl_ord_id,
+            "px": "1",
+            "fillPx": "1",
+            "sz": "10000",
+            "accFillSz": "10000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    decision = strategy.decide(state, RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True))
+
+    assert decision.ask is not None
+    assert decision.bid is None
+    assert decision.reason == "fill_rebalance_sell_only"
 
 
 def test_strategy_rebalance_sell_respects_min_profit_ticks():

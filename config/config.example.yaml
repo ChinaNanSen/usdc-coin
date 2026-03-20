@@ -50,6 +50,10 @@ strategy:
   rebalance_release_size_factor: 0.50
   rebalance_secondary_size_factor: 0.10
   rebalance_overlay_floor_factor: 0.10
+  secondary_min_positive_edge_ticks: 1
+  secondary_full_size_edge_ticks: 2
+  secondary_thin_edge_size_factor: 0.10
+  secondary_entry_layer_min_edge_ticks: 4
   rebalance_secondary_price_offset_ticks: 1
   favorable_size_spread_ticks: 2
   favorable_size_multiplier: 1.5

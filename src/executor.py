@@ -12,7 +12,7 @@ from .log_labels import summarize_okx_error, translate_reason
 from .models import InstrumentMeta, LiveOrder, QuoteDecision, RiskStatus
 from .okx_rest import OKXAPIError, OKXRestClient
 from .state import BotState
-from .utils import build_cl_ord_id, build_req_id, decimal_to_str, is_managed_cl_ord_id, now_ms, quantize_down, to_jsonable
+from .utils import build_cl_ord_id, build_req_id, decimal_to_str, is_managed_cl_ord_id, now_ms, passive_edge_ticks, quantize_down, to_jsonable
 
 logger = logging.getLogger(__name__)
 
@@ -941,28 +941,51 @@ class OrderExecutor:
             return False
 
         tolerance_ticks = max(int(self.config.strategy.rebalance_overlay_preserve_tolerance_ticks), 0)
-        min_edge_ticks = max(
-            int(self.config.strategy.min_spread_ticks),
-            max(int(self.config.strategy.rebalance_min_profit_ticks), 0),
-        )
+        min_edge_ticks = max(int(self.config.strategy.secondary_min_positive_edge_ticks), 0)
+        best_bid = self.state.book.best_bid.price if self.state.book.best_bid else None
+        best_ask = self.state.book.best_ask.price if self.state.book.best_ask else None
 
         if intent.reason == "rebalance_secondary_ask":
-            best_bid = self.state.book.best_bid.price if self.state.book.best_bid else None
             if best_bid is None:
                 return False
             if side != "sell" or primary.price > intent.price:
                 return False
-            current_edge_ticks = int((primary.price - best_bid) / tick_size)
-            target_edge_ticks = int((intent.price - best_bid) / tick_size)
+            current_edge_ticks = passive_edge_ticks(
+                side="sell",
+                price=primary.price,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                tick_size=tick_size,
+            )
+            target_edge_ticks = passive_edge_ticks(
+                side="sell",
+                price=intent.price,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                tick_size=tick_size,
+            )
         elif intent.reason == "rebalance_secondary_bid":
-            best_ask = self.state.book.best_ask.price if self.state.book.best_ask else None
             if best_ask is None:
                 return False
             if side != "buy" or primary.price < intent.price:
                 return False
-            current_edge_ticks = int((best_ask - primary.price) / tick_size)
-            target_edge_ticks = int((best_ask - intent.price) / tick_size)
+            current_edge_ticks = passive_edge_ticks(
+                side="buy",
+                price=primary.price,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                tick_size=tick_size,
+            )
+            target_edge_ticks = passive_edge_ticks(
+                side="buy",
+                price=intent.price,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                tick_size=tick_size,
+            )
         else:
+            return False
+        if current_edge_ticks is None or target_edge_ticks is None:
             return False
 
         required_edge_ticks = max(min_edge_ticks, target_edge_ticks - tolerance_ticks)
