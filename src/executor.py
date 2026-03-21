@@ -942,6 +942,7 @@ class OrderExecutor:
 
         tolerance_ticks = max(int(self.config.strategy.rebalance_overlay_preserve_tolerance_ticks), 0)
         min_edge_ticks = max(int(self.config.strategy.secondary_min_positive_edge_ticks), 0)
+        min_edge_ticks += self._secondary_markout_edge_penalty_ticks(side=side)
         best_bid = self.state.book.best_bid.price if self.state.book.best_bid else None
         best_ask = self.state.book.best_ask.price if self.state.book.best_ask else None
 
@@ -990,6 +991,25 @@ class OrderExecutor:
 
         required_edge_ticks = max(min_edge_ticks, target_edge_ticks - tolerance_ticks)
         return current_edge_ticks >= required_edge_ticks
+
+    def _secondary_markout_edge_penalty_ticks(self, *, side: str) -> int:
+        window_ms = max(int(self.config.strategy.secondary_markout_window_ms), 0)
+        trigger_samples = max(int(self.config.strategy.secondary_markout_trigger_samples), 0)
+        threshold_ticks = max(self.config.strategy.secondary_markout_adverse_threshold_ticks, Decimal("0"))
+        severe_extra_ticks = max(self.config.strategy.toxicity_severe_extra_ticks, Decimal("0"))
+        level = self.state.adverse_fill_markout_level(
+            side=side,
+            window_ms=window_ms,
+            trigger_samples=trigger_samples,
+            threshold_ticks=threshold_ticks,
+            severe_extra_ticks=severe_extra_ticks,
+        )
+        if level <= 0:
+            return 0
+        edge_penalty_ticks = max(int(self.config.strategy.secondary_markout_penalty_edge_ticks), 0)
+        if level >= 2:
+            edge_penalty_ticks += max(int(self.config.strategy.toxicity_severe_extra_edge_ticks), 0)
+        return edge_penalty_ticks
 
     def _rebalance_order_requires_refresh(self, *, primary: LiveOrder, intent) -> bool:
         rebalance_reasons = {

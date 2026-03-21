@@ -1,5 +1,5 @@
 # 敏感配置
-config/config.yaml
+config/secret.yaml
 
 # Python 缓存
 __pycache__/

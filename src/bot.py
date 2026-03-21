@@ -357,6 +357,7 @@ class TrendBot6:
     async def _on_book(self, book) -> None:
         previous_book = self.state.book
         self.state.set_book(book)
+        self.state.evaluate_fill_markouts()
         toxic_events = self.state.evaluate_toxic_flow(
             min_observation_ms=max(int(self.config.strategy.toxic_flow_min_observation_ms), 0),
             max_observation_ms=max(int(self.config.strategy.toxic_flow_max_observation_ms), 0),

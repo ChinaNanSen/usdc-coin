@@ -8,6 +8,9 @@ from pathlib import Path
 from .models import Balance, BookSnapshot, FeeSnapshot, InstrumentMeta, LiveOrder, StrategyLot, TradeTick
 from .utils import is_managed_cl_ord_id, now_ms, parse_decimal, quantize_down, quantize_up, to_jsonable
 
+MARKOUT_WINDOWS_MS = (300, 1000, 2000)
+MARKOUT_HISTORY_SIZE = 64
+
 
 class BotState:
     def __init__(self, *, managed_prefix: str, state_path: str):
@@ -54,6 +57,11 @@ class BotState:
         self._pending_amendments: dict[str, dict[str, object]] = {}
         self._pending_toxic_flow_fills: deque[TradeTick] = deque()
         self._toxic_flow_cooldown_until_ms: dict[str, int] = {"buy": 0, "sell": 0}
+        self._pending_fill_markouts: deque[dict[str, object]] = deque()
+        self._fill_markout_samples: dict[str, dict[int, deque[Decimal]]] = {
+            side: {window_ms: deque() for window_ms in MARKOUT_WINDOWS_MS}
+            for side in ("buy", "sell")
+        }
 
     def set_instrument(self, instrument: InstrumentMeta) -> None:
         self.instrument = instrument
@@ -552,6 +560,46 @@ class BotState:
     def is_toxic_flow_side_cooling_down(self, side: str, *, reference_ms: int | None = None) -> bool:
         return self.toxic_flow_cooldown_remaining_ms(side, reference_ms=reference_ms) > 0
 
+    def evaluate_fill_markouts(self, *, reference_ms: int | None = None) -> None:
+        if not self.instrument or not self.book or self.book.mid is None:
+            return
+        tick_size = self.instrument.tick_size
+        if tick_size <= 0:
+            return
+
+        now_ref = reference_ms if reference_ms is not None else now_ms()
+        remaining: deque[dict[str, object]] = deque()
+        while self._pending_fill_markouts:
+            pending = self._pending_fill_markouts.popleft()
+            fill_ts_ms = int(pending.get("ts_ms") or 0)
+            fill_price = pending.get("price")
+            side = str(pending.get("side") or "")
+            observed_windows = pending.get("observed_windows")
+            if (
+                fill_ts_ms <= 0
+                or not isinstance(fill_price, Decimal)
+                or side not in {"buy", "sell"}
+                or not isinstance(observed_windows, set)
+            ):
+                continue
+
+            age_ms = max(now_ref - fill_ts_ms, 0)
+            for window_ms in MARKOUT_WINDOWS_MS:
+                if window_ms in observed_windows or age_ms < window_ms:
+                    continue
+                adverse_ticks = self._adverse_markout_ticks(
+                    side=side,
+                    fill_price=fill_price,
+                    mark_price=self.book.mid,
+                    tick_size=tick_size,
+                )
+                self._record_markout_sample(side=side, window_ms=window_ms, adverse_ticks=adverse_ticks)
+                observed_windows.add(window_ms)
+
+            if len(observed_windows) < len(MARKOUT_WINDOWS_MS):
+                remaining.append(pending)
+        self._pending_fill_markouts = remaining
+
     def evaluate_toxic_flow(
         self,
         *,
@@ -610,6 +658,52 @@ class BotState:
 
         self._pending_toxic_flow_fills = remaining
         return tuple(events)
+
+    def average_adverse_fill_markout_ticks(self, *, side: str, window_ms: int) -> Decimal | None:
+        samples = self._fill_markout_samples.get(side, {}).get(window_ms)
+        if not samples:
+            return None
+        return sum(samples, Decimal("0")) / Decimal(len(samples))
+
+    def adverse_fill_markout_sample_count(self, *, side: str, window_ms: int) -> int:
+        samples = self._fill_markout_samples.get(side, {}).get(window_ms)
+        return len(samples) if samples is not None else 0
+
+    def adverse_fill_markout_level(
+        self,
+        *,
+        side: str,
+        window_ms: int,
+        trigger_samples: int,
+        threshold_ticks: Decimal,
+        severe_extra_ticks: Decimal = Decimal("1"),
+    ) -> int:
+        if window_ms <= 0 or trigger_samples <= 0 or threshold_ticks <= 0:
+            return 0
+        if self.adverse_fill_markout_sample_count(side=side, window_ms=window_ms) < trigger_samples:
+            return 0
+        adverse_ticks = self.average_adverse_fill_markout_ticks(side=side, window_ms=window_ms)
+        if adverse_ticks is None or adverse_ticks < threshold_ticks:
+            return 0
+        severe_threshold = threshold_ticks + max(severe_extra_ticks, Decimal("0"))
+        if adverse_ticks >= severe_threshold:
+            return 2
+        return 1
+
+    def fill_markout_summary(self) -> dict[str, dict[str, dict[str, object]]]:
+        summary: dict[str, dict[str, dict[str, object]]] = {}
+        for side, per_window in self._fill_markout_samples.items():
+            side_summary: dict[str, dict[str, object]] = {}
+            for window_ms, samples in per_window.items():
+                avg = None
+                if samples:
+                    avg = sum(samples, Decimal("0")) / Decimal(len(samples))
+                side_summary[str(window_ms)] = {
+                    "samples": len(samples),
+                    "avg_adverse_ticks": avg,
+                }
+            summary[side] = side_summary
+        return summary
 
     def rebalance_base_size(self, side: str) -> Decimal:
         position = self.strategy_position_base()
@@ -802,6 +896,7 @@ class BotState:
             "initial_external_base_inventory": self.initial_external_base_inventory,
             "external_base_inventory_remaining": self.external_base_inventory_remaining,
             "toxic_flow_cooldown_until_ms": self._toxic_flow_cooldown_until_ms,
+            "fill_markout_summary": self.fill_markout_summary(),
         }
         self.state_path.write_text(json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1010,3 +1105,35 @@ class BotState:
                 order_price=order_price,
             )
         )
+        self._pending_fill_markouts.append(
+            {
+                "ts_ms": fill_ts_ms,
+                "price": fill_price,
+                "side": side,
+                "observed_windows": set(),
+            }
+        )
+
+    @staticmethod
+    def _adverse_markout_ticks(*, side: str, fill_price: Decimal, mark_price: Decimal, tick_size: Decimal) -> Decimal:
+        if tick_size <= 0:
+            return Decimal("0")
+        adverse_move = Decimal("0")
+        if side == "buy":
+            adverse_move = fill_price - mark_price
+        elif side == "sell":
+            adverse_move = mark_price - fill_price
+        if adverse_move <= 0:
+            return Decimal("0")
+        return adverse_move / tick_size
+
+    def _record_markout_sample(self, *, side: str, window_ms: int, adverse_ticks: Decimal) -> None:
+        side_samples = self._fill_markout_samples.get(side)
+        if side_samples is None:
+            return
+        samples = side_samples.get(window_ms)
+        if samples is None:
+            return
+        samples.append(max(adverse_ticks, Decimal("0")))
+        while len(samples) > MARKOUT_HISTORY_SIZE:
+            samples.popleft()

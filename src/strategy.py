@@ -125,13 +125,14 @@ class MicroMakerStrategy:
                     rebalance_mode=rebalance_mode,
                     inventory_repair_steps=inventory_repair_steps,
                 )
-                bid = OrderIntent(
-                    side="buy",
-                    price=bid_price,
-                    quote_notional=bid_base_size * bid_price,
-                    reason="rebalance_open_short",
-                    base_size=bid_base_size,
-                )
+                if bid_base_size >= state.instrument.min_size:
+                    bid = OrderIntent(
+                        side="buy",
+                        price=bid_price,
+                        quote_notional=bid_base_size * bid_price,
+                        reason="rebalance_open_short",
+                        base_size=bid_base_size,
+                    )
             elif rebalance_sell_base > 0 and not bid_toxic_cooldown:
                 bid = self._secondary_rebalance_bid_intent(
                     state=state,
@@ -141,6 +142,12 @@ class MicroMakerStrategy:
                     inventory_repair_steps=inventory_repair_steps,
                 )
             elif not bid_toxic_cooldown:
+                entry_base_size, entry_quote_size = self._apply_entry_size_factor(
+                    state=state,
+                    base_size=bid_base_size,
+                    quote_notional=bid_quote_size,
+                    factor=self._entry_markout_penalty_factor(state=state, side="buy"),
+                )
                 bid_price = self._entry_bid_price(
                     state=state,
                     spread_ticks=spread_ticks,
@@ -153,8 +160,8 @@ class MicroMakerStrategy:
                 bid = self._entry_intent(
                     side="buy",
                     price=bid_price,
-                    base_size=bid_base_size,
-                    quote_notional=bid_quote_size,
+                    base_size=entry_base_size,
+                    quote_notional=entry_quote_size,
                     reason="join_best_bid",
                 )
         if risk_status.allow_ask:
@@ -166,13 +173,14 @@ class MicroMakerStrategy:
                     rebalance_mode=rebalance_mode,
                     inventory_repair_steps=inventory_repair_steps,
                 )
-                ask = OrderIntent(
-                    side="sell",
-                    price=ask_price,
-                    quote_notional=ask_base_size * ask_price,
-                    reason="rebalance_open_long",
-                    base_size=ask_base_size,
-                )
+                if ask_base_size >= state.instrument.min_size:
+                    ask = OrderIntent(
+                        side="sell",
+                        price=ask_price,
+                        quote_notional=ask_base_size * ask_price,
+                        reason="rebalance_open_long",
+                        base_size=ask_base_size,
+                    )
             elif rebalance_buy_base > 0 and not ask_toxic_cooldown:
                 ask = self._secondary_rebalance_ask_intent(
                     state=state,
@@ -182,6 +190,12 @@ class MicroMakerStrategy:
                     inventory_repair_steps=inventory_repair_steps,
                 )
             elif not ask_toxic_cooldown:
+                entry_base_size, entry_quote_size = self._apply_entry_size_factor(
+                    state=state,
+                    base_size=ask_base_size,
+                    quote_notional=ask_quote_size,
+                    factor=self._entry_markout_penalty_factor(state=state, side="sell"),
+                )
                 ask_price = self._entry_ask_price(
                     state=state,
                     spread_ticks=spread_ticks,
@@ -194,8 +208,8 @@ class MicroMakerStrategy:
                 ask = self._entry_intent(
                     side="sell",
                     price=ask_price,
-                    base_size=ask_base_size,
-                    quote_notional=ask_quote_size,
+                    base_size=entry_base_size,
+                    quote_notional=entry_quote_size,
                     reason="join_best_ask",
                 )
 
@@ -278,6 +292,25 @@ class MicroMakerStrategy:
             return base_size
         return scaled
 
+    @staticmethod
+    def _apply_entry_size_factor(
+        *,
+        state: BotState,
+        base_size: Decimal | None,
+        quote_notional: Decimal,
+        factor: Decimal,
+    ) -> tuple[Decimal | None, Decimal]:
+        clamped_factor = min(max(factor, Decimal("0")), Decimal("1"))
+        if clamped_factor >= Decimal("1"):
+            return base_size, quote_notional
+        scaled_quote_notional = quote_notional * clamped_factor
+        if base_size is None or not state.instrument:
+            return base_size, scaled_quote_notional
+        scaled_base_size = quantize_down(base_size * clamped_factor, state.instrument.lot_size)
+        if scaled_base_size < state.instrument.min_size:
+            return base_size, quote_notional
+        return scaled_base_size, scaled_quote_notional
+
     def _bot_position_skew_profile(
         self,
         *,
@@ -339,14 +372,21 @@ class MicroMakerStrategy:
                     rebalance_mode=rebalance_mode,
                     inventory_repair_steps=inventory_repair_steps,
                 )
-                bid = OrderIntent(
-                    side="buy",
-                    price=bid_price,
-                    quote_notional=bid_base_size * bid_price,
-                    reason="rebalance_open_short",
-                    base_size=bid_base_size,
-                )
+                if bid_base_size >= state.instrument.min_size:
+                    bid = OrderIntent(
+                        side="buy",
+                        price=bid_price,
+                        quote_notional=bid_base_size * bid_price,
+                        reason="rebalance_open_short",
+                        base_size=bid_base_size,
+                    )
             else:
+                entry_base_size, entry_quote_size = self._apply_entry_size_factor(
+                    state=state,
+                    base_size=fixed_entry_base_size,
+                    quote_notional=quote_size,
+                    factor=self._entry_markout_penalty_factor(state=state, side="buy"),
+                )
                 bid_price = state.book.best_bid.price
                 hard_buy_cap = self._buy_price_cap(state=state)
                 if hard_buy_cap is not None:
@@ -354,8 +394,8 @@ class MicroMakerStrategy:
                 bid = self._entry_intent(
                     side="buy",
                     price=bid_price,
-                    base_size=fixed_entry_base_size,
-                    quote_notional=quote_size,
+                    base_size=entry_base_size,
+                    quote_notional=entry_quote_size,
                     reason="join_best_bid",
                 )
 
@@ -368,14 +408,21 @@ class MicroMakerStrategy:
                     rebalance_mode=rebalance_mode,
                     inventory_repair_steps=inventory_repair_steps,
                 )
-                ask = OrderIntent(
-                    side="sell",
-                    price=ask_price,
-                    quote_notional=ask_base_size * ask_price,
-                    reason="rebalance_open_long",
-                    base_size=ask_base_size,
-                )
+                if ask_base_size >= state.instrument.min_size:
+                    ask = OrderIntent(
+                        side="sell",
+                        price=ask_price,
+                        quote_notional=ask_base_size * ask_price,
+                        reason="rebalance_open_long",
+                        base_size=ask_base_size,
+                    )
             else:
+                entry_base_size, entry_quote_size = self._apply_entry_size_factor(
+                    state=state,
+                    base_size=fixed_entry_base_size,
+                    quote_notional=quote_size,
+                    factor=self._entry_markout_penalty_factor(state=state, side="sell"),
+                )
                 ask_price = state.book.best_ask.price
                 sell_price_floor = self._sell_price_floor(state=state)
                 if sell_price_floor is not None:
@@ -383,8 +430,8 @@ class MicroMakerStrategy:
                 ask = self._entry_intent(
                     side="sell",
                     price=ask_price,
-                    base_size=fixed_entry_base_size,
-                    quote_notional=quote_size,
+                    base_size=entry_base_size,
+                    quote_notional=entry_quote_size,
                     reason="join_best_ask",
                 )
 
@@ -518,10 +565,12 @@ class MicroMakerStrategy:
         if profit_ticks <= 0:
             bid_base_size = self._competitive_rebalance_base_size(
                 state=state,
+                side="buy",
                 rebalance_base=rebalance_buy_base,
                 rebalance_mode=rebalance_mode,
                 inventory_repair_steps=inventory_repair_steps,
             )
+            bid_base_size, release_budget_blocked = bid_base_size
             if bid_base_size >= state.instrument.min_size:
                 bid_price = bid_market_price
                 if rebalance_mode == "release":
@@ -539,6 +588,8 @@ class MicroMakerStrategy:
                 if buy_price_cap is not None:
                     bid_price = min(bid_price, buy_price_cap)
                 return bid_base_size, quantize_down(bid_price, state.instrument.tick_size)
+            if rebalance_mode == "release" and release_budget_blocked:
+                return Decimal("0"), quantize_down(bid_market_price, state.instrument.tick_size)
         bid_price = self._rebalance_bid_price(
             state=state,
             base_size=rebalance_buy_base,
@@ -577,10 +628,12 @@ class MicroMakerStrategy:
         if profit_ticks <= 0:
             ask_base_size = self._competitive_rebalance_base_size(
                 state=state,
+                side="sell",
                 rebalance_base=rebalance_sell_base,
                 rebalance_mode=rebalance_mode,
                 inventory_repair_steps=inventory_repair_steps,
             )
+            ask_base_size, release_budget_blocked = ask_base_size
             if ask_base_size >= state.instrument.min_size:
                 ask_price = ask_market_price
                 if rebalance_mode == "release":
@@ -598,6 +651,8 @@ class MicroMakerStrategy:
                 if sell_price_floor is not None:
                     ask_price = max(ask_price, sell_price_floor)
                 return ask_base_size, quantize_up(ask_price, state.instrument.tick_size)
+            if rebalance_mode == "release" and release_budget_blocked:
+                return Decimal("0"), quantize_up(ask_market_price, state.instrument.tick_size)
         ask_price = self._rebalance_ask_price(
             state=state,
             base_size=rebalance_sell_base,
@@ -826,6 +881,11 @@ class MicroMakerStrategy:
     def _secondary_entry_layer(self, *, primary: OrderIntent, state: BotState) -> OrderIntent | None:
         if not state.instrument:
             return None
+        if (
+            self.config.toxicity_disable_second_entry_layer
+            and self._entry_markout_penalty_level(state=state, side=primary.side) >= 2
+        ):
+            return None
         tick_size = state.instrument.tick_size
         spread_ticks = state.book.spread / tick_size if state.book and tick_size > 0 else Decimal("0")
         if spread_ticks < Decimal("2"):
@@ -995,15 +1055,16 @@ class MicroMakerStrategy:
         self,
         *,
         state: BotState,
+        side: str,
         rebalance_base: Decimal,
         rebalance_mode: str,
         inventory_repair_steps: int,
-    ) -> Decimal:
+    ) -> tuple[Decimal, bool]:
         if not state.instrument:
-            return rebalance_base
+            return rebalance_base, False
         reference_base_size = self._entry_base_size(state=state)
         if reference_base_size is None or reference_base_size <= 0:
-            return rebalance_base
+            return rebalance_base, False
         release_factor = min(max(self.config.rebalance_release_size_factor, Decimal("0")), Decimal("1"))
         if rebalance_mode == "release":
             step_bonus = Decimal(max(inventory_repair_steps - 1, 0)) * Decimal("0.25")
@@ -1015,14 +1076,47 @@ class MicroMakerStrategy:
                 state.instrument.lot_size,
             )
             if excess_base_size < state.instrument.min_size:
-                return Decimal("0")
+                return Decimal("0"), False
             target_base_size = min(target_base_size, excess_base_size)
+        if rebalance_mode == "release":
+            depth_budget_base = self._release_depth_budget_base_size(
+                state=state,
+                side=side,
+                inventory_repair_steps=inventory_repair_steps,
+            )
+            if depth_budget_base is not None:
+                if depth_budget_base < state.instrument.min_size:
+                    return Decimal("0"), True
+                target_base_size = min(target_base_size, depth_budget_base)
         unwind_base_size = quantize_down(min(rebalance_base, target_base_size), state.instrument.lot_size)
         if unwind_base_size < state.instrument.min_size:
             if rebalance_mode == "release" and self.config.rebalance_release_excess_only:
-                return Decimal("0")
-            return rebalance_base
-        return unwind_base_size
+                return Decimal("0"), False
+            return rebalance_base, False
+        return unwind_base_size, False
+
+    def _release_depth_budget_base_size(
+        self,
+        *,
+        state: BotState,
+        side: str,
+        inventory_repair_steps: int,
+    ) -> Decimal | None:
+        if not state.instrument or not state.book:
+            return None
+        depth_fraction = min(max(self.config.rebalance_release_depth_fraction, Decimal("0")), Decimal("1"))
+        if depth_fraction <= 0:
+            return None
+        depth_levels = max(int(self.config.rebalance_release_depth_levels), 1)
+        levels = state.book.asks if side == "buy" else state.book.bids
+        visible_depth_base = sum((level.size for level in levels[:depth_levels]), Decimal("0"))
+        if visible_depth_base <= 0:
+            return Decimal("0")
+        step_bonus = max(self.config.rebalance_release_depth_step_bonus, Decimal("0")) * Decimal(
+            max(inventory_repair_steps - 1, 0)
+        )
+        effective_fraction = min(Decimal("1"), depth_fraction + step_bonus)
+        return quantize_down(visible_depth_base * effective_fraction, state.instrument.lot_size)
 
     def _secondary_rebalance_position_taper(self, *, state: BotState, side: str, rebalance_mode: str) -> Decimal:
         reference_base_size = self._entry_base_size(state=state)
@@ -1056,19 +1150,24 @@ class MicroMakerStrategy:
         side: str,
         price: Decimal,
     ) -> Decimal | None:
+        edge_penalty_ticks, markout_size_factor = self._secondary_markout_penalty(state=state, side=side)
+        if markout_size_factor <= 0:
+            return None
         edge_ticks = self._passive_edge_ticks(state=state, side=side, price=price)
         if edge_ticks is None:
             return None
-        min_edge_ticks = max(int(self.config.secondary_min_positive_edge_ticks), 0)
+        base_min_edge_ticks = max(int(self.config.secondary_min_positive_edge_ticks), 0)
+        min_edge_ticks = base_min_edge_ticks + edge_penalty_ticks
         if edge_ticks < min_edge_ticks:
             return None
-        full_size_edge_ticks = max(int(self.config.secondary_full_size_edge_ticks), min_edge_ticks)
+        base_full_size_edge_ticks = max(int(self.config.secondary_full_size_edge_ticks), base_min_edge_ticks)
+        full_size_edge_ticks = max(base_full_size_edge_ticks + edge_penalty_ticks, min_edge_ticks)
         if edge_ticks >= full_size_edge_ticks:
-            return Decimal("1")
+            return markout_size_factor
         thin_factor = min(max(self.config.secondary_thin_edge_size_factor, Decimal("0")), Decimal("1"))
         if thin_factor <= 0:
             return None
-        return thin_factor
+        return thin_factor * markout_size_factor
 
     def _secondary_entry_layer_passes_edge_filter(
         self,
@@ -1077,13 +1176,66 @@ class MicroMakerStrategy:
         side: str,
         price: Decimal,
     ) -> bool:
-        required_edge_ticks = max(int(self.config.secondary_entry_layer_min_edge_ticks), 0)
+        edge_penalty_ticks, _ = self._secondary_markout_penalty(state=state, side=side)
+        required_edge_ticks = max(int(self.config.secondary_entry_layer_min_edge_ticks), 0) + edge_penalty_ticks
         if required_edge_ticks <= 0:
             return True
         edge_ticks = self._passive_edge_ticks(state=state, side=side, price=price)
         if edge_ticks is None:
             return False
         return edge_ticks >= required_edge_ticks
+
+    def _secondary_markout_penalty(self, *, state: BotState, side: str) -> tuple[int, Decimal]:
+        level = self._secondary_markout_penalty_level(state=state, side=side)
+        if level <= 0:
+            return 0, Decimal("1")
+        edge_penalty_ticks = max(int(self.config.secondary_markout_penalty_edge_ticks), 0)
+        if level >= 2:
+            edge_penalty_ticks += max(int(self.config.toxicity_severe_extra_edge_ticks), 0)
+            size_factor = min(
+                max(self.config.secondary_markout_penalty_size_factor, Decimal("0")),
+                max(self.config.toxicity_severe_size_factor, Decimal("0")),
+            )
+        else:
+            size_factor = min(max(self.config.secondary_markout_penalty_size_factor, Decimal("0")), Decimal("1"))
+        return edge_penalty_ticks, size_factor
+
+    def _entry_markout_penalty_factor(self, *, state: BotState, side: str) -> Decimal:
+        level = self._entry_markout_penalty_level(state=state, side=side)
+        if level <= 0:
+            return Decimal("1")
+        if level >= 2:
+            return min(
+                max(self.config.entry_markout_penalty_size_factor, Decimal("0")),
+                max(self.config.toxicity_severe_size_factor, Decimal("0")),
+            )
+        return min(max(self.config.entry_markout_penalty_size_factor, Decimal("0")), Decimal("1"))
+
+    def _entry_markout_penalty_level(self, *, state: BotState, side: str) -> int:
+        window_ms = max(int(self.config.entry_markout_window_ms), 0)
+        trigger_samples = max(int(self.config.entry_markout_trigger_samples), 0)
+        threshold_ticks = max(self.config.entry_markout_adverse_threshold_ticks, Decimal("0"))
+        severe_extra_ticks = max(self.config.toxicity_severe_extra_ticks, Decimal("0"))
+        return state.adverse_fill_markout_level(
+            side=side,
+            window_ms=window_ms,
+            trigger_samples=trigger_samples,
+            threshold_ticks=threshold_ticks,
+            severe_extra_ticks=severe_extra_ticks,
+        )
+
+    def _secondary_markout_penalty_level(self, *, state: BotState, side: str) -> int:
+        window_ms = max(int(self.config.secondary_markout_window_ms), 0)
+        trigger_samples = max(int(self.config.secondary_markout_trigger_samples), 0)
+        threshold_ticks = max(self.config.secondary_markout_adverse_threshold_ticks, Decimal("0"))
+        severe_extra_ticks = max(self.config.toxicity_severe_extra_ticks, Decimal("0"))
+        return state.adverse_fill_markout_level(
+            side=side,
+            window_ms=window_ms,
+            trigger_samples=trigger_samples,
+            threshold_ticks=threshold_ticks,
+            severe_extra_ticks=severe_extra_ticks,
+        )
 
     @staticmethod
     def _passive_edge_ticks(*, state: BotState, side: str, price: Decimal) -> int | None:

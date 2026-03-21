@@ -106,3 +106,64 @@ telemetry:
     assert Path(config.telemetry.journal_path).name == "journal.live.jsonl"
     assert Path(config.telemetry.sqlite_path).name == "audit.live.db"
     assert Path(config.telemetry.state_path).name == "state_snapshot.live.json"
+
+
+def test_load_config_reads_exchange_secrets_from_secret_yaml(tmp_path):
+    project_root = tmp_path / "trend_bot_6"
+    config_dir = project_root / "config"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "config.yaml"
+    secret_path = config_dir / "secret.yaml"
+    config_path.write_text(
+        """
+mode: live
+exchange:
+  simulated: true
+  api_key: ""
+  secret_key: ""
+  passphrase: ""
+""".strip(),
+        encoding="utf-8",
+    )
+    secret_path.write_text(
+        """
+exchange:
+  api_key: secret_key_from_file
+  secret_key: secret_secret_from_file
+  passphrase: secret_pass_from_file
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.exchange.api_key == "secret_key_from_file"
+    assert config.exchange.secret_key == "secret_secret_from_file"
+    assert config.exchange.passphrase == "secret_pass_from_file"
+
+
+def test_load_config_falls_back_to_environment_when_secret_file_missing(tmp_path, monkeypatch):
+    project_root = tmp_path / "trend_bot_6"
+    config_dir = project_root / "config"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        """
+mode: live
+exchange:
+  simulated: true
+  api_key: ""
+  secret_key: ""
+  passphrase: ""
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OKX_API_KEY", "env_key")
+    monkeypatch.setenv("OKX_SECRET_KEY", "env_secret")
+    monkeypatch.setenv("OKX_PASSPHRASE", "env_pass")
+
+    config = load_config(config_path)
+
+    assert config.exchange.api_key == "env_key"
+    assert config.exchange.secret_key == "env_secret"
+    assert config.exchange.passphrase == "env_pass"

@@ -84,6 +84,9 @@ class StrategyConfig:
     rebalance_release_size_factor: Decimal = Decimal("0.50")
     rebalance_release_excess_only: bool = True
     rebalance_release_max_negative_ticks: int = 1
+    rebalance_release_depth_levels: int = 1
+    rebalance_release_depth_fraction: Decimal = Decimal("0.10")
+    rebalance_release_depth_step_bonus: Decimal = Decimal("0.05")
     rebalance_secondary_size_factor: Decimal = Decimal("0.10")
     rebalance_overlay_floor_factor: Decimal = Decimal("0.10")
     rebalance_overlay_preserve_tolerance_ticks: int = 1
@@ -96,6 +99,19 @@ class StrategyConfig:
     toxic_flow_max_observation_ms: int = 1000
     toxic_flow_adverse_ticks: int = 1
     toxic_flow_cooldown_seconds: float = 2.0
+    secondary_markout_window_ms: int = 1000
+    secondary_markout_trigger_samples: int = 3
+    secondary_markout_adverse_threshold_ticks: Decimal = Decimal("1")
+    secondary_markout_penalty_edge_ticks: int = 1
+    secondary_markout_penalty_size_factor: Decimal = Decimal("0.50")
+    entry_markout_window_ms: int = 1000
+    entry_markout_trigger_samples: int = 3
+    entry_markout_adverse_threshold_ticks: Decimal = Decimal("1")
+    entry_markout_penalty_size_factor: Decimal = Decimal("0.50")
+    toxicity_severe_extra_ticks: Decimal = Decimal("1")
+    toxicity_severe_size_factor: Decimal = Decimal("0.25")
+    toxicity_severe_extra_edge_ticks: int = 1
+    toxicity_disable_second_entry_layer: bool = True
     favorable_size_spread_ticks: int = 0
     favorable_size_multiplier: Decimal = Decimal("1")
     normal_buy_price_cap: Decimal = Decimal("0")
@@ -188,6 +204,17 @@ def _merge_dataclass(obj: Any, data: dict[str, Any]) -> Any:
     return obj
 
 
+def _load_optional_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _default_secret_config_path(*, config_path: Path) -> Path:
+    return config_path.with_name("secret.yaml")
+
+
 def _resolve_runtime_path(raw_path: str, *, config_path: Path) -> str:
     path = Path(raw_path)
     if path.is_absolute():
@@ -239,11 +266,13 @@ def load_config(
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    raw = _load_optional_yaml(config_path)
+    secret_raw = _load_optional_yaml(_default_secret_config_path(config_path=config_path))
     config = BotConfig()
     config.mode = mode_override or raw.get("mode", config.mode)
 
     _merge_dataclass(config.exchange, raw.get("exchange", {}))
+    _merge_dataclass(config.exchange, secret_raw.get("exchange", {}))
     _merge_dataclass(config.trading, raw.get("trading", {}))
     _merge_dataclass(config.strategy, raw.get("strategy", {}))
     _merge_dataclass(config.risk, raw.get("risk", {}))

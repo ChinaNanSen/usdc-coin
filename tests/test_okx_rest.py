@@ -1324,6 +1324,79 @@ def test_executor_overlay_queue_respects_secondary_min_positive_edge_threshold()
     assert state.pending_amend(sell_id) is not None
 
 
+def test_executor_overlay_queue_respects_recent_markout_penalty():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.risk.min_free_base_buffer = Decimal("0")
+    config.strategy.preserve_rebalance_queue = True
+    config.strategy.rebalance_max_order_age_seconds = 0
+    config.strategy.secondary_min_positive_edge_ticks = 1
+    config.strategy.secondary_markout_window_ms = 1000
+    config.strategy.secondary_markout_trigger_samples = 1
+    config.strategy.secondary_markout_adverse_threshold_ticks = Decimal("1")
+    config.strategy.secondary_markout_penalty_edge_ticks = 1
+    state._record_markout_sample(side="sell", window_ms=1000, adverse_ticks=Decimal("1.5"))
+    state.set_book(
+        state.book.__class__(
+            ts_ms=1,
+            received_ms=1,
+            bids=[
+                state.book.bids[0].__class__(price=Decimal("0.9999"), size=Decimal("100000"), order_count=0),
+            ],
+            asks=[
+                state.book.asks[0].__class__(price=Decimal("1.0001"), size=Decimal("100000"), order_count=0),
+            ],
+        )
+    )
+    journal = StubJournal()
+    rest = TrackingRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0000",
+            "sz": "1000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "sell",
+            OrderIntent(side="sell", price=Decimal("1.0001"), quote_notional=Decimal("1000.1"), reason="rebalance_secondary_ask", base_size=Decimal("1000")),
+            risk_status=RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.amend_calls) == 1
+    assert state.pending_amend(sell_id) is not None
+
+
+def test_executor_severe_markout_adds_extra_overlay_edge_penalty():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.strategy.secondary_markout_window_ms = 1000
+    config.strategy.secondary_markout_trigger_samples = 1
+    config.strategy.secondary_markout_adverse_threshold_ticks = Decimal("1")
+    config.strategy.secondary_markout_penalty_edge_ticks = 1
+    config.strategy.toxicity_severe_extra_ticks = Decimal("1")
+    config.strategy.toxicity_severe_extra_edge_ticks = 1
+    state._record_markout_sample(side="sell", window_ms=1000, adverse_ticks=Decimal("2.5"))
+
+    executor = OrderExecutor(rest=TrackingRest(), state=state, config=config, journal=StubJournal())
+
+    assert executor._secondary_markout_edge_penalty_ticks(side="sell") == 2
+
+
 def test_executor_same_target_rebalance_sell_does_not_force_refresh_when_target_is_unchanged():
     state = make_state()
     config = BotConfig(mode="live")
