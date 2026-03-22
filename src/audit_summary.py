@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import BotConfig
+from .market_gate import evaluate_market_gate
 from .utils import decimal_to_str
 
 
@@ -47,8 +48,14 @@ def _render_snapshot_section(config: BotConfig) -> list[str]:
     runtime_state = payload.get("runtime_state") or "-"
     runtime_reason = payload.get("runtime_reason") or "-"
     initial_nav = _optional_decimal(payload.get("initial_nav_quote"))
+    current_inst_id = instrument.get("inst_id") or config.trading.inst_id
     base_ccy = instrument.get("base_ccy") or config.trading.base_ccy
     quote_ccy = instrument.get("quote_ccy") or config.trading.quote_ccy
+    market_gate = evaluate_market_gate(
+        inst_id=str(current_inst_id),
+        live_allowed_instruments=config.risk.live_allowed_instruments,
+        observe_only_instruments=config.risk.observe_only_instruments,
+    )
 
     best_bid = _extract_price(book.get("bids"), 0)
     best_ask = _extract_price(book.get("asks"), 0)
@@ -80,6 +87,7 @@ def _render_snapshot_section(config: BotConfig) -> list[str]:
         f"- 策略净值(U)={_fmt(nav)} | 本轮盈亏(U)={_fmt_signed(pnl)} | 库存占比={_fmt_pct(inventory_ratio)}",
         f"- 已观测成交次数={payload.get('observed_fill_count', 0)} | 已观测成交额(U)={_fmt(_optional_decimal(payload.get('observed_fill_volume_quote')))}",
     ]
+    lines.insert(3, f"- market_gate={'allowed' if market_gate.live_allowed else 'blocked'} | current_inst={current_inst_id} | role={market_gate.role}")
     if live_realized is not None or live_unrealized is not None or strategy_position_base is not None:
         lines.append(
             f"- 已实现(U)={_fmt_signed(live_realized)} | 库存浮盈(U)={_fmt_signed(live_unrealized)} | 待回补仓位({base_ccy})={_fmt_signed(strategy_position_base)}"
@@ -312,6 +320,10 @@ def _translate_reason(value: str) -> str:
     }
     if value in mapping:
         return mapping[value]
+    if str(value).startswith("observe-only instrument blocked in live mode:"):
+        return "观察池交易对禁止 live 启动:" + str(value).split(":", 1)[1]
+    if str(value).startswith("instrument not approved for live mode:"):
+        return "未列入 live 允许池:" + str(value).split(":", 1)[1]
     prefix_mapping = {
         "stale book:": "盘口过旧:",
         "pause active:": "暂停中:",

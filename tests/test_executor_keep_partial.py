@@ -212,6 +212,30 @@ def test_entry_queue_preserve_can_still_use_account_inventory_when_enabled():
     assert result is False
 
 
+def test_max_placeable_buy_size_respects_instance_budget():
+    state = make_state()
+    state.configure_balance_budgets(
+        base_ccy="USDC",
+        quote_ccy="USDT",
+        base_total=Decimal("50000"),
+        quote_total=Decimal("5000"),
+    )
+    state.set_balances({
+        "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("50000")),
+        "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("50000")),
+    })
+    config = BotConfig(mode="shadow")
+    executor, journal = make_executor(state, config)
+
+    max_size = executor._max_placeable_base_size(
+        side="buy",
+        price=Decimal("1"),
+        instrument=state.instrument,
+    )
+
+    assert max_size == Decimal("4000")
+
+
 # ============================================================
 # Part 2: _reconcile_side integration — verify cancel is skipped
 # ============================================================

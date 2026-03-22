@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from decimal import Decimal
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .audit_store import SQLiteAuditStore
 from .config import BotConfig
+from .exchange_errors import ExchangeAPIError
 from .log_labels import summarize_okx_error, translate_reason
 from .models import InstrumentMeta, LiveOrder, QuoteDecision, RiskStatus
 from .okx_rest import OKXAPIError, OKXRestClient
@@ -61,7 +63,7 @@ class OrderExecutor:
     def __init__(
         self,
         *,
-        rest: OKXRestClient,
+        rest,
         state: BotState,
         config: BotConfig,
         journal: JournalWriter,
@@ -74,6 +76,13 @@ class OrderExecutor:
         self.shadow_simulator = shadow_simulator
         self._last_action_by_side: dict[str, int] = {}
         self.trade_client = rest
+
+    @staticmethod
+    def _exception_message(exc: BaseException) -> str:
+        text = str(exc).strip()
+        if text:
+            return text
+        return type(exc).__name__
 
     def attach_trade_client(self, trade_client) -> None:
         self.trade_client = trade_client
@@ -242,16 +251,18 @@ class OrderExecutor:
                 req_id=req_id,
                 inst_id_code=self._trade_inst_id_code(),
             )
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             self.state.record_place_result(False)
+            error_text = self._exception_message(exc)
             payload = {
                 "side": side,
                 "req_id": req_id,
-                "reason": str(exc),
+                "reason": error_text,
+                "error_type": type(exc).__name__,
                 "reason_zh": "下单失败",
                 "side_zh": "买单" if side == "buy" else "卖单",
             }
-            if isinstance(exc, OKXAPIError):
+            if isinstance(exc, ExchangeAPIError):
                 payload["okx"] = exc.to_dict()
                 payload["okx_zh"] = summarize_okx_error(payload["okx"])
             self.journal.append("place_order_error", payload)
@@ -347,21 +358,23 @@ class OrderExecutor:
                 req_id=req_id,
                 inst_id_code=self._trade_inst_id_code(),
             )
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
+            error_text = self._exception_message(exc)
             payload = {
                 "cl_ord_id": primary.cl_ord_id,
                 "ord_id": primary.ord_id,
                 "side": primary.side,
                 "reason": intent.reason,
                 "req_id": req_id,
+                "error_type": type(exc).__name__,
                 "old_price": primary.price,
                 "new_price": intent.price,
                 "old_size": primary.size,
                 "new_size": new_total_size,
-                "error": str(exc),
+                "error": error_text,
             }
             self.state.clear_pending_amend(pending_cl_ord_id)
-            if isinstance(exc, OKXAPIError):
+            if isinstance(exc, ExchangeAPIError):
                 payload["okx"] = exc.to_dict()
                 payload["okx_zh"] = summarize_okx_error(payload["okx"])
             self.journal.append("amend_order_error", payload)
@@ -411,7 +424,8 @@ class OrderExecutor:
                 req_id=req_id,
                 inst_id_code=self._trade_inst_id_code(),
             )
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
+            error_text = self._exception_message(exc)
             if self._is_benign_terminal_cancel_error(exc):
                 payload = {
                     "cl_ord_id": order.cl_ord_id,
@@ -419,9 +433,10 @@ class OrderExecutor:
                     "req_id": req_id,
                     "reason": reason,
                     "reason_zh": translate_reason(reason),
-                    "error": str(exc),
+                    "error": error_text,
+                    "error_type": type(exc).__name__,
                 }
-                if isinstance(exc, OKXAPIError):
+                if isinstance(exc, ExchangeAPIError):
                     payload["okx"] = exc.to_dict()
                     payload["okx_zh"] = summarize_okx_error(payload["okx"])
                 self.state.live_orders.pop(order.cl_ord_id, None)
@@ -437,9 +452,10 @@ class OrderExecutor:
                 "req_id": req_id,
                 "reason": reason,
                 "reason_zh": translate_reason(reason),
-                "error": str(exc),
+                "error": error_text,
+                "error_type": type(exc).__name__,
             }
-            if isinstance(exc, OKXAPIError):
+            if isinstance(exc, ExchangeAPIError):
                 payload["okx"] = exc.to_dict()
                 payload["okx_zh"] = summarize_okx_error(payload["okx"])
             self.journal.append(
@@ -498,7 +514,7 @@ class OrderExecutor:
             payloads.append(payload)
         try:
             results = await batch_cancel_orders(orders=payloads, request_id=request_id)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             self.journal.append(
                 "batch_cancel_order_error",
                 {
@@ -506,10 +522,11 @@ class OrderExecutor:
                     "reason": reason,
                     "reason_zh": translate_reason(reason),
                     "orders": [{"cl_ord_id": order.cl_ord_id, "ord_id": order.ord_id} for order in orders],
-                    "error": str(exc),
+                    "error": self._exception_message(exc),
+                    "error_type": type(exc).__name__,
                 },
             )
-            logger.warning("批量撤单失败 | %s | %s", translate_reason(reason), str(exc))
+            logger.warning("批量撤单失败 | %s | %s", translate_reason(reason), self._exception_message(exc))
             return True
 
         results_by_cl_ord_id = {str(item.get("clOrdId") or ""): item for item in results}
@@ -625,7 +642,7 @@ class OrderExecutor:
             )
         try:
             results = await batch_amend_orders(orders=batch_payloads, request_id=request_id)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             for order, _, _ in candidates:
                 self.state.clear_pending_amend(order.cl_ord_id)
             self.journal.append(
@@ -633,10 +650,11 @@ class OrderExecutor:
                 {
                     "req_id": request_id,
                     "orders": journal_payloads,
-                    "error": str(exc),
+                    "error": self._exception_message(exc),
+                    "error_type": type(exc).__name__,
                 },
             )
-            logger.warning("批量改单失败 | %s", str(exc))
+            logger.warning("批量改单失败 | %s", self._exception_message(exc))
             return True
 
         results_by_cl_ord_id = {str(item.get("clOrdId") or ""): item for item in results}
@@ -1053,7 +1071,7 @@ class OrderExecutor:
 
     @staticmethod
     def _is_benign_terminal_cancel_error(exc: Exception) -> bool:
-        if not isinstance(exc, OKXAPIError):
+        if not isinstance(exc, ExchangeAPIError):
             return False
         if not exc.data:
             return False

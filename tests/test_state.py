@@ -47,6 +47,95 @@ def test_initial_nav_waits_for_balances():
     assert state.shadow_base_cost_quote == Decimal("49997.5")
 
 
+def test_budget_caps_effective_balances_without_losing_exchange_snapshot():
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.configure_balance_budgets(
+        base_ccy="USDC",
+        quote_ccy="USDT",
+        base_total=Decimal("12000"),
+        quote_total=Decimal("8000"),
+    )
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("50000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("40000"), frozen=Decimal("10000")),
+        }
+    )
+
+    assert state.exchange_total_balance("USDC") == Decimal("50000")
+    assert state.exchange_total_balance("USDT") == Decimal("50000")
+    assert state.budget_total_balance("USDC") == Decimal("12000")
+    assert state.budget_total_balance("USDT") == Decimal("8000")
+    assert state.total_balance("USDC") == Decimal("12000")
+    assert state.free_balance("USDC") == Decimal("12000")
+    assert state.total_balance("USDT") == Decimal("8000")
+    assert state.free_balance("USDT") == Decimal("8000")
+
+
+def test_budgeted_balances_track_local_fills_then_clip_to_exchange_constraints():
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.configure_balance_budgets(
+        base_ccy="USDC",
+        quote_ccy="USDT",
+        base_total=Decimal("10000"),
+        quote_total=Decimal("10000"),
+    )
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("50000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("50000")),
+        }
+    )
+
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": buy_id,
+            "px": "1",
+            "fillPx": "1",
+            "sz": "4000",
+            "accFillSz": "4000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    assert state.budget_total_balance("USDT") == Decimal("6000")
+    assert state.total_balance("USDT") == Decimal("6000")
+    assert state.budget_total_balance("USDC") == Decimal("14000")
+    assert state.total_balance("USDC") == Decimal("14000")
+
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("12000"), available=Decimal("12000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("7000"), available=Decimal("7000")),
+        }
+    )
+
+    assert state.budget_total_balance("USDC") == Decimal("14000")
+    assert state.total_balance("USDC") == Decimal("12000")
+    assert state.budget_total_balance("USDT") == Decimal("6000")
+    assert state.total_balance("USDT") == Decimal("6000")
+
+
 def test_live_pnl_tracks_realized_and_unrealized_from_managed_fills():
     state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
     state.set_instrument(

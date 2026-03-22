@@ -4,18 +4,30 @@ import sys
 from decimal import Decimal
 
 from .config import TelemetryConfig
+from .market_gate import evaluate_market_gate, normalize_instruments
 from .models import QuoteDecision, RiskStatus
 from .state import BotState
 from .utils import decimal_to_str, now_ms
 
 
 class TerminalStatusPanel:
-    def __init__(self, *, config: TelemetryConfig, mode: str, simulated: bool = False, stream=None):
+    def __init__(
+        self,
+        *,
+        config: TelemetryConfig,
+        mode: str,
+        simulated: bool = False,
+        stream=None,
+        live_allowed_instruments: tuple[str, ...] | list[str] | None = None,
+        observe_only_instruments: tuple[str, ...] | list[str] | None = None,
+    ):
         self.config = config
         self.mode = mode
         self.simulated = simulated
         self.stream = stream or sys.stdout
         self._last_render_ms = 0
+        self.live_allowed_instruments = normalize_instruments(live_allowed_instruments)
+        self.observe_only_instruments = normalize_instruments(observe_only_instruments)
 
     def maybe_render(self, *, state: BotState, risk_status: RiskStatus, decision: QuoteDecision) -> None:
         if not self.config.status_panel_enabled:
@@ -104,6 +116,17 @@ class TerminalStatusPanel:
             f"挂单 | {self._fmt_orders(state)}",
             f"最近成交 | {self._fmt_trade(state)}",
         ]
+        current_inst_id = state.instrument.inst_id if state.instrument else "-"
+        if self.mode == "live" and current_inst_id != "-":
+            market_gate = evaluate_market_gate(
+                inst_id=current_inst_id,
+                live_allowed_instruments=self.live_allowed_instruments,
+                observe_only_instruments=self.observe_only_instruments,
+            )
+            lines.insert(
+                2,
+                f"market_gate | current={current_inst_id} role={market_gate.role} live={self._fmt_bool(market_gate.live_allowed)}",
+            )
         return "\n".join(lines)
 
     def _fmt_balance(self, state: BotState, ccy: str) -> str:
@@ -246,6 +269,10 @@ class TerminalStatusPanel:
         }
         if value in mapping:
             return mapping[value]
+        if str(value).startswith("observe-only instrument blocked in live mode:"):
+            return "观察池交易对禁止 live 启动:" + str(value).split(":", 1)[1]
+        if str(value).startswith("instrument not approved for live mode:"):
+            return "未列入 live 允许池:" + str(value).split(":", 1)[1]
         prefix_mapping = {
             "stale book:": "盘口过旧:",
             "pause active:": "暂停中:",

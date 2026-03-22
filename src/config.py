@@ -11,6 +11,7 @@ import yaml
 
 @dataclass
 class ExchangeConfig:
+    name: str = "okx"
     rest_url: str = "https://www.okx.com"
     public_ws_url: str = "wss://ws.okx.com:8443/ws/v5/public"
     private_ws_url: str = "wss://ws.okx.com:8443/ws/v5/private"
@@ -18,15 +19,23 @@ class ExchangeConfig:
     secret_key: str = ""
     passphrase: str = ""
     simulated: bool = False
+    binance_env: str = "mainnet"
     request_timeout_seconds: float = 10.0
     user_agent: str = "trend_bot_6/0.1"
 
     def apply_env(self) -> None:
+        if self.name == "binance":
+            self.api_key = self.api_key or os.getenv("BINANCE_API_KEY", "")
+            self.secret_key = self.secret_key or os.getenv("BINANCE_SECRET_KEY", "")
+            return
         self.api_key = self.api_key or os.getenv("OKX_API_KEY", "")
         self.secret_key = self.secret_key or os.getenv("OKX_SECRET_KEY", "")
         self.passphrase = self.passphrase or os.getenv("OKX_PASSPHRASE", "")
 
     def apply_runtime_defaults(self) -> None:
+        if self.name == "binance":
+            self._apply_binance_runtime_defaults()
+            return
         if not self.simulated:
             return
 
@@ -39,6 +48,16 @@ class ExchangeConfig:
         self.public_ws_url = ws_mapping.get(self.public_ws_url, self.public_ws_url)
         self.private_ws_url = ws_mapping.get(self.private_ws_url, self.private_ws_url)
 
+    def _apply_binance_runtime_defaults(self) -> None:
+        if self.binance_env == "testnet":
+            self.rest_url = "https://testnet.binance.vision"
+            self.public_ws_url = "wss://stream.testnet.binance.vision/ws"
+            self.private_ws_url = "wss://ws-api.testnet.binance.vision/ws-api/v3"
+            return
+        self.rest_url = "https://api.binance.com"
+        self.public_ws_url = "wss://stream.binance.com:9443/ws"
+        self.private_ws_url = "wss://ws-api.binance.com:443/ws-api/v3"
+
 
 @dataclass
 class TradingConfig:
@@ -46,6 +65,8 @@ class TradingConfig:
     inst_type: str = "SPOT"
     base_ccy: str = "USDC"
     quote_ccy: str = "USDT"
+    budget_base_total: Decimal = Decimal("0")
+    budget_quote_total: Decimal = Decimal("0")
     entry_base_size: Decimal = Decimal("0")
     post_only: bool = False
     quote_size: Decimal = Decimal("10000")
@@ -150,7 +171,10 @@ class RiskConfig:
     enforce_effective_fee_gate: bool = True
     max_effective_maker_fee_rate: Decimal = Decimal("0")
     max_effective_taker_fee_rate: Decimal = Decimal("0")
+    live_allowed_instruments: list[str] = field(default_factory=lambda: ["USDC-USDT", "USDG-USDT"])
+    observe_only_instruments: list[str] = field(default_factory=lambda: ["DAI-USDT", "PYUSD-USDT"])
     zero_fee_instruments: list[str] = field(default_factory=lambda: ["USDC-USDT"])
+    simulated_rest_trade_instruments: list[str] = field(default_factory=lambda: ["USDG-USDT"])
     max_managed_orders_per_side: int = 1
     max_consistency_failures: int = 3
     cancel_managed_on_consistency_failure: bool = False
@@ -173,6 +197,7 @@ class TelemetryConfig:
     sqlite_enabled: bool = True
     sqlite_path: str = "data/audit.db"
     state_path: str = "data/state_snapshot.json"
+    stop_request_path: str = "data/stop.request"
     snapshot_interval_seconds: float = 30.0
     status_panel_enabled: bool = True
     status_panel_interval_seconds: float = 1.0
@@ -211,7 +236,9 @@ def _load_optional_yaml(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _default_secret_config_path(*, config_path: Path) -> Path:
+def _default_secret_config_path(*, config_path: Path, exchange_name: str) -> Path:
+    if exchange_name == "binance":
+        return config_path.with_name("secret.binance.yaml")
     return config_path.with_name("secret.yaml")
 
 
@@ -267,7 +294,8 @@ def load_config(
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     raw = _load_optional_yaml(config_path)
-    secret_raw = _load_optional_yaml(_default_secret_config_path(config_path=config_path))
+    exchange_name = str((raw.get("exchange") or {}).get("name") or "okx").lower()
+    secret_raw = _load_optional_yaml(_default_secret_config_path(config_path=config_path, exchange_name=exchange_name))
     config = BotConfig()
     config.mode = mode_override or raw.get("mode", config.mode)
 
@@ -281,6 +309,7 @@ def load_config(
     config.telemetry.journal_path = _resolve_runtime_path(config.telemetry.journal_path, config_path=config_path)
     config.telemetry.sqlite_path = _resolve_runtime_path(config.telemetry.sqlite_path, config_path=config_path)
     config.telemetry.state_path = _resolve_runtime_path(config.telemetry.state_path, config_path=config_path)
+    config.telemetry.stop_request_path = _resolve_runtime_path(config.telemetry.stop_request_path, config_path=config_path)
 
     config.exchange.apply_env()
     config.exchange.apply_runtime_defaults()
@@ -299,16 +328,24 @@ def load_config(
         mode=config.mode,
         simulated=config.exchange.simulated,
     )
+    config.telemetry.stop_request_path = _apply_environment_suffix(
+        config.telemetry.stop_request_path,
+        mode=config.mode,
+        simulated=config.exchange.simulated,
+    )
     if config.mode == "live" and validate_live_credentials:
-        missing = [
-            name
-            for name, value in {
+        if config.exchange.name == "binance":
+            required = {
+                "BINANCE_API_KEY": config.exchange.api_key,
+                "BINANCE_SECRET_KEY": config.exchange.secret_key,
+            }
+        else:
+            required = {
                 "OKX_API_KEY": config.exchange.api_key,
                 "OKX_SECRET_KEY": config.exchange.secret_key,
                 "OKX_PASSPHRASE": config.exchange.passphrase,
-            }.items()
-            if not value
-        ]
+            }
+        missing = [name for name, value in required.items() if not value]
         if missing:
             raise ValueError(f"Live mode requires credentials: {', '.join(missing)}")
     return config

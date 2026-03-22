@@ -1,6 +1,7 @@
 mode: shadow
 
 exchange:
+  name: okx
   rest_url: https://www.okx.com
   public_ws_url: wss://ws.okx.com:8443/ws/v5/public
   private_ws_url: wss://ws.okx.com:8443/ws/v5/private
@@ -8,6 +9,7 @@ exchange:
   secret_key: ""
   passphrase: ""
   simulated: false
+  binance_env: mainnet
   request_timeout_seconds: 10
   user_agent: trend_bot_6/0.1
 
@@ -16,6 +18,8 @@ trading:
   inst_type: SPOT
   base_ccy: USDC
   quote_ccy: USDT
+  budget_base_total: 0
+  budget_quote_total: 0
   entry_base_size: 10000
   post_only: true
   quote_size: 10000
@@ -112,14 +116,19 @@ risk:
   enforce_effective_fee_gate: true
   max_effective_maker_fee_rate: 0
   max_effective_taker_fee_rate: 0
+  live_allowed_instruments:
+    - USDC-USDT
+    - USDG-USDT
+  observe_only_instruments:
+    - DAI-USDT
+    - PYUSD-USDT
+  simulated_rest_trade_instruments:
+    - USDG-USDT
   max_managed_orders_per_side: 2
   max_consistency_failures: 3
   cancel_managed_on_consistency_failure: false
   balance_consistency_tolerance_quote: 1
   require_passive_prices_on_resync: true
-  zero_fee_instruments:
-    - USDC-USDT
-
 shadow:
   subscribe_trades: true
   min_rest_seconds: 1.0

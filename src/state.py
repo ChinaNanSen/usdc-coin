@@ -18,6 +18,9 @@ class BotState:
         self.state_path = Path(state_path)
         self.instrument: InstrumentMeta | None = None
         self.book: BookSnapshot | None = None
+        self.exchange_balances: dict[str, Balance] = {}
+        self.budget_balances: dict[str, Balance] = {}
+        self.balance_budget_caps: dict[str, Decimal] = {}
         self.balances: dict[str, Balance] = {}
         self.live_orders: dict[str, LiveOrder] = {}
         self.reconnect_events: deque[int] = deque()
@@ -73,15 +76,54 @@ class BotState:
         self._init_nav_if_possible()
         self._init_shadow_cost_if_possible()
 
+    def configure_balance_budgets(
+        self,
+        *,
+        base_ccy: str,
+        quote_ccy: str,
+        base_total: Decimal,
+        quote_total: Decimal,
+    ) -> None:
+        self._set_balance_budget_cap(base_ccy, base_total)
+        self._set_balance_budget_cap(quote_ccy, quote_total)
+        for ccy in (base_ccy, quote_ccy):
+            source = self.exchange_balances.get(ccy) or self.budget_balances.get(ccy) or self.balances.get(ccy)
+            if source is not None:
+                self.budget_balances[ccy] = self._budget_seed_balance(ccy, source)
+        self._refresh_effective_balances()
+
     def set_balances(self, balances: dict[str, Balance]) -> None:
-        self.balances.update(balances)
+        for ccy, balance in balances.items():
+            self.exchange_balances[ccy] = Balance(
+                ccy=ccy,
+                total=balance.total,
+                available=balance.available,
+                frozen=balance.frozen,
+            )
+            if ccy not in self.balance_budget_caps:
+                self.budget_balances[ccy] = Balance(
+                    ccy=ccy,
+                    total=balance.total,
+                    available=balance.available,
+                    frozen=balance.frozen,
+                )
+            elif ccy not in self.budget_balances:
+                self.budget_balances[ccy] = self._budget_seed_balance(ccy, balance)
+        self._refresh_effective_balances(currencies=tuple(balances.keys()))
         self._init_nav_if_possible()
         self._init_shadow_cost_if_possible()
         self._init_external_inventory_if_possible()
 
     def seed_shadow_balances(self, *, base_ccy: str, quote_ccy: str, base_balance: Decimal, quote_balance: Decimal) -> None:
-        self.balances[base_ccy] = Balance(ccy=base_ccy, total=base_balance, available=base_balance)
-        self.balances[quote_ccy] = Balance(ccy=quote_ccy, total=quote_balance, available=quote_balance)
+        self.budget_balances[base_ccy] = self._budget_seed_balance(
+            base_ccy,
+            Balance(ccy=base_ccy, total=base_balance, available=base_balance),
+        )
+        self.budget_balances[quote_ccy] = self._budget_seed_balance(
+            quote_ccy,
+            Balance(ccy=quote_ccy, total=quote_balance, available=quote_balance),
+        )
+        self._refresh_effective_balances(currencies=(base_ccy, quote_ccy))
         self._init_nav_if_possible()
         self._init_shadow_cost_if_possible()
 
@@ -152,7 +194,13 @@ class BotState:
             total = parse_decimal(item.get("cashBal") or item.get("eq") or "0")
             available = parse_decimal(item.get("availBal") or item.get("availEq") or total)
             frozen = max(total - available, Decimal("0"))
-            self.balances[ccy] = Balance(ccy=ccy, total=total, available=available, frozen=frozen)
+            exchange_balance = Balance(ccy=ccy, total=total, available=available, frozen=frozen)
+            self.exchange_balances[ccy] = exchange_balance
+            if ccy not in self.balance_budget_caps:
+                self.budget_balances[ccy] = exchange_balance
+            elif ccy not in self.budget_balances:
+                self.budget_balances[ccy] = self._budget_seed_balance(ccy, exchange_balance)
+        self._refresh_effective_balances(currencies=tuple(item.get("ccy") for item in payload.get("details", []) if item.get("ccy")))
         self._init_nav_if_possible()
 
     def replace_live_orders(self, payloads: list[dict], *, source: str = "rest_sync") -> None:
@@ -541,6 +589,32 @@ class BotState:
         self.last_consistency_reason = reason
         self.consecutive_consistency_failures = 0 if ok else self.consecutive_consistency_failures + 1
 
+    def exchange_free_balance(self, ccy: str) -> Decimal:
+        return self.exchange_balances.get(ccy, Balance(ccy=ccy, total=Decimal("0"), available=Decimal("0"))).available
+
+    def exchange_total_balance(self, ccy: str) -> Decimal:
+        return self.exchange_balances.get(ccy, Balance(ccy=ccy, total=Decimal("0"), available=Decimal("0"))).total
+
+    def budget_free_balance(self, ccy: str) -> Decimal:
+        return self.budget_balances.get(ccy, Balance(ccy=ccy, total=Decimal("0"), available=Decimal("0"))).available
+
+    def budget_total_balance(self, ccy: str) -> Decimal:
+        return self.budget_balances.get(ccy, Balance(ccy=ccy, total=Decimal("0"), available=Decimal("0"))).total
+
+    def validate_configured_budgets(self, *, ccys: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+        errors: list[str] = []
+        for ccy in ccys:
+            configured = self.balance_budget_caps.get(ccy)
+            if configured is None or configured <= 0:
+                continue
+            exchange_total = self.exchange_total_balance(ccy)
+            if exchange_total <= 0:
+                errors.append(f"{ccy} budget configured but exchange balance missing")
+                continue
+            if configured > exchange_total:
+                errors.append(f"{ccy} budget {configured} exceeds exchange total {exchange_total}")
+        return tuple(errors)
+
     def free_balance(self, ccy: str) -> Decimal:
         return self.balances.get(ccy, Balance(ccy=ccy, total=Decimal("0"), available=Decimal("0"))).available
 
@@ -859,6 +933,8 @@ class BotState:
             "instrument": self.instrument,
             "book": self.book,
             "balances": self.balances,
+            "exchange_balances": self.exchange_balances,
+            "budget_balances": self.budget_balances,
             "live_orders": self.live_orders,
             "initial_nav_quote": self.initial_nav_quote,
             "last_fill_ms": self.last_fill_ms,
@@ -989,7 +1065,7 @@ class BotState:
     def _consume_balance(self, *, ccy: str, amount: Decimal) -> None:
         if amount <= 0:
             return
-        current = self.balances.get(ccy, Balance(ccy=ccy, total=Decimal("0"), available=Decimal("0"), frozen=Decimal("0")))
+        current = self.budget_balances.get(ccy, Balance(ccy=ccy, total=Decimal("0"), available=Decimal("0"), frozen=Decimal("0")))
         consumed_frozen = min(current.frozen, amount)
         consumed_available = amount - consumed_frozen
         self._adjust_balance(
@@ -1007,7 +1083,7 @@ class BotState:
         available_delta: Decimal = Decimal("0"),
         frozen_delta: Decimal = Decimal("0"),
     ) -> None:
-        current = self.balances.get(ccy, Balance(ccy=ccy, total=Decimal("0"), available=Decimal("0"), frozen=Decimal("0")))
+        current = self.budget_balances.get(ccy, Balance(ccy=ccy, total=Decimal("0"), available=Decimal("0"), frozen=Decimal("0")))
         total = current.total + total_delta
         available = current.available + available_delta
         frozen = current.frozen + frozen_delta
@@ -1017,12 +1093,78 @@ class BotState:
             available = Decimal("0")
         if frozen < 0:
             frozen = Decimal("0")
-        self.balances[ccy] = Balance(ccy=ccy, total=total, available=available, frozen=frozen)
+        self.budget_balances[ccy] = Balance(ccy=ccy, total=total, available=available, frozen=frozen)
+        if ccy in self.exchange_balances:
+            exchange_current = self.exchange_balances[ccy]
+            exchange_total = exchange_current.total + total_delta
+            exchange_available = exchange_current.available + available_delta
+            exchange_frozen = exchange_current.frozen + frozen_delta
+            if exchange_total < 0:
+                exchange_total = Decimal("0")
+            if exchange_available < 0:
+                exchange_available = Decimal("0")
+            if exchange_frozen < 0:
+                exchange_frozen = Decimal("0")
+            self.exchange_balances[ccy] = Balance(
+                ccy=ccy,
+                total=exchange_total,
+                available=exchange_available,
+                frozen=exchange_frozen,
+            )
+        self._refresh_effective_balances(currencies=(ccy,))
 
     def _has_balance_snapshot(self) -> bool:
         if not self.instrument:
             return False
         return self.instrument.base_ccy in self.balances and self.instrument.quote_ccy in self.balances
+
+    def _set_balance_budget_cap(self, ccy: str, total: Decimal) -> None:
+        if total > 0:
+            self.balance_budget_caps[ccy] = total
+            return
+        self.balance_budget_caps.pop(ccy, None)
+
+    def _budget_seed_balance(self, ccy: str, source: Balance) -> Balance:
+        budget_cap = self.balance_budget_caps.get(ccy)
+        if budget_cap is None or budget_cap <= 0:
+            return Balance(ccy=ccy, total=source.total, available=source.available, frozen=source.frozen)
+        total = min(source.total, budget_cap)
+        available = min(source.available, total)
+        frozen = max(total - available, Decimal("0"))
+        return Balance(ccy=ccy, total=total, available=available, frozen=frozen)
+
+    def _ensure_budget_balance(self, ccy: str) -> None:
+        if ccy in self.budget_balances:
+            return
+        source = self.exchange_balances.get(ccy) or self.balances.get(ccy) or Balance(
+            ccy=ccy,
+            total=Decimal("0"),
+            available=Decimal("0"),
+            frozen=Decimal("0"),
+        )
+        self.budget_balances[ccy] = self._budget_seed_balance(ccy, source)
+
+    def _refresh_effective_balances(self, *, currencies: tuple[str, ...] | list[str] | None = None) -> None:
+        if currencies is None:
+            keys = set(self.exchange_balances) | set(self.budget_balances) | set(self.balances)
+        else:
+            keys = {ccy for ccy in currencies if ccy}
+        for ccy in keys:
+            budget = self.budget_balances.get(ccy)
+            exchange = self.exchange_balances.get(ccy)
+            if budget is None and exchange is None:
+                self.balances.pop(ccy, None)
+                continue
+            if budget is None:
+                self.balances[ccy] = exchange
+                continue
+            if exchange is None:
+                self.balances[ccy] = budget
+                continue
+            total = min(budget.total, exchange.total)
+            available = min(budget.available, exchange.available, total)
+            frozen = max(total - available, Decimal("0"))
+            self.balances[ccy] = Balance(ccy=ccy, total=total, available=available, frozen=frozen)
 
     def _record_live_fill(
         self,

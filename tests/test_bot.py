@@ -7,6 +7,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.bot import TrendBot6
+from src.binance_private_stream import BinancePrivateUserStream
+from src.binance_market_data import BinancePublicMarketStream
+from src.binance_rest import BinanceRestClient
 from src.config import BotConfig
 from src.models import Balance, InstrumentMeta
 from src.models import BookLevel, BookSnapshot
@@ -68,6 +71,445 @@ def test_public_reconnect_resyncs_without_immediate_cancel(tmp_path):
             "configured_cancel_on_public_reconnect": False,
         },
     ) in bot.journal.events
+
+
+def test_bot_refresh_fee_uses_runtime_fee_without_zero_fee_override(tmp_path):
+    config = BotConfig(mode="live")
+    config.exchange.simulated = True
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+    config.risk.zero_fee_instruments = ["USDC-USDT"]
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+
+    async def fake_fetch_trade_fee(inst_type: str, inst_id: str) -> dict:
+        assert inst_type == "SPOT"
+        assert inst_id == "USDC-USDT"
+        return {
+            "maker": Decimal("0.0005"),
+            "taker": Decimal("0.0010"),
+            "feeType": "level_based",
+        }
+
+    bot.rest.fetch_trade_fee = fake_fetch_trade_fee  # type: ignore[method-assign]
+
+    try:
+        asyncio.run(bot._refresh_fee(force=True))
+    finally:
+        asyncio.run(bot.rest.close())
+        bot.audit_store.close()
+
+    assert bot.state.fee_snapshot is not None
+    assert bot.state.fee_snapshot.maker == Decimal("0.0005")
+    assert bot.state.fee_snapshot.taker == Decimal("0.0010")
+    assert bot.state.fee_snapshot.effective_maker == Decimal("0.0005")
+    assert bot.state.fee_snapshot.effective_taker == Decimal("0.0010")
+    assert bot.state.fee_snapshot.zero_fee_override is False
+
+
+def test_live_market_gate_blocks_observe_only_pair(tmp_path):
+    config = BotConfig(mode="live")
+    config.trading.inst_id = "DAI-USDT"
+    config.trading.base_ccy = "DAI"
+    config.trading.quote_ccy = "USDT"
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+
+    try:
+        allowed = bot._check_live_market_gate()
+    finally:
+        bot.audit_store.close()
+
+    assert allowed is False
+    assert bot.state.runtime_state == "STOPPED"
+    assert bot.state.runtime_reason == "observe-only instrument blocked in live mode: DAI-USDT"
+    assert (
+        "startup_market_gate_blocked",
+        {
+            "inst_id": "DAI-USDT",
+            "reason": "observe-only instrument blocked in live mode: DAI-USDT",
+            "live_allowed_instruments": ["USDC-USDT", "USDG-USDT"],
+            "observe_only_instruments": ["DAI-USDT", "PYUSD-USDT"],
+        },
+    ) in bot.journal.events
+
+
+def test_live_market_gate_allows_core_pair(tmp_path):
+    config = BotConfig(mode="live")
+    config.trading.inst_id = "USDG-USDT"
+    config.trading.base_ccy = "USDG"
+    config.trading.quote_ccy = "USDT"
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+
+    try:
+        allowed = bot._check_live_market_gate()
+    finally:
+        bot.audit_store.close()
+
+    assert allowed is True
+    assert bot.state.runtime_state == "INIT"
+
+
+def test_live_budget_gate_blocks_when_instance_budget_exceeds_account_balance(tmp_path):
+    config = BotConfig(mode="live")
+    config.exchange.simulated = True
+    config.trading.budget_base_total = Decimal("60000")
+    config.trading.budget_quote_total = Decimal("5000")
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+    bot.state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("50000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("50000")),
+        }
+    )
+
+    try:
+        allowed = bot._check_live_budget_gate()
+    finally:
+        bot.audit_store.close()
+
+    assert allowed is False
+    assert bot.state.runtime_state == "STOPPED"
+    assert "instance budget exceeds account balance" in bot.state.runtime_reason
+    assert (
+        "startup_budget_gate_blocked",
+        {
+            "inst_id": "USDC-USDT",
+            "reason": "instance budget exceeds account balance: USDC budget 60000 exceeds exchange total 50000",
+            "budget_base_total": Decimal("60000"),
+            "budget_quote_total": Decimal("5000"),
+            "exchange_base_total": Decimal("50000"),
+            "exchange_quote_total": Decimal("50000"),
+        },
+    ) in bot.journal.events
+
+
+def test_binance_bot_uses_binance_clients(monkeypatch, tmp_path):
+    config = BotConfig(mode="live")
+    config.exchange.name = "binance"
+    config.exchange.binance_env = "testnet"
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+    config.telemetry.stop_request_path = str(tmp_path / "stop.request")
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+
+    async def fake_sync_time_offset():
+        return None
+
+    async def fake_fetch_instrument(inst_id: str, inst_type: str):
+        return InstrumentMeta(
+            inst_id=inst_id,
+            inst_type=inst_type,
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+            state="live",
+        )
+
+    async def fake_fetch_order_book(inst_id: str, depth: int):
+        return make_book(bid="1.0000", ask="1.0001", ts_ms=1)
+
+    async def fake_fetch_balances(ccys):
+        return {
+            "USDC": Balance(ccy="USDC", total=Decimal("10000"), available=Decimal("10000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000")),
+        }
+
+    async def fake_fetch_trade_fee(inst_type: str, inst_id: str):
+        return {"maker": Decimal("0"), "taker": Decimal("0"), "feeType": ""}
+
+    async def fake_bootstrap_pending_orders():
+        return None
+
+    async def fake_stream_start(self):
+        return None
+
+    bot.rest.sync_time_offset = fake_sync_time_offset  # type: ignore[method-assign]
+    bot.rest.fetch_instrument = fake_fetch_instrument  # type: ignore[method-assign]
+    bot.rest.fetch_order_book = fake_fetch_order_book  # type: ignore[method-assign]
+    bot.rest.fetch_balances = fake_fetch_balances  # type: ignore[method-assign]
+    bot.rest.fetch_trade_fee = fake_fetch_trade_fee  # type: ignore[method-assign]
+    bot.executor.bootstrap_pending_orders = fake_bootstrap_pending_orders  # type: ignore[method-assign]
+    monkeypatch.setattr("src.binance_market_data.BinancePublicMarketStream.start", fake_stream_start)
+    monkeypatch.setattr("src.binance_private_stream.BinancePrivateUserStream.start", fake_stream_start)
+
+    try:
+        asyncio.run(bot._bootstrap())
+    finally:
+        asyncio.run(bot.rest.close())
+        bot.audit_store.close()
+
+    assert isinstance(bot.rest, BinanceRestClient)
+    assert isinstance(bot.public_stream, BinancePublicMarketStream)
+    assert isinstance(bot.private_stream, BinancePrivateUserStream)
+    assert bot.executor.trade_client is bot.rest
+
+
+def test_simulated_live_bootstrap_keeps_private_ws_routing_for_usdc(monkeypatch, tmp_path):
+    config = BotConfig(mode="live")
+    config.exchange.simulated = True
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+
+    async def fake_sync_time_offset():
+        return None
+
+    async def fake_fetch_instrument(inst_id: str, inst_type: str):
+        return InstrumentMeta(
+            inst_id=inst_id,
+            inst_type=inst_type,
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+            inst_id_code="648",
+            state="live",
+        )
+
+    async def fake_fetch_order_book(inst_id: str, depth: int):
+        return make_book(bid="1.0000", ask="1.0001", ts_ms=1)
+
+    async def fake_fetch_balances(ccys):
+        return {
+            "USDC": Balance(ccy="USDC", total=Decimal("10000"), available=Decimal("10000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000")),
+        }
+
+    async def fake_fetch_trade_fee(inst_type: str, inst_id: str):
+        return {"maker": Decimal("0"), "taker": Decimal("0"), "feeType": ""}
+
+    async def fake_stream_start(self):
+        return None
+
+    bot.rest.sync_time_offset = fake_sync_time_offset  # type: ignore[method-assign]
+    bot.rest.fetch_instrument = fake_fetch_instrument  # type: ignore[method-assign]
+    bot.rest.fetch_order_book = fake_fetch_order_book  # type: ignore[method-assign]
+    bot.rest.fetch_balances = fake_fetch_balances  # type: ignore[method-assign]
+    bot.rest.fetch_trade_fee = fake_fetch_trade_fee  # type: ignore[method-assign]
+    bot.executor.bootstrap_pending_orders = fake_sync_time_offset  # type: ignore[method-assign]
+    monkeypatch.setattr("src.market_data.PublicBookStream.start", fake_stream_start)
+    monkeypatch.setattr("src.private_stream.PrivateUserStream.start", fake_stream_start)
+
+    try:
+        asyncio.run(bot._bootstrap())
+    finally:
+        asyncio.run(bot.rest.close())
+        bot.audit_store.close()
+
+    assert bot.private_stream is not None
+    assert bot.executor.trade_client is bot.private_stream
+    assert (
+        "simulated_trade_routing",
+        {
+            "trade_client": "private_ws",
+            "reason": "simulated instrument allows private ws trading",
+            "inst_id": "USDC-USDT",
+        },
+    ) in bot.journal.events
+
+
+def test_simulated_live_bootstrap_keeps_rest_trade_routing_for_usdg(monkeypatch, tmp_path):
+    config = BotConfig(mode="live")
+    config.exchange.simulated = True
+    config.trading.inst_id = "USDG-USDT"
+    config.trading.base_ccy = "USDG"
+    config.trading.quote_ccy = "USDT"
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+
+    async def fake_sync_time_offset():
+        return None
+
+    async def fake_fetch_instrument(inst_id: str, inst_type: str):
+        return InstrumentMeta(
+            inst_id=inst_id,
+            inst_type=inst_type,
+            base_ccy="USDG",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+            inst_id_code="213767",
+            state="live",
+        )
+
+    async def fake_fetch_order_book(inst_id: str, depth: int):
+        return make_book(bid="1.0000", ask="1.0001", ts_ms=1)
+
+    async def fake_fetch_balances(ccys):
+        return {
+            "USDG": Balance(ccy="USDG", total=Decimal("10000"), available=Decimal("10000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000")),
+        }
+
+    async def fake_fetch_trade_fee(inst_type: str, inst_id: str):
+        return {"maker": Decimal("0"), "taker": Decimal("0"), "feeType": ""}
+
+    async def fake_stream_start(self):
+        return None
+
+    bot.rest.sync_time_offset = fake_sync_time_offset  # type: ignore[method-assign]
+    bot.rest.fetch_instrument = fake_fetch_instrument  # type: ignore[method-assign]
+    bot.rest.fetch_order_book = fake_fetch_order_book  # type: ignore[method-assign]
+    bot.rest.fetch_balances = fake_fetch_balances  # type: ignore[method-assign]
+    bot.rest.fetch_trade_fee = fake_fetch_trade_fee  # type: ignore[method-assign]
+    bot.executor.bootstrap_pending_orders = fake_sync_time_offset  # type: ignore[method-assign]
+    monkeypatch.setattr("src.market_data.PublicBookStream.start", fake_stream_start)
+    monkeypatch.setattr("src.private_stream.PrivateUserStream.start", fake_stream_start)
+
+    try:
+        asyncio.run(bot._bootstrap())
+    finally:
+        asyncio.run(bot.rest.close())
+        bot.audit_store.close()
+
+    assert bot.private_stream is not None
+    assert bot.executor.trade_client is bot.rest
+    assert (
+        "simulated_trade_routing",
+        {
+            "trade_client": "rest",
+            "reason": "configured simulated instrument uses rest trading fallback",
+            "inst_id": "USDG-USDT",
+        },
+    ) in bot.journal.events
+
+
+def test_on_order_ignores_foreign_instrument_updates(tmp_path):
+    config = BotConfig(mode="live")
+    config.trading.inst_id = "USDC-USDT"
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+
+    try:
+        asyncio.run(
+            bot._on_order(
+                {
+                    "instId": "USDG-USDT",
+                    "side": "buy",
+                    "ordId": "foreign-1",
+                    "clOrdId": "bot7mb123",
+                    "px": "1",
+                    "sz": "1000",
+                    "accFillSz": "0",
+                    "state": "live",
+                    "cTime": "1",
+                    "uTime": "1",
+                }
+            )
+        )
+    finally:
+        bot.audit_store.close()
+
+    assert bot.state.live_orders == {}
+    assert (
+        "order_update_ignored_foreign_inst",
+        {
+            "inst_id": "USDG-USDT",
+            "expected_inst_id": "USDC-USDT",
+            "cl_ord_id": "bot7mb123",
+        },
+    ) in bot.journal.events
+
+
+def test_bot_detects_stop_request_file_and_marks_stopped(tmp_path):
+    stop_path = tmp_path / "stop.request"
+    config = BotConfig(mode="live")
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+    config.telemetry.stop_request_path = str(stop_path)
+
+    bot = TrendBot6(config)
+    bot.journal = StubJournal()
+    stop_path.write_text("stop", encoding="utf-8")
+
+    try:
+        stopped = bot._check_stop_request()
+    finally:
+        bot.audit_store.close()
+
+    assert stopped is True
+    assert bot.state.runtime_state == "STOPPED"
+    assert "stop requested" in bot.state.runtime_reason
+    assert (
+        "stop_requested",
+        {
+            "inst_id": "USDC-USDT",
+            "path": str(stop_path),
+        },
+    ) in bot.journal.events
+
+
+def test_shutdown_preserves_existing_startup_gate_reason(tmp_path):
+    config = BotConfig(mode="live")
+    config.trading.inst_id = "DAI-USDT"
+    config.trading.base_ccy = "DAI"
+    config.trading.quote_ccy = "USDT"
+    config.risk.cancel_managed_orders_on_shutdown = False
+    config.telemetry.sqlite_enabled = False
+    config.telemetry.journal_path = str(tmp_path / "journal.jsonl")
+    config.telemetry.sqlite_path = str(tmp_path / "audit.db")
+    config.telemetry.state_path = str(tmp_path / "state.json")
+
+    bot = TrendBot6(config)
+
+    try:
+        assert bot._check_live_market_gate() is False
+        asyncio.run(bot.shutdown())
+    finally:
+        bot.audit_store.close()
+
+    assert bot.state.runtime_state == "STOPPED"
+    assert bot.state.runtime_reason == "observe-only instrument blocked in live mode: DAI-USDT"
 
 
 def test_bot_restores_persisted_accounting_on_init(tmp_path):

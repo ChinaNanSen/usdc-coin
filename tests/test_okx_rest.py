@@ -154,6 +154,12 @@ class WSTradeClient:
         ]
 
 
+class CancelledPlaceWSTradeClient(WSTradeClient):
+    async def place_limit_order(self, **kwargs):
+        self.place_calls.append(kwargs)
+        raise asyncio.CancelledError()
+
+
 class CapturingPlaceRest:
     def __init__(self):
         self.place_calls = []
@@ -488,6 +494,30 @@ def test_executor_logs_structured_okx_error_payload():
     assert event == "place_order_error"
     assert payload["okx"]["code"] == "51008"
     assert payload["okx"]["data"][0]["sMsg"] == "Insufficient USDT balance"
+
+
+def test_executor_recovers_from_cancelled_ws_place_request():
+    state = make_state()
+    config = BotConfig(mode="live")
+    journal = StubJournal()
+    rest = TrackingRest()
+    ws_trade = CancelledPlaceWSTradeClient()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    executor.attach_trade_client(ws_trade)
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            OrderIntent(side="buy", price=Decimal("1"), quote_notional=Decimal("1000"), reason="test_cancelled_place"),
+        )
+
+    asyncio.run(run())
+
+    event, payload = journal.events[-1]
+    assert event == "place_order_error"
+    assert payload["reason"] == "CancelledError"
+    assert state.consecutive_place_failures == 1
+    assert state.live_orders == {}
 
 
 def test_executor_keeps_same_order_after_ttl_when_disabled(monkeypatch):

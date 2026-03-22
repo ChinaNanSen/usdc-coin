@@ -128,6 +128,40 @@ def test_risk_blocks_when_streams_not_ready_in_live_mode():
     assert status.runtime_state == "INIT"
 
 
+def test_risk_uses_effective_budgeted_quote_balance_for_bid_permission():
+    risk = RiskManager(RiskConfig(min_free_quote_buffer=Decimal("1000")), TradingConfig(), mode="live")
+    state = make_state()
+    state.configure_balance_budgets(
+        base_ccy="USDC",
+        quote_ccy="USDT",
+        base_total=Decimal("50000"),
+        quote_total=Decimal("900"),
+    )
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("50000"), available=Decimal("50000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("50000"), available=Decimal("50000")),
+        }
+    )
+    state.set_fee_snapshot(
+        FeeSnapshot(
+            inst_type="SPOT",
+            inst_id="USDC-USDT",
+            maker=Decimal("0"),
+            taker=Decimal("0"),
+            effective_maker=Decimal("0"),
+            effective_taker=Decimal("0"),
+            checked_at_ms=now_ms(),
+        )
+    )
+
+    status = risk.evaluate(state)
+
+    assert status.ok is True
+    assert status.allow_bid is False
+    assert status.allow_ask is True
+
+
 def test_risk_does_not_enter_reduce_only_from_account_inventory_when_bot_is_flat():
     risk = RiskManager(RiskConfig(), TradingConfig(), mode="shadow")
     state = make_state()

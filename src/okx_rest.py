@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .config import ExchangeConfig
+from .exchange_errors import ExchangeAPIError
 from .models import Balance, BookLevel, BookSnapshot, InstrumentMeta
 from .okx_auth import OKXSigner
 from .utils import dumps_json, now_ms, parse_decimal, rest_timestamp
@@ -16,36 +17,7 @@ from .utils import dumps_json, now_ms, parse_decimal, rest_timestamp
 logger = logging.getLogger(__name__)
 
 
-class OKXAPIError(RuntimeError):
-    def __init__(
-        self,
-        *,
-        path: str,
-        code: str = "",
-        msg: str = "",
-        status_code: int | None = None,
-        data: list[dict[str, Any]] | None = None,
-    ):
-        self.path = path
-        self.code = str(code or "")
-        self.msg = str(msg or "")
-        self.status_code = status_code
-        self.data = data or []
-        super().__init__(self._build_message())
-
-    def _build_message(self) -> str:
-        parts = [self.path]
-        if self.status_code is not None:
-            parts.append(f"http_status={self.status_code}")
-        if self.code:
-            parts.append(f"code={self.code}")
-        if self.msg:
-            parts.append(f"msg={self.msg}")
-        item_details = self._format_item_details()
-        if item_details:
-            parts.append(f"details=[{item_details}]")
-        return ": ".join(parts[:1]) + (" " + " ".join(parts[1:]) if len(parts) > 1 else "")
-
+class OKXAPIError(ExchangeAPIError):
     def _format_item_details(self) -> str:
         parts: list[str] = []
         for item in self.data[:3]:
@@ -63,15 +35,6 @@ class OKXAPIError(RuntimeError):
             if detail:
                 parts.append(", ".join(detail))
         return " | ".join(parts)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "path": self.path,
-            "http_status": self.status_code,
-            "code": self.code,
-            "msg": self.msg,
-            "data": self.data,
-        }
 
     @classmethod
     def from_payload(
@@ -193,6 +156,25 @@ class OKXRestClient:
             bids=[BookLevel(price=parse_decimal(level[0]), size=parse_decimal(level[1]), order_count=int(level[3])) for level in book["bids"]],
             asks=[BookLevel(price=parse_decimal(level[0]), size=parse_decimal(level[1]), order_count=int(level[3])) for level in book["asks"]],
         )
+
+    async def fetch_ticker(self, inst_id: str) -> dict[str, Any]:
+        data = await self._request(
+            "GET",
+            "/api/v5/market/ticker",
+            params={"instId": inst_id},
+            private=False,
+        )
+        if not data:
+            raise OKXAPIError(path="/api/v5/market/ticker", msg=f"Ticker empty: {inst_id}")
+        item = data[0]
+        return {
+            "inst_id": str(item.get("instId") or inst_id),
+            "bid_px": parse_decimal(item.get("bidPx") or "0"),
+            "ask_px": parse_decimal(item.get("askPx") or "0"),
+            "vol24h": parse_decimal(item.get("vol24h") or "0"),
+            "vol_ccy24h": parse_decimal(item.get("volCcy24h") or "0"),
+            "ts_ms": int(item.get("ts") or now_ms()),
+        }
 
     async def fetch_balances(self, ccys: list[str]) -> dict[str, Balance]:
         data = await self._request(

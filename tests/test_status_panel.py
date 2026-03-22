@@ -204,6 +204,54 @@ def test_status_panel_shows_live_realized_and_unrealized_pnl():
     assert f"最近成交 | 方向=买 委托价=1 成交价=1 数量=10000 订单号={buy_id}" in text
 
 
+def test_status_panel_shows_market_gate_role():
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDG-USDT",
+            inst_type="SPOT",
+            base_ccy="USDG",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=10,
+            received_ms=10,
+            bids=[BookLevel(price=Decimal("1.0000"), size=Decimal("1000"))],
+            asks=[BookLevel(price=Decimal("1.0001"), size=Decimal("1000"))],
+        )
+    )
+    state.set_balances(
+        {
+            "USDG": Balance(ccy="USDG", total=Decimal("10000"), available=Decimal("10000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("10000"), available=Decimal("10000")),
+        }
+    )
+    state.runtime_state = "READY"
+    state.runtime_reason = "ok"
+
+    panel = TerminalStatusPanel(
+        config=TelemetryConfig(status_panel_enabled=True, status_panel_render_non_interactive=True),
+        mode="live",
+        live_allowed_instruments=("USDC-USDT", "USDG-USDT"),
+        observe_only_instruments=("DAI-USDT", "PYUSD-USDT"),
+    )
+    decision = QuoteDecision(reason="two_sided", bid=None, ask=None, inventory_ratio=Decimal("0.5"), spread_ticks=Decimal("1"))
+    risk = RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True)
+
+    text = panel.build_text(state=state, risk_status=risk, decision=decision)
+
+    assert "market_gate |" in text
+    assert "current=USDG-USDT" in text
+    assert "role=core" in text
+
+
 def test_status_panel_translates_strict_cycle_reasons():
     state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
     state.set_instrument(

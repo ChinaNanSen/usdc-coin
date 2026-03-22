@@ -95,6 +95,48 @@ def test_render_audit_summary_outputs_chinese_sections(tmp_path):
     assert "撤单主因: 改价或超时重挂 1" in text
 
 
+def test_render_audit_summary_shows_market_gate_snapshot(tmp_path):
+    db_path = tmp_path / "audit.db"
+    snapshot_path = tmp_path / "state_snapshot.json"
+
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "instrument": {"inst_id": "DAI-USDT", "base_ccy": "DAI", "quote_ccy": "USDT"},
+                "book": {
+                    "bids": [{"price": "1", "size": "1000"}],
+                    "asks": [{"price": "1.0001", "size": "1000"}],
+                },
+                "balances": {
+                    "DAI": {"total": "10000"},
+                    "USDT": {"total": "10000"},
+                },
+                "runtime_state": "STOPPED",
+                "runtime_reason": "observe-only instrument blocked in live mode: DAI-USDT",
+                "initial_nav_quote": "20000",
+                "observed_fill_count": 0,
+                "observed_fill_volume_quote": "0",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    config = BotConfig(mode="live")
+    config.exchange.simulated = True
+    config.trading.inst_id = "DAI-USDT"
+    config.trading.base_ccy = "DAI"
+    config.trading.quote_ccy = "USDT"
+    config.telemetry.sqlite_path = str(db_path)
+    config.telemetry.state_path = str(snapshot_path)
+
+    text = render_audit_summary(config)
+
+    assert "current_inst=DAI-USDT" in text
+    assert "market_gate=blocked" in text
+    assert "role=observe_only" in text
+
+
 def test_render_audit_summary_translates_strict_cycle_reasons(tmp_path):
     db_path = tmp_path / "audit.db"
     snapshot_path = tmp_path / "state_snapshot.json"

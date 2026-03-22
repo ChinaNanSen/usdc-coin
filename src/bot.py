@@ -6,11 +6,16 @@ import logging
 import traceback
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
 from .audit_store import SQLiteAuditStore
+from .binance_market_data import BinancePublicMarketStream
+from .binance_private_stream import BinancePrivateUserStream
+from .binance_rest import BinanceRestClient
 from .config import BotConfig
 from .consistency import StateConsistencyChecker
 from .executor import JournalWriter, OrderExecutor
+from .market_gate import evaluate_market_gate
 from .market_data import PublicBookStream
 from .models import FeeSnapshot
 from .okx_rest import OKXRestClient
@@ -30,6 +35,12 @@ class TrendBot6:
         self.config = config
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         self.state = BotState(managed_prefix=config.managed_prefix, state_path=config.telemetry.state_path)
+        self.state.configure_balance_budgets(
+            base_ccy=config.trading.base_ccy,
+            quote_ccy=config.trading.quote_ccy,
+            base_total=config.trading.budget_base_total,
+            quote_total=config.trading.budget_quote_total,
+        )
         restored_state = self.state.load_persisted_accounting()
         self.audit_store = SQLiteAuditStore(
             config.telemetry.sqlite_path,
@@ -44,7 +55,7 @@ class TrendBot6:
         )
         if restored_state:
             self.journal.append("state_restored", restored_state)
-        self.rest = OKXRestClient(config.exchange)
+        self.rest = self._build_rest_client(config)
         self.risk = RiskManager(config.risk, config.trading, mode=config.mode)
         self.strategy = MicroMakerStrategy(
             config.strategy,
@@ -72,6 +83,8 @@ class TrendBot6:
             config=config.telemetry,
             mode=config.mode,
             simulated=config.exchange.simulated,
+            live_allowed_instruments=tuple(config.risk.live_allowed_instruments),
+            observe_only_instruments=tuple(config.risk.observe_only_instruments),
         )
         self.public_stream: PublicBookStream | None = None
         self.private_stream: PrivateUserStream | None = None
@@ -83,6 +96,8 @@ class TrendBot6:
         self._book_requote_task: asyncio.Task | None = None
         self._last_book_requote_signal_ms = 0
         self._last_book_requote_reason = "book_top_price_changed"
+        self.stop_request_path = Path(config.telemetry.stop_request_path)
+        self._clear_stale_stop_request()
 
     async def run(self) -> None:
         logger.info("Trend Bot 6 starting in [%s] mode", self.config.mode)
@@ -90,6 +105,8 @@ class TrendBot6:
         try:
             while self.state.runtime_state != "STOPPED":
                 try:
+                    if self._check_stop_request():
+                        continue
                     await self._tick()
                 except Exception as exc:
                     logger.exception("Tick failed: %s", exc)
@@ -115,7 +132,12 @@ class TrendBot6:
 
     async def shutdown(self) -> None:
         await self._stop_book_requote_worker()
-        self.state.set_runtime_state("STOPPED", "shutdown")
+        shutdown_reason = (
+            self.state.runtime_reason
+            if self.state.runtime_state == "STOPPED" and self.state.runtime_reason and self.state.runtime_reason != "booting"
+            else "shutdown"
+        )
+        self.state.set_runtime_state("STOPPED", shutdown_reason)
         logger.info("Shutting down Trend Bot 6")
         if self.config.mode == "live" and self.config.risk.cancel_managed_orders_on_shutdown:
             try:
@@ -129,6 +151,7 @@ class TrendBot6:
         self.state.persist()
         self.audit_store.close()
         await self.rest.close()
+        self._clear_stop_request_file()
 
     async def _bootstrap(self) -> None:
         self.state.set_runtime_state("INIT", "bootstrap")
@@ -137,6 +160,8 @@ class TrendBot6:
 
         await self.rest.sync_time_offset()
         await self._refresh_instrument(force=True)
+        if not self._check_live_market_gate():
+            return
 
         book = await self.rest.fetch_order_book(self.config.trading.inst_id, self.config.trading.bootstrap_depth)
         self.state.set_book(book)
@@ -146,6 +171,8 @@ class TrendBot6:
         if self.config.mode == "live":
             balances = await self.rest.fetch_balances([self.config.trading.base_ccy, self.config.trading.quote_ccy])
             self.state.set_balances(balances)
+            if not self._check_live_budget_gate():
+                return
             await self._refresh_fee(force=True)
             await self.executor.bootstrap_pending_orders()
             if not await self._run_consistency_check(context="bootstrap", stop_on_failure=True):
@@ -159,7 +186,51 @@ class TrendBot6:
             )
             self.state.set_runtime_state("READY", "shadow bootstrap complete")
 
-        self.public_stream = PublicBookStream(
+        self.public_stream = self._build_public_stream()
+        await self.public_stream.start()
+
+        if self.config.mode == "live":
+            self.private_stream = self._build_private_stream()
+            trade_client_name = "private_ws"
+            if self._prefer_rest_trade_routing():
+                trade_client_name = "rest"
+            if self.config.exchange.simulated:
+                self.journal.append(
+                    "simulated_trade_routing",
+                    {
+                        "trade_client": trade_client_name,
+                        "reason": (
+                            "configured simulated instrument uses rest trading fallback"
+                            if trade_client_name == "rest"
+                            else "simulated instrument allows private ws trading"
+                        ),
+                        "inst_id": self.config.trading.inst_id,
+                    },
+                )
+            if trade_client_name == "private_ws":
+                self.executor.attach_trade_client(self.private_stream)
+            await self.private_stream.start()
+
+    @staticmethod
+    def _build_rest_client(config: BotConfig):
+        if config.exchange.name == "binance":
+            return BinanceRestClient(config.exchange)
+        return OKXRestClient(config.exchange)
+
+    def _build_public_stream(self):
+        if self.config.exchange.name == "binance":
+            return BinancePublicMarketStream(
+                url=self.config.exchange.public_ws_url,
+                inst_id=self.config.trading.inst_id,
+                on_book=self._on_book,
+                on_trade=self._on_trade,
+                on_reconnect=self._on_reconnect,
+                on_status=self._on_stream_status,
+                on_error=self._on_stream_error,
+                on_activity=self._on_stream_activity,
+                subscribe_trades=True,
+            )
+        return PublicBookStream(
             url=self.config.exchange.public_ws_url,
             inst_id=self.config.trading.inst_id,
             on_book=self._on_book,
@@ -170,22 +241,30 @@ class TrendBot6:
             on_activity=self._on_stream_activity,
             subscribe_trades=True,
         )
-        await self.public_stream.start()
 
-        if self.config.mode == "live":
-            self.private_stream = PrivateUserStream(
+    def _build_private_stream(self):
+        if self.config.exchange.name == "binance":
+            return BinancePrivateUserStream(
                 url=self.config.exchange.private_ws_url,
-                signer=self.rest.signer,
-                time_offset_ms=self.rest.time_offset_ms,
-                inst_type=self.config.trading.inst_type,
+                rest=self.rest,
+                inst_id=self.config.trading.inst_id,
                 on_order=self._on_order,
                 on_account=self._on_account,
                 on_reconnect=self._on_reconnect,
                 on_status=self._on_stream_status,
                 on_error=self._on_stream_error,
             )
-            self.executor.attach_trade_client(self.private_stream)
-            await self.private_stream.start()
+        return PrivateUserStream(
+            url=self.config.exchange.private_ws_url,
+            signer=self.rest.signer,
+            time_offset_ms=self.rest.time_offset_ms,
+            inst_type=self.config.trading.inst_type,
+            on_order=self._on_order,
+            on_account=self._on_account,
+            on_reconnect=self._on_reconnect,
+            on_status=self._on_stream_status,
+            on_error=self._on_stream_error,
+        )
 
     async def _tick(self) -> None:
         await self._run_quote_cycle(trigger="loop", include_maintenance=True)
@@ -246,22 +325,102 @@ class TrendBot6:
         if not force and loop_ms - self.state.last_fee_check_ms < int(self.config.risk.fee_poll_interval_seconds * 1000):
             return
         fee_data = await self.rest.fetch_trade_fee(self.config.trading.inst_type, self.config.trading.inst_id)
-        zero_fee_override = self.config.trading.inst_id in self.config.risk.zero_fee_instruments
-        effective_maker = Decimal("0") if zero_fee_override else fee_data["maker"]
-        effective_taker = Decimal("0") if zero_fee_override else fee_data["taker"]
         snapshot = FeeSnapshot(
             inst_type=self.config.trading.inst_type,
             inst_id=self.config.trading.inst_id,
             maker=fee_data["maker"],
             taker=fee_data["taker"],
-            effective_maker=effective_maker,
-            effective_taker=effective_taker,
+            effective_maker=fee_data["maker"],
+            effective_taker=fee_data["taker"],
             checked_at_ms=loop_ms,
             fee_type=fee_data.get("feeType", ""),
-            zero_fee_override=zero_fee_override,
+            zero_fee_override=False,
         )
         self.state.set_fee_snapshot(snapshot)
         self.journal.append("fee_snapshot", {"snapshot": snapshot})
+
+    def _check_live_market_gate(self) -> bool:
+        if self.config.mode != "live":
+            return True
+        market_gate = evaluate_market_gate(
+            inst_id=self.config.trading.inst_id,
+            live_allowed_instruments=self.config.risk.live_allowed_instruments,
+            observe_only_instruments=self.config.risk.observe_only_instruments,
+        )
+        if market_gate.live_allowed:
+            return True
+
+        logger.warning("Startup market gate blocked live run for %s: %s", market_gate.inst_id, market_gate.reason)
+        self.journal.append(
+            "startup_market_gate_blocked",
+            {
+                "inst_id": market_gate.inst_id,
+                "reason": market_gate.reason,
+                "live_allowed_instruments": list(market_gate.live_allowed_instruments),
+                "observe_only_instruments": list(market_gate.observe_only_instruments),
+            },
+        )
+        self.state.set_runtime_state("STOPPED", market_gate.reason)
+        return False
+
+    def _check_live_budget_gate(self) -> bool:
+        if self.config.mode != "live":
+            return True
+        errors = self.state.validate_configured_budgets(
+            ccys=(self.config.trading.base_ccy, self.config.trading.quote_ccy),
+        )
+        if not errors:
+            return True
+
+        reason = f"instance budget exceeds account balance: {'; '.join(errors)}"
+        logger.warning("Startup budget gate blocked live run for %s: %s", self.config.trading.inst_id, reason)
+        self.journal.append(
+            "startup_budget_gate_blocked",
+            {
+                "inst_id": self.config.trading.inst_id,
+                "reason": reason,
+                "budget_base_total": self.config.trading.budget_base_total,
+                "budget_quote_total": self.config.trading.budget_quote_total,
+                "exchange_base_total": self.state.exchange_total_balance(self.config.trading.base_ccy),
+                "exchange_quote_total": self.state.exchange_total_balance(self.config.trading.quote_ccy),
+            },
+        )
+        self.state.set_runtime_state("STOPPED", reason)
+        return False
+
+    def _prefer_rest_trade_routing(self) -> bool:
+        if self.config.exchange.name == "binance":
+            return True
+        return self.config.exchange.simulated and self.config.trading.inst_id in self.config.risk.simulated_rest_trade_instruments
+
+    def _check_stop_request(self) -> bool:
+        if not self.stop_request_path.exists():
+            return False
+        self.journal.append(
+            "stop_requested",
+            {
+                "inst_id": self.config.trading.inst_id,
+                "path": str(self.stop_request_path),
+            },
+        )
+        self.state.set_runtime_state("STOPPED", f"stop requested: {self.stop_request_path.name}")
+        return True
+
+    def _clear_stale_stop_request(self) -> None:
+        if not self.stop_request_path.exists():
+            return
+        try:
+            self.stop_request_path.unlink()
+        except OSError:
+            logger.warning("Failed to clear stale stop request file: %s", self.stop_request_path)
+
+    def _clear_stop_request_file(self) -> None:
+        if not self.stop_request_path.exists():
+            return
+        try:
+            self.stop_request_path.unlink()
+        except OSError:
+            logger.warning("Failed to remove stop request file during shutdown: %s", self.stop_request_path)
 
     async def _maybe_resync(self) -> None:
         if self.config.mode != "live" or not self.state.resync_required:
@@ -379,6 +538,17 @@ class TrendBot6:
 
     async def _on_order(self, payload: dict) -> None:
         normalized = dict(payload)
+        inst_id = str(normalized.get("instId") or "")
+        if inst_id and inst_id != self.config.trading.inst_id:
+            self.journal.append(
+                "order_update_ignored_foreign_inst",
+                {
+                    "inst_id": inst_id,
+                    "expected_inst_id": self.config.trading.inst_id,
+                    "cl_ord_id": normalized.get("clOrdId") or normalized.get("ordId") or "",
+                },
+            )
+            return
         for key in ("cTime", "uTime", "fillTime"):
             value = normalized.get(key)
             if value not in (None, "", "0"):

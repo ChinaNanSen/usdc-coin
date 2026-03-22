@@ -3,6 +3,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from decimal import Decimal
+
 from src.config import load_config
 
 
@@ -142,6 +144,39 @@ exchange:
     assert config.exchange.passphrase == "secret_pass_from_file"
 
 
+def test_load_config_reads_binance_secrets_from_secret_binance_yaml(tmp_path):
+    project_root = tmp_path / "trend_bot_6"
+    config_dir = project_root / "config"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "config.yaml"
+    secret_path = config_dir / "secret.binance.yaml"
+    config_path.write_text(
+        """
+mode: live
+exchange:
+  name: binance
+  binance_env: testnet
+  api_key: ""
+  secret_key: ""
+""".strip(),
+        encoding="utf-8",
+    )
+    secret_path.write_text(
+        """
+exchange:
+  api_key: binance_key_from_file
+  secret_key: binance_secret_from_file
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.exchange.name == "binance"
+    assert config.exchange.api_key == "binance_key_from_file"
+    assert config.exchange.secret_key == "binance_secret_from_file"
+
+
 def test_load_config_falls_back_to_environment_when_secret_file_missing(tmp_path, monkeypatch):
     project_root = tmp_path / "trend_bot_6"
     config_dir = project_root / "config"
@@ -167,3 +202,70 @@ exchange:
     assert config.exchange.api_key == "env_key"
     assert config.exchange.secret_key == "env_secret"
     assert config.exchange.passphrase == "env_pass"
+
+
+def test_load_config_reads_instance_budget_fields(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+mode: live
+exchange:
+  simulated: true
+  api_key: demo_key
+  secret_key: demo_secret
+  passphrase: demo_pass
+trading:
+  budget_base_total: 12000
+  budget_quote_total: 8000
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.trading.budget_base_total == Decimal("12000")
+    assert config.trading.budget_quote_total == Decimal("8000")
+
+
+def test_binance_testnet_runtime_defaults_override_urls(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+mode: live
+exchange:
+  name: binance
+  binance_env: testnet
+  api_key: demo_key
+  secret_key: demo_secret
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.exchange.name == "binance"
+    assert config.exchange.rest_url == "https://testnet.binance.vision"
+    assert config.exchange.public_ws_url == "wss://stream.testnet.binance.vision/ws"
+    assert config.exchange.private_ws_url == "wss://ws-api.testnet.binance.vision/ws-api/v3"
+
+
+def test_binance_mainnet_runtime_defaults_override_urls(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+mode: live
+exchange:
+  name: binance
+  binance_env: mainnet
+  api_key: demo_key
+  secret_key: demo_secret
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.exchange.name == "binance"
+    assert config.exchange.rest_url == "https://api.binance.com"
+    assert config.exchange.public_ws_url == "wss://stream.binance.com:9443/ws"
+    assert config.exchange.private_ws_url == "wss://ws-api.binance.com:443/ws-api/v3"
