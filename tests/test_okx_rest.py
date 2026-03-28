@@ -1953,6 +1953,78 @@ def test_executor_binance_replacement_uses_remaining_size_after_partial_fill():
     assert state.pending_amend(sell_id) is None
 
 
+def test_executor_passes_inst_id_code_for_okx_live_private_ws_orders():
+    state = make_state()
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USDC-USDT",
+            inst_type="SPOT",
+            base_ccy="USDC",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+            inst_id_code="648",
+        )
+    )
+    config = BotConfig(mode="live")
+    config.exchange.simulated = False
+    journal = StubJournal()
+    rest = TrackingRest()
+    ws_client = WSTradeClient()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    executor.attach_trade_client(ws_client)
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            (
+                OrderIntent(
+                    side="buy",
+                    price=Decimal("0.9999"),
+                    quote_notional=Decimal("9999"),
+                    base_size=Decimal("10000"),
+                    reason="join_best_bid",
+                ),
+            ),
+        )
+
+    asyncio.run(run())
+
+    assert len(ws_client.place_calls) == 1
+    assert ws_client.place_calls[0]["inst_id_code"] == "648"
+
+
+def test_executor_does_not_pass_inst_id_code_for_binance_orders():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.exchange = ExchangeConfig(name="binance")
+    journal = StubJournal()
+    rest = CapturingPlaceRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            (
+                OrderIntent(
+                    side="buy",
+                    price=Decimal("0.9999"),
+                    quote_notional=Decimal("9999"),
+                    base_size=Decimal("10000"),
+                    reason="join_best_bid",
+                ),
+            ),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.place_calls) == 1
+    assert rest.place_calls[0]["inst_id_code"] is None
+
+
 def test_executor_skips_same_price_amend_when_remaining_change_is_small():
     state = make_state()
     config = BotConfig(mode="live")

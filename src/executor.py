@@ -549,7 +549,7 @@ class OrderExecutor:
         return self.rest
 
     def _trade_inst_id_code(self) -> str | None:
-        if not self.config.exchange.simulated or not self.state.instrument:
+        if self.config.exchange.name != "okx" or not self.state.instrument:
             return None
         inst_id_code = str(self.state.instrument.inst_id_code or "")
         return inst_id_code or None
