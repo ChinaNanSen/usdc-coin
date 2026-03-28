@@ -9,7 +9,7 @@ exchange:
   secret_key: ""
   passphrase: ""
   simulated: true
-  request_timeout_seconds: 10
+  request_timeout_seconds: 15
   user_agent: trend_bot_6/0.1
 
 trading:
@@ -19,13 +19,13 @@ trading:
   quote_ccy: USDT
   budget_base_total: 12000
   budget_quote_total: 12000
-  entry_base_size: 3000
+  entry_base_size: 2000
   post_only: true
-  quote_size: 3000
+  quote_size: 2000
   min_quote_size: 1000
-  max_quote_size: 3000
+  max_quote_size: 2000
   loop_interval_seconds: 1.0
-  balance_poll_interval_seconds: 10.0
+  balance_poll_interval_seconds: 20.0
   order_ttl_seconds: 6.0
   cancel_on_ttl_expiry: false
   action_cooldown_seconds: 0.2
@@ -41,8 +41,8 @@ strategy:
   min_spread_ticks: 1
   strict_alternating_sides: false
   inventory_target_pct: 0.50
-  inventory_soft_lower_pct: 0.45
-  inventory_soft_upper_pct: 0.55
+  inventory_soft_lower_pct: 0.42
+  inventory_soft_upper_pct: 0.58
   mild_skew_threshold_pct: 0.02
   mild_skew_size_factor: 0.70
   visible_depth_levels: 5
@@ -54,6 +54,7 @@ strategy:
   rebalance_release_depth_levels: 1
   rebalance_release_depth_fraction: 0.10
   rebalance_release_depth_step_bonus: 0.05
+  secondary_layers_enabled: false
   rebalance_secondary_size_factor: 0.25
   secondary_min_positive_edge_ticks: 1
   secondary_full_size_edge_ticks: 2
@@ -61,6 +62,17 @@ strategy:
   secondary_entry_layer_min_edge_ticks: 4
   rebalance_overlay_preserve_tolerance_ticks: 1
   rebalance_secondary_price_offset_ticks: 0
+  rebalance_profit_density_enabled: true
+  rebalance_profit_density_window_minutes: 60
+  rebalance_profit_density_soft_per10k: 0.08
+  rebalance_profit_density_hard_per10k: 0.03
+  rebalance_profit_density_soft_size_factor: 0.90
+  rebalance_profit_density_hard_size_factor: 0.70
+  rebalance_profit_density_soft_extra_ticks: 1
+  rebalance_profit_density_hard_extra_ticks: 2
+  sell_drought_guard_enabled: true
+  sell_drought_inventory_ratio_pct: 0.58
+  sell_drought_rebalance_window_seconds: 900
   toxic_flow_min_observation_ms: 300
   toxic_flow_max_observation_ms: 1000
   toxic_flow_adverse_ticks: 1
@@ -79,7 +91,7 @@ strategy:
   toxicity_severe_extra_edge_ticks: 1
   toxicity_disable_second_entry_layer: true
   favorable_size_spread_ticks: 2
-  favorable_size_multiplier: 1.5
+  favorable_size_multiplier: 2.0
   normal_buy_price_cap: 0
   normal_sell_price_floor: 0
   preserve_entry_queue: true
@@ -97,8 +109,8 @@ risk:
   cancel_managed_orders_on_shutdown: true
   cancel_managed_orders_on_public_reconnect: false
   allow_emergency_ioc: false
-  hard_inventory_lower_pct: 0.30
-  hard_inventory_upper_pct: 0.70
+  hard_inventory_lower_pct: 0.38
+  hard_inventory_upper_pct: 0.62
   pause_after_reconnect_seconds: 2
   max_mid_deviation_bps: 20
   peg_reference_price: 1

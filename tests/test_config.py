@@ -85,6 +85,42 @@ telemetry:
     assert Path(config.telemetry.state_path) == data_dir / "state_snapshot.live.json"
 
 
+def test_live_paths_prefer_workspace_root_over_nested_cwd_and_apply_live_suffix_to_shared_state_paths(tmp_path, monkeypatch):
+    project_root = tmp_path / "trend_bot_6"
+    config_dir = project_root / "config"
+    data_dir = project_root / "data" / "binance_usd1usdt"
+    nested_dir = project_root / "trend_bot_6" / "data" / "binance_usd1usdt"
+    config_dir.mkdir(parents=True)
+    data_dir.mkdir(parents=True)
+    nested_dir.mkdir(parents=True)
+    (nested_dir / "state_snapshot.json").write_text("{}", encoding="utf-8")
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        """
+mode: live
+exchange:
+  name: binance
+  simulated: false
+  api_key: live_key
+  secret_key: live_secret
+telemetry:
+  journal_path: trend_bot_6/data/journal.jsonl
+strategy:
+  release_only_shared_state_paths:
+    - trend_bot_6/data/binance_usd1usdt/state_snapshot.json
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(project_root)
+    config = load_config(config_path)
+
+    assert Path(config.telemetry.journal_path) == project_root / "data" / "journal.live.jsonl"
+    assert config.strategy.release_only_shared_state_paths == [
+        str(project_root / "data" / "binance_usd1usdt" / "state_snapshot.live.json")
+    ]
+
+
 def test_explicit_environment_suffix_is_preserved(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -225,6 +261,50 @@ trading:
 
     assert config.trading.budget_base_total == Decimal("12000")
     assert config.trading.budget_quote_total == Decimal("8000")
+
+
+def test_load_config_reads_sell_drought_guard_fields(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+mode: live
+exchange:
+  simulated: true
+  api_key: demo_key
+  secret_key: demo_secret
+  passphrase: demo_pass
+strategy:
+  sell_drought_guard_enabled: true
+  sell_drought_inventory_ratio_pct: 0.58
+  sell_drought_rebalance_window_seconds: 900
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.strategy.sell_drought_guard_enabled is True
+    assert config.strategy.sell_drought_inventory_ratio_pct == Decimal("0.58")
+    assert config.strategy.sell_drought_rebalance_window_seconds == 900
+
+
+def test_load_config_reads_top_level_managed_prefix(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+mode: live
+managed_prefix: binusdc
+exchange:
+  name: binance
+  api_key: demo_key
+  secret_key: demo_secret
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.managed_prefix == "binusdc"
 
 
 def test_binance_testnet_runtime_defaults_override_urls(tmp_path):

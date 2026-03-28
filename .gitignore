@@ -1,6 +1,7 @@
 # 敏感配置
 config/secret.yaml
-
+config/secret.binance.yaml
+logs
 # Python 缓存
 __pycache__/
 *.pyc

@@ -23,13 +23,27 @@ def render_audit_summary(config: BotConfig, *, run_id: str | None = None) -> str
     if latest_run:
         if lines:
             lines.append("")
-        lines.extend(_render_run_section(config.telemetry.sqlite_path, latest_run, title="最新运行"))
+        lines.extend(
+            _render_run_section(
+                config.telemetry.sqlite_path,
+                latest_run,
+                title="最新运行",
+                default_base_ccy=config.trading.base_ccy,
+            )
+        )
 
     filled_run = _latest_run_with_fills(config.telemetry.sqlite_path, exclude_run_id=latest_run)
     if filled_run:
         if lines:
             lines.append("")
-        lines.extend(_render_run_section(config.telemetry.sqlite_path, filled_run, title="最近一次有成交的运行"))
+        lines.extend(
+            _render_run_section(
+                config.telemetry.sqlite_path,
+                filled_run,
+                title="最近一次有成交的运行",
+                default_base_ccy=config.trading.base_ccy,
+            )
+        )
 
     if not lines:
         return "未找到快照或审计数据。"
@@ -75,6 +89,9 @@ def _render_snapshot_section(config: BotConfig) -> list[str]:
     live_realized = _optional_decimal(payload.get("live_realized_pnl_quote"))
     live_unrealized = _optional_decimal(payload.get("live_unrealized_pnl_quote"))
     strategy_position_base = _optional_decimal(payload.get("strategy_position_base"))
+    initial_external_base_inventory = _optional_decimal(payload.get("initial_external_base_inventory"))
+    external_base_inventory_remaining = _optional_decimal(payload.get("external_base_inventory_remaining"))
+    triangle_exit_route_choice = payload.get("triangle_exit_route_choice") or {}
 
     mode_text = "OKX模拟盘" if config.mode == "live" and config.exchange.simulated else ("实盘" if config.mode == "live" else "影子模拟")
     lines = [
@@ -88,14 +105,40 @@ def _render_snapshot_section(config: BotConfig) -> list[str]:
         f"- 已观测成交次数={payload.get('observed_fill_count', 0)} | 已观测成交额(U)={_fmt(_optional_decimal(payload.get('observed_fill_volume_quote')))}",
     ]
     lines.insert(3, f"- market_gate={'allowed' if market_gate.live_allowed else 'blocked'} | current_inst={current_inst_id} | role={market_gate.role}")
+    if config.strategy.release_only_mode:
+        release_buffer = Decimal(str(config.strategy.release_only_base_buffer))
+        released = None
+        if initial_external_base_inventory is not None and external_base_inventory_remaining is not None:
+            released = max(initial_external_base_inventory - external_base_inventory_remaining, Decimal("0"))
+        releasable = Decimal("0")
+        if external_base_inventory_remaining is not None:
+            releasable = max(min(external_base_inventory_remaining, base_total) - max(release_buffer, Decimal("0")), Decimal("0"))
+        lines.append(
+            "- 释放模式: "
+            f"初始外部库存={_fmt(initial_external_base_inventory)} "
+            f"当前剩余={_fmt(external_base_inventory_remaining)} "
+            f"已释放={_fmt(released)} "
+            f"保留量={_fmt(release_buffer)} "
+            f"当前可释放={_fmt(releasable)}"
+        )
     if live_realized is not None or live_unrealized is not None or strategy_position_base is not None:
         lines.append(
             f"- 已实现(U)={_fmt_signed(live_realized)} | 库存浮盈(U)={_fmt_signed(live_unrealized)} | 待回补仓位({base_ccy})={_fmt_signed(strategy_position_base)}"
         )
+    if isinstance(triangle_exit_route_choice, dict) and triangle_exit_route_choice:
+        lines.append(
+            "- 路由建议: "
+            f"主路={triangle_exit_route_choice.get('primary_route') or '-'} "
+            f"备路={triangle_exit_route_choice.get('backup_route') or '-'} "
+            f"方向={triangle_exit_route_choice.get('direction') or '-'} "
+            f"主参考价={_fmt(_optional_decimal(triangle_exit_route_choice.get('primary_reference_price')))} "
+            f"备参考价={_fmt(_optional_decimal(triangle_exit_route_choice.get('backup_reference_price')))} "
+            f"改善bp={_fmt(_optional_decimal(triangle_exit_route_choice.get('improvement_bp')))}"
+        )
     return lines
 
 
-def _render_run_section(sqlite_path: str, run_id: str, *, title: str) -> list[str]:
+def _render_run_section(sqlite_path: str, run_id: str, *, title: str, default_base_ccy: str | None = None) -> list[str]:
     events = _load_run_events(sqlite_path, run_id)
     if not events:
         return [title, f"- run_id={run_id}", "- 未找到事件"]
@@ -104,6 +147,9 @@ def _render_run_section(sqlite_path: str, run_id: str, *, title: str) -> list[st
     cancel_reasons: Counter[str] = Counter()
     decision_reasons: Counter[str] = Counter()
     fills_by_order: dict[str, dict[str, Any]] = {}
+    release_fill_count = 0
+    release_fill_base = Decimal("0")
+    release_fill_quote = Decimal("0")
 
     for _, event, payload in events:
         if event == "cancel_order":
@@ -131,6 +177,8 @@ def _render_run_section(sqlite_path: str, run_id: str, *, title: str) -> list[st
             "price": _optional_decimal(order.get("price")) or Decimal("0"),
             "filled_size": filled_size,
             "state": str(order.get("state") or "-"),
+            "reason": str(payload.get("reason") or ""),
+            "reason_bucket": str(payload.get("reason_bucket") or ""),
         }
 
     buy_count = 0
@@ -149,6 +197,10 @@ def _render_run_section(sqlite_path: str, run_id: str, *, title: str) -> list[st
             sell_count += 1
             sell_notional += notional
             sell_size += fill["filled_size"]
+        if fill.get("reason_bucket") == "release" or str(fill.get("reason") or "").startswith("release"):
+            release_fill_count += 1
+            release_fill_base += fill["filled_size"]
+            release_fill_quote += notional
 
     start_ms = events[0][0]
     end_ms = events[-1][0]
@@ -174,6 +226,9 @@ def _render_run_section(sqlite_path: str, run_id: str, *, title: str) -> list[st
             f"往返价差毛收益估算(U)={_fmt_signed(roundtrip_pnl)}"
         ),
     ]
+    if release_fill_count > 0:
+        order_ccy = _infer_run_base_ccy(events) or default_base_ccy or "BASE"
+        lines.append(f"- 释放成交={release_fill_count}笔/{_fmt(release_fill_base)}{order_ccy}/{_fmt(release_fill_quote)}U")
     if roundtrip_pnl is None and (buy_count or sell_count):
         lines.append("- 说明: 当前只有单边成交，或买卖数量未配平，暂不把成交额差额当成利润")
     if cancel_reasons:
@@ -183,6 +238,17 @@ def _render_run_section(sqlite_path: str, run_id: str, *, title: str) -> list[st
         translated = "，".join(f"{_translate_reason(reason)} {count}" for reason, count in decision_reasons.most_common(3))
         lines.append(f"- 决策主因: {translated}")
     return lines
+
+
+def _infer_run_base_ccy(events: list[tuple[int, str, dict[str, Any]]]) -> str | None:
+    for _, event, payload in events:
+        if event != "order_update":
+            continue
+        order = payload.get("order") or {}
+        inst_id = str(order.get("inst_id") or order.get("instId") or "")
+        if "-" in inst_id:
+            return inst_id.split("-", 1)[0]
+    return None
 
 
 def _load_run_events(sqlite_path: str, run_id: str) -> list[tuple[int, str, dict[str, Any]]]:

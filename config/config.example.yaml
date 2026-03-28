@@ -42,6 +42,20 @@ strategy:
   inventory_target_pct: 0.50
   inventory_soft_lower_pct: 0.40
   inventory_soft_upper_pct: 0.60
+  release_only_shared_state_paths: []
+  release_only_shared_inventory_min_base: 100
+  release_only_shared_inventory_min_improvement_bp: 0.20
+  triangle_routing_enabled: false
+  triangle_route_refresh_interval_seconds: 5
+  triangle_snapshot_stale_ms: 15000
+  triangle_strict_dual_exit_edge_bp: 0.15
+  triangle_best_exit_edge_bp: 0.75
+  triangle_max_worst_exit_loss_bp: 1.25
+  triangle_indirect_leg_penalty_bp: 0.20
+  triangle_prefer_indirect_min_improvement_bp: 0.10
+  triangle_indirect_handoff_enabled: false
+  triangle_direct_sell_floor_enabled: false
+  triangle_direct_buy_ceiling_enabled: false
   account_inventory_skew_enabled: false
   mild_skew_threshold_pct: 0.03
   mild_skew_size_factor: 0.50
@@ -57,6 +71,7 @@ strategy:
   rebalance_release_depth_levels: 1
   rebalance_release_depth_fraction: 0.10
   rebalance_release_depth_step_bonus: 0.05
+  secondary_layers_enabled: false
   rebalance_secondary_size_factor: 0.10
   rebalance_overlay_floor_factor: 0.10
   secondary_min_positive_edge_ticks: 1
@@ -129,6 +144,7 @@ risk:
   cancel_managed_on_consistency_failure: false
   balance_consistency_tolerance_quote: 1
   require_passive_prices_on_resync: true
+  startup_recovery_enabled: false
 shadow:
   subscribe_trades: true
   min_rest_seconds: 1.0

@@ -195,6 +195,15 @@ class FailingAmendRest(TrackingRest):
         )
 
 
+class BinanceReplacementRest(TrackingRest):
+    async def amend_order(self, **kwargs):
+        self.amend_calls.append(kwargs)
+        return {
+            "ordId": "b2",
+            "clOrdId": "bot6mbnewreplace1234",
+        }
+
+
 class AlreadyTerminalCancelRest:
     async def place_limit_order(self, **kwargs):
         return {}
@@ -1887,7 +1896,61 @@ def test_executor_amends_partially_filled_sell_using_total_order_size():
     assert state.live_orders[sell_id].size == Decimal("10000")
     assert state.live_orders[sell_id].remaining_size == Decimal("6400")
     assert state.pending_amend(sell_id)["target_price"] == Decimal("1.0001")
-    assert state.pending_amend(sell_id)["target_size"] == Decimal("8600")
+
+
+def test_executor_binance_replacement_uses_remaining_size_after_partial_fill():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.exchange = ExchangeConfig(name="binance")
+    config.risk.min_free_base_buffer = Decimal("0")
+    config.strategy.preserve_rebalance_queue = False
+    journal = StubJournal()
+    rest = BinanceReplacementRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0000",
+            "sz": "10000",
+            "accFillSz": "3600",
+            "state": "partially_filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "sell",
+            OrderIntent(
+                side="sell",
+                price=Decimal("1.0001"),
+                quote_notional=Decimal("5000.5"),
+                base_size=Decimal("5000"),
+                reason="rebalance_open_long",
+            ),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.amend_calls) == 1
+    assert rest.amend_calls[0]["new_size"] == Decimal("8600")
+    assert rest.amend_calls[0]["filled_size"] == Decimal("3600")
+    replaced = state.live_orders["bot6mbnewreplace1234"]
+    assert replaced.price == Decimal("1.0001")
+    assert replaced.size == Decimal("5000")
+    assert replaced.filled_size == Decimal("0")
+    pending = state.pending_amend("bot6mbnewreplace1234")
+    assert pending is not None
+    assert pending["target_price"] == Decimal("1.0001")
+    assert pending["target_size"] == Decimal("8600")
+    assert pending["target_exchange_size"] == Decimal("5000")
+    assert state.pending_amend(sell_id) is None
 
 
 def test_executor_skips_same_price_amend_when_remaining_change_is_small():
@@ -2008,6 +2071,53 @@ def test_executor_falls_back_to_cancel_when_amend_fails():
     assert len(rest.cancel_calls) == 1
     assert buy_id in state.live_orders
     assert state.live_orders[buy_id].cancel_requested is True
+    assert state.pending_amend(buy_id) is None
+
+
+def test_executor_switches_live_order_identity_when_binance_amend_returns_new_order():
+    state = make_state()
+    config = BotConfig(mode="live")
+    config.exchange = ExchangeConfig(name="binance")
+    config.risk.min_free_quote_buffer = Decimal("0")
+    config.strategy.preserve_entry_queue = False
+    journal = StubJournal()
+    rest = BinanceReplacementRest()
+    executor = OrderExecutor(rest=rest, state=state, config=config, journal=journal)
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "0.9998",
+            "sz": "10000",
+            "accFillSz": "0",
+            "state": "live",
+            "cTime": "1",
+            "uTime": "1",
+        },
+        source="test",
+    )
+
+    async def run():
+        await executor._reconcile_side(
+            "buy",
+            OrderIntent(side="buy", price=Decimal("0.9999"), quote_notional=Decimal("9999"), reason="join_best_bid"),
+        )
+
+    asyncio.run(run())
+
+    assert len(rest.amend_calls) == 1
+    assert rest.amend_calls[0]["side"] == "buy"
+    assert rest.amend_calls[0]["post_only"] is False
+    assert buy_id not in state.live_orders
+    assert "bot6mbnewreplace1234" in state.live_orders
+    replaced = state.live_orders["bot6mbnewreplace1234"]
+    assert replaced.ord_id == "b2"
+    assert replaced.price == Decimal("0.9999")
+    assert replaced.size == Decimal("10000")
+    assert state.pending_amend("bot6mbnewreplace1234") is not None
     assert state.pending_amend(buy_id) is None
 
 

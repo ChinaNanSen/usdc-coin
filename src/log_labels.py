@@ -15,6 +15,9 @@ REASON_LABELS = {
     "join_best_ask": "挂卖一排队",
     "rebalance_open_long": "按已成交仓位回补卖出",
     "rebalance_open_short": "按已成交仓位回补买入",
+    "release_external_long": "按外部库存释放卖出",
+    "release_external_sell_only": "释放模式：只挂卖单",
+    "release_only_idle": "释放模式待机",
     "strict_cycle_buy_only": "严格交替：本轮只挂买单",
     "strict_cycle_sell_only": "严格交替：本轮只挂卖单",
 }
@@ -48,8 +51,8 @@ def summarize_okx_error(payload: dict[str, Any] | None) -> str:
 
     parts: list[str] = []
     for item in data[:3]:
-        s_code = str(item.get("sCode") or "")
-        s_msg = str(item.get("sMsg") or "")
+        s_code = str(item.get("sCode") or item.get("code") or "")
+        s_msg = str(item.get("sMsg") or item.get("msg") or "")
         label = PLACE_ERROR_LABELS.get(s_code) or CANCEL_ERROR_LABELS.get(s_code) or s_msg or s_code
         if s_code:
             parts.append(f"{s_code} {label}".strip())

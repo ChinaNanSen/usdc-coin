@@ -52,6 +52,7 @@ strategy:
   rebalance_release_depth_levels: 1
   rebalance_release_depth_fraction: 0.10
   rebalance_release_depth_step_bonus: 0.05
+  secondary_layers_enabled: false
   rebalance_secondary_size_factor: 0.25
   secondary_min_positive_edge_ticks: 1
   secondary_full_size_edge_ticks: 2

@@ -232,14 +232,18 @@ class PrivateUserStream:
         self,
         *,
         inst_id: str,
+        side: Any | None = None,
         new_price: Any,
         new_size: Any,
+        filled_size: Any | None = None,
+        post_only: Any | None = None,
         ord_id: str | None = None,
         cl_ord_id: str | None = None,
         cxl_on_fail: bool = False,
         req_id: str | None = None,
         inst_id_code: str | None = None,
     ) -> dict[str, Any]:
+        del side, filled_size, post_only
         amend_req_id = req_id or build_req_id("okxws", "amnd")
         payload = {
             **self._trade_identifier_payload(inst_id=inst_id, inst_id_code=inst_id_code),

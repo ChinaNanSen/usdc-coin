@@ -138,8 +138,54 @@ class RiskManager:
         allow_bid = state.free_balance(self.trading.quote_ccy) > self.config.min_free_quote_buffer
         allow_ask = state.free_balance(self.trading.base_ccy) > self.config.min_free_base_buffer
 
+        if state.startup_recovery_side == "sell":
+            allow_bid = False
+            if allow_ask:
+                return RiskStatus(
+                    ok=True,
+                    reason="startup_recovery_sell_only",
+                    allow_bid=False,
+                    allow_ask=True,
+                    runtime_state="REDUCE_ONLY",
+                )
+        if state.startup_recovery_side == "buy":
+            allow_ask = False
+            if allow_bid:
+                return RiskStatus(
+                    ok=True,
+                    reason="startup_recovery_buy_only",
+                    allow_bid=True,
+                    allow_ask=False,
+                    runtime_state="REDUCE_ONLY",
+                )
+
         strategy_position = state.strategy_position_base()
         min_position_size = state.instrument.min_size if state.instrument else Decimal("0")
+        inventory_ratio = state.inventory_ratio()
+        if inventory_ratio is not None:
+            hard_upper = max(self.config.hard_inventory_upper_pct, Decimal("0"))
+            hard_lower = min(max(self.config.hard_inventory_lower_pct, Decimal("0")), Decimal("1"))
+            if strategy_position >= min_position_size and inventory_ratio >= hard_upper:
+                allow_bid = False
+                if allow_ask:
+                    return RiskStatus(
+                        ok=True,
+                        reason="reduce_only_inventory_high",
+                        allow_bid=False,
+                        allow_ask=True,
+                        runtime_state="REDUCE_ONLY",
+                    )
+            if strategy_position <= -min_position_size and inventory_ratio <= hard_lower:
+                allow_ask = False
+                if allow_bid:
+                    return RiskStatus(
+                        ok=True,
+                        reason="reduce_only_inventory_low",
+                        allow_bid=True,
+                        allow_ask=False,
+                        runtime_state="REDUCE_ONLY",
+                    )
+
         if strategy_position >= min_position_size and not allow_ask:
             return RiskStatus(
                 ok=False,

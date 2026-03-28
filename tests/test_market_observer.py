@@ -236,3 +236,18 @@ def test_collect_market_observations_uses_binance_rest_when_exchange_name_is_bin
     assert [observation.inst_id for observation in observations] == ["USDC-USDT", "DAI-USDT"]
     assert observations[0].fee_type == "standardCommission"
     assert "fee_fetch_failed:-1121" in observations[1].issues
+
+
+def test_collect_market_observations_defaults_to_binance_stable_pairs(monkeypatch):
+    monkeypatch.setattr("src.market_observer.BinanceRestClient", DummyBinanceObserverRest)
+    config = BotConfig(mode="live")
+    config.exchange.name = "binance"
+
+    observations = asyncio.run(
+        collect_market_observations(
+            config=config,
+            reference_quote_size=Decimal("5000"),
+        )
+    )
+
+    assert [observation.inst_id for observation in observations] == ["USDC-USDT", "USD1-USDT", "USD1-USDC"]

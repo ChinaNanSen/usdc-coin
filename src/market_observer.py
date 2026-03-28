@@ -11,8 +11,15 @@ from .models import BookSnapshot, InstrumentMeta
 from .okx_rest import OKXAPIError, OKXRestClient
 from .utils import decimal_to_str
 
-DEFAULT_OBSERVED_MARKETS: tuple[str, ...] = ("USDC-USDT", "USDG-USDT", "DAI-USDT", "PYUSD-USDT")
+DEFAULT_OKX_OBSERVED_MARKETS: tuple[str, ...] = ("USDC-USDT", "USDG-USDT", "DAI-USDT", "PYUSD-USDT")
+DEFAULT_BINANCE_OBSERVED_MARKETS: tuple[str, ...] = ("USDC-USDT", "USD1-USDT", "USD1-USDC")
 logger = logging.getLogger(__name__)
+
+
+def default_observed_markets(*, exchange_name: str) -> tuple[str, ...]:
+    if exchange_name == "binance":
+        return DEFAULT_BINANCE_OBSERVED_MARKETS
+    return DEFAULT_OKX_OBSERVED_MARKETS
 
 
 @dataclass(frozen=True)
@@ -161,7 +168,7 @@ async def collect_market_observations(
     reference_quote_size: Decimal | None = None,
     depth: int = 5,
 ) -> list[MarketObservation]:
-    observed_inst_ids = list(inst_ids or DEFAULT_OBSERVED_MARKETS)
+    observed_inst_ids = list(inst_ids or default_observed_markets(exchange_name=config.exchange.name))
     reference_size = reference_quote_size if reference_quote_size is not None else config.trading.quote_size
     rest = BinanceRestClient(config.exchange) if config.exchange.name == "binance" else OKXRestClient(config.exchange)
     try:

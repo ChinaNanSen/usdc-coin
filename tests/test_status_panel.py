@@ -300,3 +300,177 @@ def test_status_panel_translates_strict_cycle_reasons():
 
     assert "原因=严格交替：本轮只挂卖单" in text
     assert "决策 | 原因=严格交替：本轮只挂买单" in text
+
+
+def test_status_panel_shows_release_only_status():
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USD1-USDC",
+            inst_type="SPOT",
+            base_ccy="USD1",
+            quote_ccy="USDC",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.configure_release_tracking(enabled=True)
+    state.set_book(
+        BookSnapshot(
+            ts_ms=10,
+            received_ms=10,
+            bids=[BookLevel(price=Decimal("0.9994"), size=Decimal("1000"))],
+            asks=[BookLevel(price=Decimal("0.9995"), size=Decimal("1000"))],
+        )
+    )
+    state.set_balances(
+        {
+            "USD1": Balance(ccy="USD1", total=Decimal("1200"), available=Decimal("1200")),
+            "USDC": Balance(ccy="USDC", total=Decimal("800"), available=Decimal("800")),
+        }
+    )
+    state.external_base_inventory_remaining = Decimal("900")
+    state.runtime_state = "QUOTING"
+    state.runtime_reason = "release_external_sell_only"
+
+    panel = TerminalStatusPanel(
+        config=TelemetryConfig(status_panel_enabled=True, status_panel_render_non_interactive=True),
+        mode="live",
+        simulated=False,
+        release_only_mode=True,
+        release_only_base_buffer=Decimal("150"),
+    )
+    decision = QuoteDecision(
+        reason="release_external_sell_only",
+        ask=OrderIntent(
+            side="sell",
+            price=Decimal("0.9995"),
+            quote_notional=Decimal("499.75"),
+            reason="release_external_long",
+            base_size=Decimal("500"),
+        ),
+    )
+    risk = RiskStatus(ok=True, reason="ok", allow_bid=False, allow_ask=True)
+
+    text = panel.build_text(state=state, risk_status=risk, decision=decision)
+
+    assert "释放 |" in text
+    assert "模式=是" in text
+    assert "外部库存剩余=900" in text
+    assert "保留量=150" in text
+    assert "可释放=750" in text
+    assert "当前动作=释放中" in text
+
+
+def test_status_panel_shows_triangle_route_status():
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USD1-USDT",
+            inst_type="SPOT",
+            base_ccy="USD1",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=10,
+            received_ms=10,
+            bids=[BookLevel(price=Decimal("0.9995"), size=Decimal("1000"))],
+            asks=[BookLevel(price=Decimal("0.9996"), size=Decimal("1000"))],
+        )
+    )
+    state.set_balances(
+        {
+            "USD1": Balance(ccy="USD1", total=Decimal("1200"), available=Decimal("1200")),
+            "USDT": Balance(ccy="USDT", total=Decimal("900"), available=Decimal("900")),
+        }
+    )
+    state.set_triangle_exit_route_choice(
+        {
+            "primary_route": "direct_sell_usd1usdt",
+            "backup_route": "sell_usd1usdc_then_sell_usdcusdt",
+            "direction": "sell",
+            "primary_reference_price": Decimal("0.9996"),
+            "backup_reference_price": Decimal("0.99949986"),
+            "improvement_bp": Decimal("0.8"),
+        }
+    )
+
+    panel = TerminalStatusPanel(
+        config=TelemetryConfig(status_panel_enabled=True, status_panel_render_non_interactive=True),
+        mode="live",
+    )
+    decision = QuoteDecision(reason="fill_rebalance_sell_only", ask=None)
+    risk = RiskStatus(ok=True, reason="ok", allow_bid=False, allow_ask=True)
+
+    text = panel.build_text(state=state, risk_status=risk, decision=decision)
+
+    assert "路由 |" in text
+    assert "主路=direct_sell_usd1usdt" in text
+    assert "备路=sell_usd1usdc_then_sell_usdcusdt" in text
+    assert "方向=sell" in text
+    assert "主参考价=0.9996" in text
+
+
+def test_status_panel_shows_triangle_route_diagnostics_without_choice():
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id="USD1-USDT",
+            inst_type="SPOT",
+            base_ccy="USD1",
+            quote_ccy="USDT",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=10,
+            received_ms=10,
+            bids=[BookLevel(price=Decimal("0.9995"), size=Decimal("1000"))],
+            asks=[BookLevel(price=Decimal("0.9996"), size=Decimal("1000"))],
+        )
+    )
+    state.set_balances(
+        {
+            "USD1": Balance(ccy="USD1", total=Decimal("1200"), available=Decimal("1200")),
+            "USDT": Balance(ccy="USDT", total=Decimal("900"), available=Decimal("900")),
+        }
+    )
+    state.set_triangle_route_diagnostics(
+        {
+            "snapshot_status": "ready",
+            "snapshot_age_ms": 120,
+            "route_status": "flat_position",
+            "entry_buy_gate_status": "allowed",
+            "entry_buy_gate_reason": "strict_edge_ok",
+        }
+    )
+
+    panel = TerminalStatusPanel(
+        config=TelemetryConfig(status_panel_enabled=True, status_panel_render_non_interactive=True),
+        mode="live",
+    )
+    decision = QuoteDecision(reason="two_sided", ask=None)
+    risk = RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True)
+
+    text = panel.build_text(state=state, risk_status=risk, decision=decision)
+
+    assert "路由 |" in text
+    assert "快照=ready" in text
+    assert "库存路由状态=flat_position" in text
+    assert "入口买入=allowed" in text
+    assert "入口原因=strict_edge_ok" in text

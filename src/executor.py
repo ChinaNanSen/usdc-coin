@@ -13,6 +13,7 @@ from .exchange_errors import ExchangeAPIError
 from .log_labels import summarize_okx_error, translate_reason
 from .models import InstrumentMeta, LiveOrder, QuoteDecision, RiskStatus
 from .okx_rest import OKXAPIError, OKXRestClient
+from .reason_attribution import classify_reason_bucket
 from .state import BotState
 from .utils import build_cl_ord_id, build_req_id, decimal_to_str, is_managed_cl_ord_id, now_ms, passive_edge_ticks, quantize_down, to_jsonable
 
@@ -92,6 +93,8 @@ class OrderExecutor:
             fail_on_foreign=self.config.risk.fail_on_foreign_pending_orders,
             cancel_managed=self.config.risk.cancel_managed_orders_on_startup,
         )
+        if self.config.exchange.name == "binance" and self.config.risk.cancel_managed_orders_on_startup:
+            await self.reload_pending_orders()
 
     async def reload_pending_orders(self) -> None:
         await self._sync_pending_orders(fail_on_foreign=False, cancel_managed=False)
@@ -220,6 +223,7 @@ class OrderExecutor:
                 "cTime": str(now_ms()),
                 "uTime": str(now_ms()),
             }
+            self.state.set_order_reason(cl_ord_id=cl_ord_id, reason=intent.reason)
             order = self.state.apply_order_update(payload, source="shadow_place")
             if self.shadow_simulator:
                 self.shadow_simulator.on_order_placed(order)
@@ -233,6 +237,7 @@ class OrderExecutor:
                     "base_size": base_size,
                     "quote_notional": base_size * intent.price,
                     "reason": intent.reason,
+                    "reason_bucket": classify_reason_bucket(intent.reason),
                 },
             )
             self._last_action_by_side[side] = now_ms()
@@ -240,6 +245,7 @@ class OrderExecutor:
 
         cl_ord_id = build_cl_ord_id(self.config.managed_prefix, side)
         req_id = build_req_id(self.config.managed_prefix, f"pl{side}")
+        self.state.set_order_reason(cl_ord_id=cl_ord_id, reason=intent.reason)
         try:
             response = await self._trade_client().place_limit_order(
                 inst_id=self.config.trading.inst_id,
@@ -281,6 +287,8 @@ class OrderExecutor:
             "state": "live",
             "cTime": str(now_ms()),
             "uTime": str(now_ms()),
+            "reason": intent.reason,
+            "reason_bucket": classify_reason_bucket(intent.reason),
         }
         self.state.apply_order_update(payload, source="rest_place")
         self.state.record_place_result(True)
@@ -313,6 +321,7 @@ class OrderExecutor:
             "ord_id": primary.ord_id,
             "side": primary.side,
             "reason": intent.reason,
+            "reason_bucket": classify_reason_bucket(intent.reason),
             "old_price": primary.price,
             "new_price": intent.price,
             "old_size": primary.size,
@@ -324,6 +333,7 @@ class OrderExecutor:
         }
 
         if self.config.mode == "shadow":
+            self.state.set_order_reason(cl_ord_id=primary.cl_ord_id, reason=intent.reason)
             amended_order = self.state.apply_order_update(update_payload, source="shadow_amend")
             if self.shadow_simulator:
                 self.shadow_simulator.on_order_amended(primary, amended_order)
@@ -333,6 +343,8 @@ class OrderExecutor:
 
         pending_cl_ord_id = str(update_payload["clOrdId"])
         pending_ord_id = str(update_payload["ordId"])
+        target_exchange_size = base_size if self.config.exchange.name == "binance" else new_total_size
+        target_exchange_filled_size = Decimal("0") if self.config.exchange.name == "binance" else primary.filled_size
         self.state.register_pending_amend(
             cl_ord_id=pending_cl_ord_id,
             ord_id=pending_ord_id,
@@ -345,15 +357,21 @@ class OrderExecutor:
             target_size=new_total_size,
             target_remaining_size=base_size,
             filled_size=primary.filled_size,
+            target_exchange_size=target_exchange_size,
+            target_exchange_filled_size=target_exchange_filled_size,
             req_id=req_id,
         )
+        self.state.set_order_reason(cl_ord_id=pending_cl_ord_id, reason=intent.reason)
         try:
             response = await amend_order(
                 inst_id=primary.inst_id,
+                side=primary.side,
                 ord_id=primary.ord_id or None,
                 cl_ord_id=primary.cl_ord_id or None,
                 new_price=intent.price,
                 new_size=new_total_size,
+                filled_size=primary.filled_size,
+                post_only=self.config.trading.post_only,
                 cxl_on_fail=False,
                 req_id=req_id,
                 inst_id_code=self._trade_inst_id_code(),
@@ -387,14 +405,55 @@ class OrderExecutor:
             update_payload["clOrdId"] = str(response["clOrdId"])
         journal_payload["cl_ord_id"] = str(update_payload["clOrdId"])
         journal_payload["ord_id"] = str(update_payload["ordId"])
+        identity_changed = (
+            str(update_payload["clOrdId"]) != pending_cl_ord_id
+            or str(update_payload["ordId"]) != pending_ord_id
+        )
         self.state.update_pending_amend_identity(
             previous_cl_ord_id=pending_cl_ord_id,
             cl_ord_id=str(update_payload["clOrdId"]),
             ord_id=str(update_payload["ordId"]),
         )
+        self.state.set_order_reason(cl_ord_id=str(update_payload["clOrdId"]), reason=intent.reason)
+        if identity_changed:
+            self._adopt_amend_replacement_order(
+                primary=primary,
+                cl_ord_id=str(update_payload["clOrdId"]),
+                ord_id=str(update_payload["ordId"]),
+                price=intent.price,
+                size=target_exchange_size,
+                filled_size=target_exchange_filled_size,
+            )
         self.journal.append("amend_order_submitted", journal_payload)
         self._last_action_by_side[primary.side] = now_ms()
         return True
+
+    def _adopt_amend_replacement_order(
+        self,
+        *,
+        primary: LiveOrder,
+        cl_ord_id: str,
+        ord_id: str,
+        price: Decimal,
+        size: Decimal,
+        filled_size: Decimal,
+    ) -> None:
+        self.state.live_orders.pop(primary.cl_ord_id, None)
+        replacement_payload = {
+            "instId": primary.inst_id,
+            "side": primary.side,
+            "ordId": ord_id,
+            "clOrdId": cl_ord_id,
+            "px": decimal_to_str(price),
+            "sz": decimal_to_str(size),
+            "accFillSz": decimal_to_str(filled_size),
+            "state": "live",
+            "cTime": str(now_ms()),
+            "uTime": str(now_ms()),
+        }
+        replacement = self.state.apply_order_update(replacement_payload, source="rest_amend_replace")
+        if primary.cancel_requested:
+            self.state.mark_cancel_requested(replacement.cl_ord_id)
 
     async def _cancel_order(self, order: LiveOrder, *, reason: str, ignore_cooldown: bool = False) -> None:
         if not ignore_cooldown and not self._cooldown_ok(order.side):
@@ -1073,12 +1132,14 @@ class OrderExecutor:
     def _is_benign_terminal_cancel_error(exc: Exception) -> bool:
         if not isinstance(exc, ExchangeAPIError):
             return False
+        if exc.code in {"-2011"}:
+            return True
         if not exc.data:
             return False
-        terminal_codes = {"51400"}
+        terminal_codes = {"51400", "-2011"}
         found_terminal = False
         for item in exc.data:
-            s_code = str(item.get("sCode") or "")
+            s_code = str(item.get("sCode") or item.get("code") or "")
             if s_code in terminal_codes:
                 found_terminal = True
                 continue

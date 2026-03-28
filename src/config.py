@@ -93,6 +93,22 @@ class StrategyConfig:
     inventory_target_pct: Decimal = Decimal("0.50")
     inventory_soft_lower_pct: Decimal = Decimal("0.45")
     inventory_soft_upper_pct: Decimal = Decimal("0.55")
+    release_only_mode: bool = False
+    release_only_base_buffer: Decimal = Decimal("0")
+    release_only_shared_state_paths: list[str] = field(default_factory=list)
+    release_only_shared_inventory_min_base: Decimal = Decimal("100")
+    release_only_shared_inventory_min_improvement_bp: Decimal = Decimal("0.20")
+    triangle_routing_enabled: bool = False
+    triangle_route_refresh_interval_seconds: float = 5.0
+    triangle_snapshot_stale_ms: int = 15000
+    triangle_strict_dual_exit_edge_bp: Decimal = Decimal("0.15")
+    triangle_best_exit_edge_bp: Decimal = Decimal("0.75")
+    triangle_max_worst_exit_loss_bp: Decimal = Decimal("1.25")
+    triangle_indirect_leg_penalty_bp: Decimal = Decimal("0.20")
+    triangle_prefer_indirect_min_improvement_bp: Decimal = Decimal("0.10")
+    triangle_indirect_handoff_enabled: bool = False
+    triangle_direct_sell_floor_enabled: bool = False
+    triangle_direct_buy_ceiling_enabled: bool = False
     account_inventory_skew_enabled: bool = False
     mild_skew_threshold_pct: Decimal = Decimal("0.03")
     mild_skew_size_factor: Decimal = Decimal("0.50")
@@ -108,6 +124,7 @@ class StrategyConfig:
     rebalance_release_depth_levels: int = 1
     rebalance_release_depth_fraction: Decimal = Decimal("0.10")
     rebalance_release_depth_step_bonus: Decimal = Decimal("0.05")
+    secondary_layers_enabled: bool = True
     rebalance_secondary_size_factor: Decimal = Decimal("0.10")
     rebalance_overlay_floor_factor: Decimal = Decimal("0.10")
     rebalance_overlay_preserve_tolerance_ticks: int = 1
@@ -129,6 +146,23 @@ class StrategyConfig:
     entry_markout_trigger_samples: int = 3
     entry_markout_adverse_threshold_ticks: Decimal = Decimal("1")
     entry_markout_penalty_size_factor: Decimal = Decimal("0.50")
+    entry_profit_density_enabled: bool = False
+    entry_profit_density_window_minutes: int = 60
+    entry_profit_density_soft_per10k: Decimal = Decimal("0.15")
+    entry_profit_density_hard_per10k: Decimal = Decimal("0.05")
+    entry_profit_density_soft_size_factor: Decimal = Decimal("0.70")
+    entry_profit_density_hard_size_factor: Decimal = Decimal("0.40")
+    rebalance_profit_density_enabled: bool = False
+    rebalance_profit_density_window_minutes: int = 60
+    rebalance_profit_density_soft_per10k: Decimal = Decimal("0.10")
+    rebalance_profit_density_hard_per10k: Decimal = Decimal("0")
+    rebalance_profit_density_soft_size_factor: Decimal = Decimal("0.70")
+    rebalance_profit_density_hard_size_factor: Decimal = Decimal("0.40")
+    rebalance_profit_density_soft_extra_ticks: int = 1
+    rebalance_profit_density_hard_extra_ticks: int = 2
+    sell_drought_guard_enabled: bool = False
+    sell_drought_inventory_ratio_pct: Decimal = Decimal("0.60")
+    sell_drought_rebalance_window_seconds: float = 900.0
     toxicity_severe_extra_ticks: Decimal = Decimal("1")
     toxicity_severe_size_factor: Decimal = Decimal("0.25")
     toxicity_severe_extra_edge_ticks: int = 1
@@ -180,6 +214,7 @@ class RiskConfig:
     cancel_managed_on_consistency_failure: bool = False
     balance_consistency_tolerance_quote: Decimal = Decimal("1")
     require_passive_prices_on_resync: bool = True
+    startup_recovery_enabled: bool = False
 
 
 @dataclass
@@ -198,6 +233,7 @@ class TelemetryConfig:
     sqlite_path: str = "data/audit.db"
     state_path: str = "data/state_snapshot.json"
     stop_request_path: str = "data/stop.request"
+    shared_route_ledger_path: str = "data/route_ledger.jsonl"
     snapshot_interval_seconds: float = 30.0
     status_panel_enabled: bool = True
     status_panel_interval_seconds: float = 1.0
@@ -249,14 +285,17 @@ def _resolve_runtime_path(raw_path: str, *, config_path: Path) -> str:
 
     project_root = config_path.parent.parent
     workspace_root = project_root.parent
-    preferred = workspace_root / path if path.parts and path.parts[0] == project_root.name else project_root / path
-
-    candidates = [
-        Path.cwd() / path,
-        config_path.parent / path,
-        project_root / path,
-        workspace_root / path,
-    ]
+    if path.parts and path.parts[0] == project_root.name:
+        preferred = workspace_root / path
+        return str(preferred)
+    else:
+        preferred = project_root / path
+        candidates = [
+            Path.cwd() / path,
+            config_path.parent / path,
+            project_root / path,
+            workspace_root / path,
+        ]
     seen: set[str] = set()
     for candidate in candidates:
         key = str(candidate.resolve(strict=False))
@@ -298,6 +337,7 @@ def load_config(
     secret_raw = _load_optional_yaml(_default_secret_config_path(config_path=config_path, exchange_name=exchange_name))
     config = BotConfig()
     config.mode = mode_override or raw.get("mode", config.mode)
+    config.managed_prefix = str(raw.get("managed_prefix") or config.managed_prefix)
 
     _merge_dataclass(config.exchange, raw.get("exchange", {}))
     _merge_dataclass(config.exchange, secret_raw.get("exchange", {}))
@@ -310,6 +350,11 @@ def load_config(
     config.telemetry.sqlite_path = _resolve_runtime_path(config.telemetry.sqlite_path, config_path=config_path)
     config.telemetry.state_path = _resolve_runtime_path(config.telemetry.state_path, config_path=config_path)
     config.telemetry.stop_request_path = _resolve_runtime_path(config.telemetry.stop_request_path, config_path=config_path)
+    config.telemetry.shared_route_ledger_path = _resolve_runtime_path(config.telemetry.shared_route_ledger_path, config_path=config_path)
+    config.strategy.release_only_shared_state_paths = [
+        _resolve_runtime_path(path, config_path=config_path)
+        for path in config.strategy.release_only_shared_state_paths
+    ]
 
     config.exchange.apply_env()
     config.exchange.apply_runtime_defaults()
@@ -333,6 +378,15 @@ def load_config(
         mode=config.mode,
         simulated=config.exchange.simulated,
     )
+    config.telemetry.shared_route_ledger_path = _apply_environment_suffix(
+        config.telemetry.shared_route_ledger_path,
+        mode=config.mode,
+        simulated=config.exchange.simulated,
+    )
+    config.strategy.release_only_shared_state_paths = [
+        _apply_environment_suffix(path, mode=config.mode, simulated=config.exchange.simulated)
+        for path in config.strategy.release_only_shared_state_paths
+    ]
     if config.mode == "live" and validate_live_credentials:
         if config.exchange.name == "binance":
             required = {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import traceback
 from datetime import datetime, timezone
@@ -20,12 +21,15 @@ from .market_data import PublicBookStream
 from .models import FeeSnapshot
 from .okx_rest import OKXRestClient
 from .private_stream import PrivateUserStream
+from .reason_attribution import classify_reason_bucket
 from .risk import RiskManager
+from .route_ledger import append_route_ledger_event, read_route_ledger_events
 from .shadow import ShadowFillSimulator
 from .state import BotState
 from .status_panel import TerminalStatusPanel
 from .strategy import MicroMakerStrategy
-from .utils import now_ms
+from .triangle_routing import SUPPORTED_TRIANGLE_PAIRS, build_triangle_quote_snapshot, compute_dual_exit_metrics, compute_inventory_route_choice
+from .utils import now_ms, to_jsonable
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,7 @@ class TrendBot6:
         self.config = config
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         self.state = BotState(managed_prefix=config.managed_prefix, state_path=config.telemetry.state_path)
+        self.state.configure_release_tracking(enabled=config.strategy.release_only_mode)
         self.state.configure_balance_budgets(
             base_ccy=config.trading.base_ccy,
             quote_ccy=config.trading.quote_ccy,
@@ -85,18 +90,23 @@ class TrendBot6:
             simulated=config.exchange.simulated,
             live_allowed_instruments=tuple(config.risk.live_allowed_instruments),
             observe_only_instruments=tuple(config.risk.observe_only_instruments),
+            release_only_mode=config.strategy.release_only_mode,
+            release_only_base_buffer=config.strategy.release_only_base_buffer,
         )
         self.public_stream: PublicBookStream | None = None
         self.private_stream: PrivateUserStream | None = None
         self._last_balance_poll_ms = 0
         self._last_snapshot_ms = 0
         self._last_resync_attempt_ms = 0
+        self._last_triangle_route_refresh_ms = 0
         self._quote_cycle_lock = asyncio.Lock()
         self._book_requote_event = asyncio.Event()
         self._book_requote_task: asyncio.Task | None = None
         self._last_book_requote_signal_ms = 0
         self._last_book_requote_reason = "book_top_price_changed"
         self.stop_request_path = Path(config.telemetry.stop_request_path)
+        self.shared_route_ledger_path = Path(config.telemetry.shared_route_ledger_path)
+        self._last_triangle_route_diagnostics_json = ""
         self._clear_stale_stop_request()
 
     async def run(self) -> None:
@@ -171,10 +181,10 @@ class TrendBot6:
         if self.config.mode == "live":
             balances = await self.rest.fetch_balances([self.config.trading.base_ccy, self.config.trading.quote_ccy])
             self.state.set_balances(balances)
+            await self.executor.bootstrap_pending_orders()
             if not self._check_live_budget_gate():
                 return
             await self._refresh_fee(force=True)
-            await self.executor.bootstrap_pending_orders()
             if not await self._run_consistency_check(context="bootstrap", stop_on_failure=True):
                 return
         else:
@@ -273,10 +283,18 @@ class TrendBot6:
         async with self._quote_cycle_lock:
             if include_maintenance:
                 await self._refresh_balances_if_due()
+                self._refresh_startup_recovery_mode()
+                self._refresh_entry_profit_density_signal()
+                self._refresh_rebalance_profit_density_signal()
                 await self._refresh_instrument(force=False)
                 await self._refresh_fee(force=False)
+                await self._refresh_triangle_route_snapshot_if_due()
+                self._refresh_shared_release_inventory()
+                self._consume_route_ledger_events()
                 await self._maybe_resync()
             self.state.clear_pause_if_elapsed()
+            self._refresh_triangle_exit_route_choice()
+            self._refresh_triangle_route_diagnostics()
 
             risk_status = self.risk.evaluate(self.state)
             decision = self.strategy.decide(self.state, risk_status)
@@ -307,7 +325,22 @@ class TrendBot6:
         loop_ms = now_ms()
         if loop_ms - self._last_balance_poll_ms < int(self.config.trading.balance_poll_interval_seconds * 1000):
             return
-        balances = await self.rest.fetch_balances([self.config.trading.base_ccy, self.config.trading.quote_ccy])
+        try:
+            balances = await self.rest.fetch_balances([self.config.trading.base_ccy, self.config.trading.quote_ccy])
+        except Exception as exc:
+            self._last_balance_poll_ms = loop_ms
+            logger.warning("Balance refresh failed for %s: %r", self.config.trading.inst_id, exc)
+            self.journal.append(
+                "balance_refresh_error",
+                {
+                    "inst_id": self.config.trading.inst_id,
+                    "base_ccy": self.config.trading.base_ccy,
+                    "quote_ccy": self.config.trading.quote_ccy,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return
         self.state.set_balances(balances)
         self._last_balance_poll_ms = loop_ms
 
@@ -338,6 +371,251 @@ class TrendBot6:
         )
         self.state.set_fee_snapshot(snapshot)
         self.journal.append("fee_snapshot", {"snapshot": snapshot})
+
+    async def _refresh_triangle_route_snapshot_if_due(self) -> None:
+        if self.config.exchange.name != "binance":
+            return
+        if not self.config.strategy.triangle_routing_enabled:
+            return
+        if self.config.trading.inst_id not in {"USDC-USDT", "USD1-USDT"}:
+            return
+        loop_ms = now_ms()
+        interval_ms = int(max(self.config.strategy.triangle_route_refresh_interval_seconds, 0) * 1000)
+        if interval_ms > 0 and loop_ms - self._last_triangle_route_refresh_ms < interval_ms:
+            return
+
+        quotes: dict[str, dict[str, Decimal]] = {}
+        current_book = self.state.book
+        if (
+            current_book
+            and self.config.trading.inst_id in SUPPORTED_TRIANGLE_PAIRS
+            and current_book.best_bid
+            and current_book.best_ask
+        ):
+            quotes[self.config.trading.inst_id] = {
+                "bid": current_book.best_bid.price,
+                "ask": current_book.best_ask.price,
+            }
+
+        auxiliary_inst_ids = [inst_id for inst_id in SUPPORTED_TRIANGLE_PAIRS if inst_id != self.config.trading.inst_id]
+        if self.config.exchange.name == "binance" and hasattr(self.rest, "fetch_best_bid_ask_many"):
+            try:
+                books = await self.rest.fetch_best_bid_ask_many(auxiliary_inst_ids)
+            except Exception as exc:
+                self._last_triangle_route_refresh_ms = loop_ms
+                self.journal.append(
+                    "triangle_route_refresh_error",
+                    {
+                        "inst_id": self.config.trading.inst_id,
+                        "reference_inst_id": ",".join(auxiliary_inst_ids),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+                return
+            for inst_id, book in books.items():
+                if book.best_bid and book.best_ask:
+                    quotes[inst_id] = {
+                        "bid": book.best_bid.price,
+                        "ask": book.best_ask.price,
+                    }
+        else:
+            for inst_id in auxiliary_inst_ids:
+                try:
+                    if self.config.exchange.name == "binance" and hasattr(self.rest, "fetch_best_bid_ask"):
+                        book = await self.rest.fetch_best_bid_ask(inst_id)
+                    else:
+                        book = await self.rest.fetch_order_book(inst_id, depth=1)
+                except Exception as exc:
+                    self._last_triangle_route_refresh_ms = loop_ms
+                    self.journal.append(
+                        "triangle_route_refresh_error",
+                        {
+                            "inst_id": self.config.trading.inst_id,
+                            "reference_inst_id": inst_id,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        },
+                    )
+                    return
+                if book.best_bid and book.best_ask:
+                    quotes[inst_id] = {
+                        "bid": book.best_bid.price,
+                        "ask": book.best_ask.price,
+                    }
+
+        self.state.set_triangle_route_snapshot(build_triangle_quote_snapshot(quotes, checked_at_ms=loop_ms))
+        self._last_triangle_route_refresh_ms = loop_ms
+
+    def _refresh_triangle_exit_route_choice(self) -> None:
+        if self.config.exchange.name != "binance":
+            self.state.set_triangle_exit_route_choice(None)
+            return
+        if not self.config.strategy.triangle_routing_enabled:
+            self.state.set_triangle_exit_route_choice(None)
+            return
+        if self.config.trading.inst_id not in {"USDC-USDT", "USD1-USDT"}:
+            self.state.set_triangle_exit_route_choice(None)
+            return
+        book = self.state.book
+        if not book or not book.best_bid or not book.best_ask:
+            self.state.set_triangle_exit_route_choice(None)
+            return
+        choice = compute_inventory_route_choice(
+            inst_id=self.config.trading.inst_id,
+            position_base=self.state.strategy_position_base(),
+            current_bid=book.best_bid.price,
+            current_ask=book.best_ask.price,
+            snapshot=self.state.triangle_route_snapshot,
+            indirect_leg_penalty_bp=self.config.strategy.triangle_indirect_leg_penalty_bp,
+            prefer_indirect_min_improvement_bp=self.config.strategy.triangle_prefer_indirect_min_improvement_bp,
+        )
+        self.state.set_triangle_exit_route_choice(choice)
+
+    def _refresh_triangle_route_diagnostics(self) -> None:
+        diagnostics = self._build_triangle_route_diagnostics()
+        self.state.set_triangle_route_diagnostics(diagnostics)
+        normalized = json.dumps(to_jsonable(diagnostics or {}), sort_keys=True, ensure_ascii=False)
+        if normalized == self._last_triangle_route_diagnostics_json:
+            return
+        self._last_triangle_route_diagnostics_json = normalized
+        if diagnostics is not None:
+            self.journal.append("triangle_route_diagnostics", {"diagnostics": diagnostics})
+
+    def _build_triangle_route_diagnostics(self) -> dict[str, object] | None:
+        if self.config.exchange.name != "binance":
+            return None
+        if not self.config.strategy.triangle_routing_enabled:
+            return None
+
+        inst_id = self.config.trading.inst_id
+        position_base = self.state.strategy_position_base()
+        snapshot = self.state.triangle_route_snapshot if isinstance(self.state.triangle_route_snapshot, dict) else None
+        now_ref = now_ms()
+        snapshot_checked_at_ms = int(snapshot.get("checked_at_ms") or 0) if snapshot else 0
+        snapshot_age_ms = max(now_ref - snapshot_checked_at_ms, 0) if snapshot_checked_at_ms > 0 else None
+        snapshot_status = "missing"
+        snapshot_ready = False
+        if snapshot is not None:
+            snapshot_status = "ready"
+            if (
+                snapshot_checked_at_ms > 0
+                and snapshot_age_ms is not None
+                and snapshot_age_ms > max(self.config.strategy.triangle_snapshot_stale_ms, 0)
+            ):
+                snapshot_status = "stale"
+            else:
+                snapshot_ready = True
+
+        route_status = "not_applicable"
+        choice = self.state.triangle_exit_route_choice if isinstance(self.state.triangle_exit_route_choice, dict) else None
+        if inst_id in {"USDC-USDT", "USD1-USDT"}:
+            if not snapshot_ready:
+                route_status = f"snapshot_{snapshot_status}"
+            elif position_base == 0:
+                route_status = "flat_position"
+            elif not choice:
+                route_status = "choice_unavailable"
+            else:
+                primary_route = str(choice.get("primary_route") or "")
+                route_status = "indirect_preferred" if primary_route and not primary_route.startswith("direct_") else "direct_preferred"
+
+        book = self.state.book
+        entry_gate_status = "not_applicable"
+        entry_gate_reason = "unsupported_inst"
+        metrics: dict[str, Decimal] | None = None
+        if inst_id in {"USDC-USDT", "USD1-USDT"}:
+            if not book or not book.best_bid:
+                entry_gate_status = "not_ready"
+                entry_gate_reason = "book_missing"
+            elif not snapshot_ready:
+                entry_gate_status = "not_ready"
+                entry_gate_reason = f"snapshot_{snapshot_status}"
+            else:
+                metrics = compute_dual_exit_metrics(
+                    inst_id=inst_id,
+                    entry_buy_price=book.best_bid.price,
+                    snapshot=snapshot,
+                    indirect_leg_penalty_bp=self.config.strategy.triangle_indirect_leg_penalty_bp,
+                )
+                if metrics is None:
+                    entry_gate_status = "not_ready"
+                    entry_gate_reason = "metrics_unavailable"
+                else:
+                    strict_edge = metrics["strict_dual_exit_edge_bp"]
+                    best_edge = metrics["best_exit_edge_bp"]
+                    strict_ok = strict_edge >= self.config.strategy.triangle_strict_dual_exit_edge_bp
+                    best_ok = (
+                        best_edge >= self.config.strategy.triangle_best_exit_edge_bp
+                        and strict_edge >= -self.config.strategy.triangle_max_worst_exit_loss_bp
+                    )
+                    if strict_ok:
+                        entry_gate_status = "allowed"
+                        entry_gate_reason = "strict_edge_ok"
+                    elif best_ok:
+                        entry_gate_status = "allowed"
+                        entry_gate_reason = "best_edge_ok"
+                    elif strict_edge < -self.config.strategy.triangle_max_worst_exit_loss_bp:
+                        entry_gate_status = "blocked"
+                        entry_gate_reason = "worst_exit_loss_too_large"
+                    elif best_edge < self.config.strategy.triangle_best_exit_edge_bp:
+                        entry_gate_status = "blocked"
+                        entry_gate_reason = "best_exit_edge_too_low"
+                    else:
+                        entry_gate_status = "blocked"
+                        entry_gate_reason = "strict_exit_edge_too_low"
+
+        diagnostics: dict[str, object] = {
+            "inst_id": inst_id,
+            "snapshot_status": snapshot_status,
+            "snapshot_age_ms": snapshot_age_ms,
+            "position_base": position_base,
+            "route_status": route_status,
+            "entry_buy_gate_status": entry_gate_status,
+            "entry_buy_gate_reason": entry_gate_reason,
+            "primary_route": str(choice.get("primary_route") or "") if choice else "",
+            "backup_route": str(choice.get("backup_route") or "") if choice else "",
+            "direction": str(choice.get("direction") or "") if choice else "",
+            "improvement_bp": Decimal(str(choice.get("improvement_bp") or "0")) if choice else None,
+        }
+        if metrics is not None:
+            diagnostics.update(metrics)
+        return diagnostics
+
+    def _refresh_shared_release_inventory(self) -> None:
+        if not self.config.strategy.release_only_mode:
+            self.state.set_shared_release_inventory_base(Decimal("0"))
+            self.state.set_shared_release_inventory_improvement_bp(Decimal("0"))
+            return
+        total_shared = Decimal("0")
+        best_improvement = Decimal("0")
+        for raw_path in self.config.strategy.release_only_shared_state_paths:
+            path = Path(raw_path)
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            instrument = payload.get("instrument") or {}
+            if str(instrument.get("base_ccy") or "") != self.config.trading.base_ccy:
+                continue
+            position = Decimal(str(payload.get("strategy_position_base") or "0"))
+            if position <= 0:
+                continue
+            route_choice = payload.get("triangle_exit_route_choice") or {}
+            primary_route = str(route_choice.get("primary_route") or "")
+            improvement_bp = Decimal(str(route_choice.get("improvement_bp") or "0"))
+            if primary_route.startswith("direct_") or not primary_route:
+                continue
+            if position < self.config.strategy.release_only_shared_inventory_min_base:
+                continue
+            if improvement_bp < self.config.strategy.release_only_shared_inventory_min_improvement_bp:
+                continue
+            total_shared += position
+            best_improvement = max(best_improvement, improvement_bp)
+        self.state.set_shared_release_inventory_base(total_shared)
+        self.state.set_shared_release_inventory_improvement_bp(best_improvement)
 
     def _check_live_market_gate(self) -> bool:
         if self.config.mode != "live":
@@ -371,6 +649,63 @@ class TrendBot6:
         )
         if not errors:
             return True
+        if self.config.strategy.release_only_mode:
+            self.journal.append(
+                "startup_budget_gate_release_only_bypassed",
+                {
+                    "inst_id": self.config.trading.inst_id,
+                    "budget_base_total": self.config.trading.budget_base_total,
+                    "budget_quote_total": self.config.trading.budget_quote_total,
+                    "exchange_base_total": self.state.exchange_total_balance(self.config.trading.base_ccy),
+                    "exchange_quote_total": self.state.exchange_total_balance(self.config.trading.quote_ccy),
+                },
+            )
+            return True
+        if self._can_enter_startup_recovery(errors):
+            self.state.set_startup_recovery_side("sell")
+            self.journal.append(
+                "startup_budget_gate_recovery_bypassed",
+                {
+                    "inst_id": self.config.trading.inst_id,
+                    "recovery_side": "sell",
+                    "reason": "; ".join(errors),
+                    "strategy_position_base": self.state.strategy_position_base(),
+                    "exchange_base_total": self.state.exchange_total_balance(self.config.trading.base_ccy),
+                    "exchange_quote_total": self.state.exchange_total_balance(self.config.trading.quote_ccy),
+                },
+            )
+            return True
+        if self._can_clamp_startup_budget(errors):
+            base_ccy = self.config.trading.base_ccy
+            quote_ccy = self.config.trading.quote_ccy
+            clamped_base = min(
+                self.config.trading.budget_base_total,
+                self.state.exchange_total_balance(base_ccy),
+            )
+            clamped_quote = min(
+                self.config.trading.budget_quote_total,
+                self.state.exchange_total_balance(quote_ccy),
+            )
+            self.config.trading.budget_base_total = clamped_base
+            self.config.trading.budget_quote_total = clamped_quote
+            self.state.configure_balance_budgets(
+                base_ccy=base_ccy,
+                quote_ccy=quote_ccy,
+                base_total=clamped_base,
+                quote_total=clamped_quote,
+            )
+            self.journal.append(
+                "startup_budget_gate_clamped",
+                {
+                    "inst_id": self.config.trading.inst_id,
+                    "reason": "; ".join(errors),
+                    "budget_base_total": clamped_base,
+                    "budget_quote_total": clamped_quote,
+                    "exchange_base_total": self.state.exchange_total_balance(base_ccy),
+                    "exchange_quote_total": self.state.exchange_total_balance(quote_ccy),
+                },
+            )
+            return True
 
         reason = f"instance budget exceeds account balance: {'; '.join(errors)}"
         logger.warning("Startup budget gate blocked live run for %s: %s", self.config.trading.inst_id, reason)
@@ -387,6 +722,165 @@ class TrendBot6:
         )
         self.state.set_runtime_state("STOPPED", reason)
         return False
+
+    def _can_clamp_startup_budget(self, errors: tuple[str, ...]) -> bool:
+        if self.config.exchange.name != "binance":
+            return False
+        if self.config.strategy.release_only_mode:
+            return False
+        if not errors:
+            return False
+        return True
+
+    def _can_enter_startup_recovery(self, errors: tuple[str, ...]) -> bool:
+        if not self.config.risk.startup_recovery_enabled:
+            return False
+        position = self.state.strategy_position_base()
+        if position <= 0:
+            return False
+        base_total = self.state.exchange_total_balance(self.config.trading.base_ccy)
+        if base_total < position:
+            return False
+        quote_ccy = self.config.trading.quote_ccy
+        if not errors:
+            return False
+        if not all(error.startswith(f"{quote_ccy} ") for error in errors):
+            return False
+        return True
+
+    def _refresh_startup_recovery_mode(self) -> None:
+        if self.state.startup_recovery_side != "sell":
+            return
+        quote_budget = self.state.balance_budget_caps.get(self.config.trading.quote_ccy, Decimal("0"))
+        position = self.state.strategy_position_base()
+        quote_total = self.state.exchange_total_balance(self.config.trading.quote_ccy)
+        if position <= 0 or (quote_budget > 0 and quote_total >= quote_budget):
+            self.state.set_startup_recovery_side(None)
+            self.journal.append(
+                "startup_recovery_cleared",
+                {
+                    "inst_id": self.config.trading.inst_id,
+                    "strategy_position_base": position,
+                    "exchange_quote_total": quote_total,
+                    "quote_budget": quote_budget,
+                },
+            )
+
+    def _refresh_entry_profit_density_signal(self) -> None:
+        if not self.config.strategy.entry_profit_density_enabled:
+            self.state.set_entry_profit_density(per10k=None, size_factor=Decimal("1"))
+            return
+        turnover, realized = self._compute_profit_density_window(reason_bucket="entry", window_minutes=self.config.strategy.entry_profit_density_window_minutes)
+
+        per10k = None
+        size_factor = Decimal("1")
+        if turnover > 0:
+            per10k = (realized / turnover) * Decimal("10000")
+            if per10k <= self.config.strategy.entry_profit_density_hard_per10k:
+                size_factor = self.config.strategy.entry_profit_density_hard_size_factor
+            elif per10k <= self.config.strategy.entry_profit_density_soft_per10k:
+                size_factor = self.config.strategy.entry_profit_density_soft_size_factor
+        self.state.set_entry_profit_density(per10k=per10k, size_factor=size_factor)
+
+    def _refresh_rebalance_profit_density_signal(self) -> None:
+        if not self.config.strategy.rebalance_profit_density_enabled:
+            self.state.set_rebalance_profit_density(per10k=None, size_factor=Decimal("1"), extra_ticks=0)
+            return
+        turnover, realized = self._compute_profit_density_window(
+            reason_bucket="rebalance",
+            window_minutes=self.config.strategy.rebalance_profit_density_window_minutes,
+        )
+
+        per10k = None
+        size_factor = Decimal("1")
+        extra_ticks = 0
+        if turnover > 0:
+            per10k = (realized / turnover) * Decimal("10000")
+            if per10k <= self.config.strategy.rebalance_profit_density_hard_per10k:
+                size_factor = self.config.strategy.rebalance_profit_density_hard_size_factor
+                extra_ticks = self.config.strategy.rebalance_profit_density_hard_extra_ticks
+            elif per10k <= self.config.strategy.rebalance_profit_density_soft_per10k:
+                size_factor = self.config.strategy.rebalance_profit_density_soft_size_factor
+                extra_ticks = self.config.strategy.rebalance_profit_density_soft_extra_ticks
+        self.state.set_rebalance_profit_density(per10k=per10k, size_factor=size_factor, extra_ticks=extra_ticks)
+
+    def _compute_profit_density_window(self, *, reason_bucket: str, window_minutes: int) -> tuple[Decimal, Decimal]:
+        journal_path = Path(self.config.telemetry.journal_path)
+        if not journal_path.exists():
+            return Decimal("0"), Decimal("0")
+
+        cutoff_ms = 0
+        if window_minutes > 0:
+            cutoff_ms = now_ms() - (int(window_minutes) * 60 * 1000)
+
+        turnover = Decimal("0")
+        realized = Decimal("0")
+        lots: list[dict[str, Decimal]] = []
+        prev_filled_by_order: dict[str, Decimal] = {}
+        with journal_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                if record.get("event") != "order_update":
+                    continue
+                payload = record.get("payload") or {}
+                if str(payload.get("reason_bucket") or "") != reason_bucket:
+                    continue
+                order = payload.get("order") or {}
+                cl_ord_id = str(
+                    order.get("cl_ord_id")
+                    or order.get("clOrdId")
+                    or order.get("ord_id")
+                    or order.get("ordId")
+                    or ""
+                )
+                filled_size = Decimal(str(order.get("filled_size") or "0"))
+                previous_filled = prev_filled_by_order.get(cl_ord_id, Decimal("0")) if cl_ord_id else Decimal("0")
+                if cl_ord_id:
+                    prev_filled_by_order[cl_ord_id] = filled_size
+                fill_delta = filled_size - previous_filled
+                if fill_delta <= 0:
+                    continue
+
+                raw = payload.get("raw") or {}
+                fill_price = Decimal(str(raw.get("fillPx") or order.get("price") or "0"))
+                side = str(order.get("side") or "")
+                if fill_price <= 0 or side not in {"buy", "sell"}:
+                    continue
+
+                record_ts_ms = int(record.get("ts_ms") or 0)
+                in_window = cutoff_ms <= 0 or record_ts_ms <= 0 or record_ts_ms >= cutoff_ms
+                if in_window:
+                    turnover += fill_delta * fill_price
+
+                remaining = fill_delta
+                if side == "buy":
+                    while remaining > 0 and lots and lots[0]["qty"] < 0:
+                        lot = lots[0]
+                        matched = min(remaining, -lot["qty"])
+                        if in_window:
+                            realized += matched * (lot["price"] - fill_price)
+                        lot["qty"] += matched
+                        remaining -= matched
+                        if lot["qty"] == 0:
+                            lots.pop(0)
+                    if remaining > 0:
+                        lots.append({"qty": remaining, "price": fill_price})
+                else:
+                    while remaining > 0 and lots and lots[0]["qty"] > 0:
+                        lot = lots[0]
+                        matched = min(remaining, lot["qty"])
+                        if in_window:
+                            realized += matched * (fill_price - lot["price"])
+                        lot["qty"] -= matched
+                        remaining -= matched
+                        if lot["qty"] == 0:
+                            lots.pop(0)
+                    if remaining > 0:
+                        lots.append({"qty": -remaining, "price": fill_price})
+        return turnover, realized
 
     def _prefer_rest_trade_routing(self) -> bool:
         if self.config.exchange.name == "binance":
@@ -553,16 +1047,99 @@ class TrendBot6:
             value = normalized.get(key)
             if value not in (None, "", "0"):
                 normalized[key] = str(self._exchange_ms_to_local_ms(int(value)))
+        previous_order = self.state.live_orders.get(str(normalized.get("clOrdId") or normalized.get("ordId") or ""))
+        previous_filled = previous_order.filled_size if previous_order is not None else Decimal("0")
         order = self.state.apply_order_update(normalized, source="ws_order")
+        fill_delta = order.filled_size - previous_filled
+        if (
+            fill_delta > 0
+            and self.config.strategy.release_only_mode
+            and order.side == "sell"
+            and self.state.order_reason(order.cl_ord_id) == "release_external_long"
+        ):
+            fill_price = Decimal(str(normalized.get("fillPx") or normalized.get("px") or "0"))
+            if fill_price > 0:
+                append_route_ledger_event(
+                    self.shared_route_ledger_path,
+                    {
+                        "asset": self.config.trading.base_ccy,
+                        "source_inst_id": self.config.trading.inst_id,
+                        "side": order.side,
+                        "fill_size": fill_delta,
+                        "fill_price": fill_price,
+                        "reason": "release_external_long",
+                    },
+                )
         amend_resolution = self.state.resolve_pending_amend_update(payload=normalized, order=order)
         if amend_resolution is not None:
             event, event_payload = amend_resolution
             self.journal.append(event, event_payload)
-        self.journal.append("order_update", {"order": order, "raw": payload})
+            await self._handle_amend_resolution(order=order, event=event, event_payload=event_payload)
+        self.journal.append(
+            "order_update",
+            {
+                "order": order,
+                "raw": payload,
+                "reason": self.state.order_reason(order.cl_ord_id) or "",
+                "reason_bucket": self.state.order_reason_bucket(order.cl_ord_id),
+            },
+        )
+
+    async def _handle_amend_resolution(self, *, order, event: str, event_payload: dict[str, object]) -> None:
+        if event != "amend_order_error":
+            return
+        if order.is_terminal or order.cancel_requested:
+            return
+        event_reason = str(event_payload.get("reason") or self.state.order_reason(order.cl_ord_id) or "")
+        reason_bucket = classify_reason_bucket(event_reason)
+        if reason_bucket not in {"rebalance", "secondary"}:
+            return
+        self.journal.append(
+            "amend_rebalance_fallback_cancel",
+            {
+                "cl_ord_id": order.cl_ord_id,
+                "ord_id": order.ord_id,
+                "side": order.side,
+                "reason": event_reason,
+                "reason_bucket": reason_bucket,
+                "fallback_reason": "reprice_or_ttl",
+            },
+        )
+        await self.executor._cancel_order(order, reason="reprice_or_ttl", ignore_cooldown=True)
 
     async def _on_account(self, payload: dict) -> None:
         self.state.apply_account_update(payload)
         self.journal.append("account_update", payload)
+
+    def _consume_route_ledger_events(self) -> None:
+        if self.config.strategy.release_only_mode:
+            return
+        if not self.state.instrument:
+            return
+        new_offset, events = read_route_ledger_events(
+            self.shared_route_ledger_path,
+            offset=self.state.route_ledger_offset,
+        )
+        for event in events:
+            payload = event.get("payload") or {}
+            if str(payload.get("asset") or "") != self.config.trading.base_ccy:
+                continue
+            if str(payload.get("source_inst_id") or "") == self.config.trading.inst_id:
+                continue
+            fill_size = Decimal(str(payload.get("fill_size") or "0"))
+            fill_price = Decimal(str(payload.get("fill_price") or "0"))
+            matched = self.state.apply_external_release_fill(fill_size=fill_size, fill_price=fill_price)
+            if matched > 0:
+                self.journal.append(
+                    "triangle_route_ledger_applied",
+                    {
+                        "source_inst_id": payload.get("source_inst_id") or "",
+                        "asset": payload.get("asset") or "",
+                        "matched_size": matched,
+                        "fill_price": fill_price,
+                    },
+                )
+        self.state.set_route_ledger_offset(new_offset)
 
     async def _on_stream_status(self, stream_name: str, connected: bool) -> None:
         self.state.set_stream_status(stream_name, connected)

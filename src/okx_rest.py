@@ -270,15 +270,18 @@ class OKXRestClient:
         self,
         *,
         inst_id: str,
+        side: str | None = None,
         new_price: Decimal,
         new_size: Decimal,
+        filled_size: Decimal | None = None,
+        post_only: bool | None = None,
         ord_id: str | None = None,
         cl_ord_id: str | None = None,
         cxl_on_fail: bool = False,
         req_id: str | None = None,
         inst_id_code: str | None = None,
     ) -> dict[str, Any]:
-        del req_id, inst_id_code
+        del side, filled_size, post_only, req_id, inst_id_code
         payload = {
             "instId": inst_id,
             "newPx": str(new_price),

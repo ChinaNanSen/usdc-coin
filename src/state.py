@@ -5,6 +5,7 @@ from decimal import Decimal
 import json
 from pathlib import Path
 
+from .reason_attribution import classify_reason_bucket
 from .models import Balance, BookSnapshot, FeeSnapshot, InstrumentMeta, LiveOrder, StrategyLot, TradeTick
 from .utils import is_managed_cl_ord_id, now_ms, parse_decimal, quantize_down, quantize_up, to_jsonable
 
@@ -28,6 +29,7 @@ class BotState:
         self.last_fill_ms: int | None = None
         self.runtime_state = "INIT"
         self.runtime_reason = "booting"
+        self.startup_recovery_side = ""
         self.pause_until_ms = 0
         self.stream_status = {"public_books5": False, "private_user": False}
         self.stream_last_activity_ms = {"public_books5": 0, "private_user": 0}
@@ -53,23 +55,76 @@ class BotState:
         self.observed_fill_count = 0
         self.observed_fill_volume_quote = Decimal("0")
         self.live_realized_pnl_quote = Decimal("0")
+        self.entry_profit_density_per10k: Decimal | None = None
+        self.entry_profit_density_size_factor: Decimal = Decimal("1")
+        self.rebalance_profit_density_per10k: Decimal | None = None
+        self.rebalance_profit_density_size_factor: Decimal = Decimal("1")
+        self.rebalance_profit_density_extra_ticks: int = 0
         self.live_position_lots: deque[StrategyLot] = deque()
         self.initial_external_base_inventory: Decimal | None = None
         self.external_base_inventory_remaining: Decimal = Decimal("0")
+        self.release_tracking_enabled = False
+        self.shared_release_inventory_base = Decimal("0")
+        self.shared_release_inventory_improvement_bp = Decimal("0")
+        self.triangle_route_snapshot: dict[str, object] | None = None
+        self.triangle_exit_route_choice: dict[str, object] | None = None
+        self.triangle_route_diagnostics: dict[str, object] | None = None
+        self.route_ledger_offset = 0
         self._resync_passive_violation_counts: dict[str, int] = {}
         self._pending_amendments: dict[str, dict[str, object]] = {}
         self._pending_toxic_flow_fills: deque[TradeTick] = deque()
         self._toxic_flow_cooldown_until_ms: dict[str, int] = {"buy": 0, "sell": 0}
         self._pending_fill_markouts: deque[dict[str, object]] = deque()
+        self._order_reasons: dict[str, dict[str, str]] = {}
+        self._last_managed_fill_ts_ms_by_side_bucket: dict[str, int] = {}
         self._fill_markout_samples: dict[str, dict[int, deque[Decimal]]] = {
             side: {window_ms: deque() for window_ms in MARKOUT_WINDOWS_MS}
             for side in ("buy", "sell")
         }
+        self._fill_markout_samples_by_reason: dict[str, dict[int, deque[Decimal]]] = {}
 
     def set_instrument(self, instrument: InstrumentMeta) -> None:
         self.instrument = instrument
         self.last_instrument_check_ms = now_ms()
         self._init_external_inventory_if_possible()
+        self._clamp_external_inventory_to_balance()
+
+    def configure_release_tracking(self, *, enabled: bool) -> None:
+        self.release_tracking_enabled = bool(enabled)
+        self._clamp_external_inventory_to_balance()
+
+    def set_triangle_route_snapshot(self, snapshot: dict[str, object] | None) -> None:
+        self.triangle_route_snapshot = dict(snapshot) if snapshot is not None else None
+
+    def set_triangle_exit_route_choice(self, choice: dict[str, object] | None) -> None:
+        self.triangle_exit_route_choice = dict(choice) if choice is not None else None
+
+    def set_triangle_route_diagnostics(self, diagnostics: dict[str, object] | None) -> None:
+        self.triangle_route_diagnostics = dict(diagnostics) if diagnostics is not None else None
+
+    def set_route_ledger_offset(self, offset: int) -> None:
+        self.route_ledger_offset = max(int(offset), 0)
+
+    def set_startup_recovery_side(self, side: str | None) -> None:
+        normalized = str(side or "").lower()
+        if normalized not in {"", "buy", "sell"}:
+            normalized = ""
+        self.startup_recovery_side = normalized
+
+    def set_shared_release_inventory_base(self, value: Decimal) -> None:
+        self.shared_release_inventory_base = max(value, Decimal("0"))
+
+    def set_shared_release_inventory_improvement_bp(self, value: Decimal) -> None:
+        self.shared_release_inventory_improvement_bp = max(value, Decimal("0"))
+
+    def set_entry_profit_density(self, *, per10k: Decimal | None, size_factor: Decimal) -> None:
+        self.entry_profit_density_per10k = per10k
+        self.entry_profit_density_size_factor = min(max(size_factor, Decimal("0")), Decimal("1"))
+
+    def set_rebalance_profit_density(self, *, per10k: Decimal | None, size_factor: Decimal, extra_ticks: int) -> None:
+        self.rebalance_profit_density_per10k = per10k
+        self.rebalance_profit_density_size_factor = min(max(size_factor, Decimal("0")), Decimal("1"))
+        self.rebalance_profit_density_extra_ticks = max(int(extra_ticks), 0)
 
     def set_book(self, book: BookSnapshot) -> None:
         self.book = book
@@ -113,6 +168,7 @@ class BotState:
         self._init_nav_if_possible()
         self._init_shadow_cost_if_possible()
         self._init_external_inventory_if_possible()
+        self._clamp_external_inventory_to_balance()
 
     def seed_shadow_balances(self, *, base_ccy: str, quote_ccy: str, base_balance: Decimal, quote_balance: Decimal) -> None:
         self.budget_balances[base_ccy] = self._budget_seed_balance(
@@ -147,6 +203,7 @@ class BotState:
 
         self.initial_nav_quote = self._optional_decimal(payload.get("initial_nav_quote"))
         self.last_fill_ms = self._optional_int(payload.get("last_fill_ms"))
+        self.startup_recovery_side = str(payload.get("startup_recovery_side") or "").lower()
         self.shadow_realized_pnl_quote = parse_decimal(payload.get("shadow_realized_pnl_quote") or "0")
         self.shadow_base_cost_quote = self._optional_decimal(payload.get("shadow_base_cost_quote"))
         self.shadow_fill_count = self._optional_int(payload.get("shadow_fill_count")) or 0
@@ -154,8 +211,47 @@ class BotState:
         self.observed_fill_count = self._optional_int(payload.get("observed_fill_count")) or 0
         self.observed_fill_volume_quote = parse_decimal(payload.get("observed_fill_volume_quote") or "0")
         self.live_realized_pnl_quote = parse_decimal(payload.get("live_realized_pnl_quote") or "0")
+        self.entry_profit_density_per10k = self._optional_decimal(payload.get("entry_profit_density_per10k"))
+        self.entry_profit_density_size_factor = parse_decimal(payload.get("entry_profit_density_size_factor") or "1")
+        self.rebalance_profit_density_per10k = self._optional_decimal(payload.get("rebalance_profit_density_per10k"))
+        self.rebalance_profit_density_size_factor = parse_decimal(payload.get("rebalance_profit_density_size_factor") or "1")
+        self.rebalance_profit_density_extra_ticks = int(payload.get("rebalance_profit_density_extra_ticks") or 0)
         self.initial_external_base_inventory = self._optional_decimal(payload.get("initial_external_base_inventory"))
         self.external_base_inventory_remaining = parse_decimal(payload.get("external_base_inventory_remaining") or "0")
+        self.shared_release_inventory_base = parse_decimal(payload.get("shared_release_inventory_base") or "0")
+        self.shared_release_inventory_improvement_bp = parse_decimal(payload.get("shared_release_inventory_improvement_bp") or "0")
+        restored_budget_balances = self._restore_balance_map(payload, "budget_balances")
+        if restored_budget_balances:
+            self.budget_balances = restored_budget_balances
+        restored_effective_balances = self._restore_balance_map(payload, "balances")
+        if restored_effective_balances:
+            self.balances = restored_effective_balances
+        restored_exchange_balances = self._restore_balance_map(payload, "exchange_balances")
+        if restored_exchange_balances:
+            self.exchange_balances = restored_exchange_balances
+        if restored_budget_balances or restored_exchange_balances:
+            self._refresh_effective_balances()
+        fill_ts_payload = payload.get("last_managed_fill_ts_ms_by_side_bucket")
+        restored_fill_ts: dict[str, int] = {}
+        if isinstance(fill_ts_payload, dict):
+            for key, value in fill_ts_payload.items():
+                try:
+                    resolved = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if resolved > 0:
+                    restored_fill_ts[str(key)] = resolved
+        self._last_managed_fill_ts_ms_by_side_bucket = restored_fill_ts
+        triangle_snapshot = payload.get("triangle_route_snapshot")
+        if isinstance(triangle_snapshot, dict):
+            self.triangle_route_snapshot = triangle_snapshot
+        triangle_choice = payload.get("triangle_exit_route_choice")
+        if isinstance(triangle_choice, dict):
+            self.triangle_exit_route_choice = triangle_choice
+        triangle_diagnostics = payload.get("triangle_route_diagnostics")
+        if isinstance(triangle_diagnostics, dict):
+            self.triangle_route_diagnostics = triangle_diagnostics
+        self.route_ledger_offset = int(payload.get("route_ledger_offset") or 0)
         cooldown_payload = payload.get("toxic_flow_cooldown_until_ms") or {}
         now_ref = now_ms()
         self._toxic_flow_cooldown_until_ms = {
@@ -202,6 +298,8 @@ class BotState:
                 self.budget_balances[ccy] = self._budget_seed_balance(ccy, exchange_balance)
         self._refresh_effective_balances(currencies=tuple(item.get("ccy") for item in payload.get("details", []) if item.get("ccy")))
         self._init_nav_if_possible()
+        self._init_external_inventory_if_possible()
+        self._clamp_external_inventory_to_balance()
 
     def replace_live_orders(self, payloads: list[dict], *, source: str = "rest_sync") -> None:
         seen: set[str] = set()
@@ -217,9 +315,12 @@ class BotState:
         cl_ord_id = payload.get("clOrdId") or payload.get("ordId") or ""
         state = str(payload.get("state") or "live").lower()
         previous = self.live_orders.get(cl_ord_id)
+        side = str(payload.get("side") or "")
+        if not side and previous is not None:
+            side = previous.side
         order = LiveOrder(
             inst_id=payload.get("instId", self.instrument.inst_id if self.instrument else ""),
-            side=str(payload.get("side") or ""),
+            side=side,
             ord_id=str(payload.get("ordId") or ""),
             cl_ord_id=cl_ord_id,
             price=parse_decimal(payload.get("px") or "0"),
@@ -239,6 +340,11 @@ class BotState:
             if fill_price > 0:
                 self.observed_fill_volume_quote += fill_delta * fill_price
                 if is_managed_cl_ord_id(cl_ord_id, self.managed_prefix):
+                    self._record_managed_fill_timestamp(
+                        side=order.side,
+                        reason_bucket=self.order_reason_bucket(cl_ord_id),
+                        ts_ms=order.updated_at_ms,
+                    )
                     self._apply_live_fill_balance_effect(
                         side=order.side,
                         fill_size=fill_delta,
@@ -275,6 +381,8 @@ class BotState:
         target_size: Decimal,
         target_remaining_size: Decimal,
         filled_size: Decimal,
+        target_exchange_size: Decimal | None = None,
+        target_exchange_filled_size: Decimal | None = None,
         req_id: str | None = None,
     ) -> None:
         self._pending_amendments[cl_ord_id] = {
@@ -289,6 +397,8 @@ class BotState:
             "target_size": target_size,
             "target_remaining_size": target_remaining_size,
             "filled_size": filled_size,
+            "target_exchange_size": target_exchange_size if target_exchange_size is not None else target_size,
+            "target_exchange_filled_size": target_exchange_filled_size if target_exchange_filled_size is not None else filled_size,
             "req_id": req_id or "",
             "requested_at_ms": now_ms(),
         }
@@ -318,6 +428,57 @@ class BotState:
         pending["cl_ord_id"] = cl_ord_id
         pending["ord_id"] = ord_id
         self._pending_amendments[cl_ord_id] = pending
+
+    def set_order_reason(self, *, cl_ord_id: str, reason: str | None) -> None:
+        if not cl_ord_id:
+            return
+        resolved = str(reason or "")
+        self._order_reasons[cl_ord_id] = {
+            "reason": resolved,
+            "bucket": classify_reason_bucket(resolved),
+        }
+
+    def order_reason(self, cl_ord_id: str) -> str | None:
+        payload = self._order_reasons.get(cl_ord_id)
+        if payload is None:
+            return None
+        return payload.get("reason") or None
+
+    def order_reason_bucket(self, cl_ord_id: str) -> str:
+        payload = self._order_reasons.get(cl_ord_id)
+        if payload is None:
+            return "unknown"
+        return payload.get("bucket") or "unknown"
+
+    @staticmethod
+    def _managed_fill_ts_key(*, side: str, reason_bucket: str) -> str:
+        return f"{str(reason_bucket or 'unknown')}|{str(side or '')}"
+
+    def _record_managed_fill_timestamp(self, *, side: str, reason_bucket: str, ts_ms: int) -> None:
+        if ts_ms <= 0 or side not in {"buy", "sell"}:
+            return
+        key = self._managed_fill_ts_key(side=side, reason_bucket=reason_bucket)
+        self._last_managed_fill_ts_ms_by_side_bucket[key] = ts_ms
+
+    def last_managed_fill_ts_ms(self, *, side: str, reason_bucket: str) -> int | None:
+        key = self._managed_fill_ts_key(side=side, reason_bucket=reason_bucket)
+        value = self._last_managed_fill_ts_ms_by_side_bucket.get(key)
+        if value is None or value <= 0:
+            return None
+        return value
+
+    def managed_fill_age_ms(
+        self,
+        *,
+        side: str,
+        reason_bucket: str,
+        reference_ms: int | None = None,
+    ) -> int | None:
+        last_ts = self.last_managed_fill_ts_ms(side=side, reason_bucket=reason_bucket)
+        if last_ts is None:
+            return None
+        now_ref = reference_ms if reference_ms is not None else now_ms()
+        return max(now_ref - last_ts, 0)
 
     def resolve_pending_amend_update(self, *, payload: dict, order: LiveOrder) -> tuple[str, dict[str, object]] | None:
         pending = self._pending_amendments.get(order.cl_ord_id)
@@ -362,7 +523,13 @@ class BotState:
 
         target_price = pending["target_price"]
         target_size = pending["target_size"]
-        if amend_result == "0" or (order.price == target_price and order.size == target_size):
+        target_exchange_size = pending.get("target_exchange_size", target_size)
+        target_exchange_filled_size = pending.get("target_exchange_filled_size", pending["filled_size"])
+        if amend_result == "0" or (
+            order.price == target_price
+            and order.size == target_exchange_size
+            and order.filled_size == target_exchange_filled_size
+        ):
             self._pending_amendments.pop(order.cl_ord_id, None)
             return (
                 "amend_order",
@@ -624,6 +791,36 @@ class BotState:
     def strategy_position_base(self) -> Decimal:
         return sum((lot.qty for lot in self.live_position_lots), Decimal("0"))
 
+    def external_release_base_size(self, *, base_buffer: Decimal) -> Decimal:
+        if not self.instrument:
+            return Decimal("0")
+        available = min(self.external_base_inventory_remaining, self.total_balance(self.instrument.base_ccy))
+        releasable = max(available - max(base_buffer, Decimal("0")), Decimal("0"))
+        return quantize_down(releasable, self.instrument.lot_size)
+
+    def total_release_base_size(self, *, base_buffer: Decimal) -> Decimal:
+        if not self.instrument:
+            return Decimal("0")
+        own = self.external_release_base_size(base_buffer=base_buffer)
+        shared = quantize_down(max(self.shared_release_inventory_base, Decimal("0")), self.instrument.lot_size)
+        return own + shared
+
+    def apply_external_release_fill(self, *, fill_size: Decimal, fill_price: Decimal) -> Decimal:
+        if fill_size <= 0 or fill_price <= 0:
+            return Decimal("0")
+        remaining = fill_size
+        matched_total = Decimal("0")
+        while remaining > 0 and self.live_position_lots and self.live_position_lots[0].qty > 0:
+            lot = self.live_position_lots[0]
+            matched = min(remaining, lot.qty)
+            self.live_realized_pnl_quote += matched * (fill_price - lot.price)
+            lot.qty -= matched
+            remaining -= matched
+            matched_total += matched
+            if lot.qty == 0:
+                self.live_position_lots.popleft()
+        return matched_total
+
     def toxic_flow_cooldown_remaining_ms(self, side: str, *, reference_ms: int | None = None) -> int:
         until_ms = self._toxic_flow_cooldown_until_ms.get(side, 0)
         if until_ms <= 0:
@@ -667,7 +864,12 @@ class BotState:
                     mark_price=self.book.mid,
                     tick_size=tick_size,
                 )
-                self._record_markout_sample(side=side, window_ms=window_ms, adverse_ticks=adverse_ticks)
+                self._record_markout_sample(
+                    side=side,
+                    window_ms=window_ms,
+                    adverse_ticks=adverse_ticks,
+                    reason_bucket=str(pending.get("reason_bucket") or "unknown"),
+                )
                 observed_windows.add(window_ms)
 
             if len(observed_windows) < len(MARKOUT_WINDOWS_MS):
@@ -777,6 +979,21 @@ class BotState:
                     "avg_adverse_ticks": avg,
                 }
             summary[side] = side_summary
+        return summary
+
+    def fill_markout_summary_by_reason(self) -> dict[str, dict[str, dict[str, object]]]:
+        summary: dict[str, dict[str, dict[str, object]]] = {}
+        for reason_bucket, per_window in self._fill_markout_samples_by_reason.items():
+            bucket_summary: dict[str, dict[str, object]] = {}
+            for window_ms, samples in per_window.items():
+                avg = None
+                if samples:
+                    avg = sum(samples, Decimal("0")) / Decimal(len(samples))
+                bucket_summary[str(window_ms)] = {
+                    "samples": len(samples),
+                    "avg_adverse_ticks": avg,
+                }
+            summary[reason_bucket] = bucket_summary
         return summary
 
     def rebalance_base_size(self, side: str) -> Decimal:
@@ -938,6 +1155,7 @@ class BotState:
             "live_orders": self.live_orders,
             "initial_nav_quote": self.initial_nav_quote,
             "last_fill_ms": self.last_fill_ms,
+            "startup_recovery_side": self.startup_recovery_side,
             "runtime_state": self.runtime_state,
             "runtime_reason": self.runtime_reason,
             "pause_until_ms": self.pause_until_ms,
@@ -965,14 +1183,27 @@ class BotState:
             "observed_fill_count": self.observed_fill_count,
             "observed_fill_volume_quote": self.observed_fill_volume_quote,
             "live_realized_pnl_quote": self.live_realized_pnl_quote,
+            "entry_profit_density_per10k": self.entry_profit_density_per10k,
+            "entry_profit_density_size_factor": self.entry_profit_density_size_factor,
+            "rebalance_profit_density_per10k": self.rebalance_profit_density_per10k,
+            "rebalance_profit_density_size_factor": self.rebalance_profit_density_size_factor,
+            "rebalance_profit_density_extra_ticks": self.rebalance_profit_density_extra_ticks,
             "live_unrealized_pnl_quote": self.live_unrealized_pnl_quote(),
             "live_total_pnl_quote": self.live_total_pnl_quote(),
             "strategy_position_base": self.strategy_position_base(),
             "live_position_lots": list(self.live_position_lots),
             "initial_external_base_inventory": self.initial_external_base_inventory,
             "external_base_inventory_remaining": self.external_base_inventory_remaining,
+            "shared_release_inventory_base": self.shared_release_inventory_base,
+            "shared_release_inventory_improvement_bp": self.shared_release_inventory_improvement_bp,
+            "last_managed_fill_ts_ms_by_side_bucket": self._last_managed_fill_ts_ms_by_side_bucket,
+            "triangle_route_snapshot": self.triangle_route_snapshot,
+            "triangle_exit_route_choice": self.triangle_exit_route_choice,
+            "triangle_route_diagnostics": self.triangle_route_diagnostics,
+            "route_ledger_offset": self.route_ledger_offset,
             "toxic_flow_cooldown_until_ms": self._toxic_flow_cooldown_until_ms,
             "fill_markout_summary": self.fill_markout_summary(),
+            "fill_markout_summary_by_reason": self.fill_markout_summary_by_reason(),
         }
         self.state_path.write_text(json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1016,6 +1247,35 @@ class BotState:
             return None
 
     @staticmethod
+    def _parse_balance(value) -> Balance | None:
+        if not isinstance(value, dict):
+            return None
+        ccy = str(value.get("ccy") or "")
+        if not ccy:
+            return None
+        try:
+            return Balance(
+                ccy=ccy,
+                total=parse_decimal(value.get("total") or "0"),
+                available=parse_decimal(value.get("available") or "0"),
+                frozen=parse_decimal(value.get("frozen") or "0"),
+            )
+        except (TypeError, ValueError, ArithmeticError):
+            return None
+
+    def _restore_balance_map(self, payload: dict, key: str) -> dict[str, Balance]:
+        raw = payload.get(key)
+        if not isinstance(raw, dict):
+            return {}
+        restored: dict[str, Balance] = {}
+        for ccy, item in raw.items():
+            balance = self._parse_balance(item)
+            if balance is None:
+                continue
+            restored[str(ccy)] = balance
+        return restored
+
+    @staticmethod
     def _parse_strategy_lot(value) -> StrategyLot | None:
         if not isinstance(value, dict):
             return None
@@ -1036,6 +1296,14 @@ class BotState:
             return
         self.initial_external_base_inventory = self.total_balance(self.instrument.base_ccy)
         self.external_base_inventory_remaining = self.initial_external_base_inventory
+
+    def _clamp_external_inventory_to_balance(self) -> None:
+        if not self.release_tracking_enabled or not self.instrument or not self._has_balance_snapshot():
+            return
+        base_total = self.total_balance(self.instrument.base_ccy)
+        self.external_base_inventory_remaining = min(self.external_base_inventory_remaining, base_total)
+        if self.external_base_inventory_remaining < 0:
+            self.external_base_inventory_remaining = Decimal("0")
 
     def mark_cancel_requested(self, cl_ord_id: str) -> None:
         order = self.live_orders.get(cl_ord_id)
@@ -1212,6 +1480,10 @@ class BotState:
                 remaining -= matched
                 if lot.qty == 0:
                     self.live_position_lots.popleft()
+            if remaining > 0 and self.release_tracking_enabled and self.external_base_inventory_remaining > 0:
+                released = min(remaining, self.external_base_inventory_remaining)
+                self.external_base_inventory_remaining -= released
+                remaining -= released
             if remaining > 0:
                 self.live_position_lots.append(
                     StrategyLot(
@@ -1252,6 +1524,8 @@ class BotState:
                 "ts_ms": fill_ts_ms,
                 "price": fill_price,
                 "side": side,
+                "reason": self.order_reason(cl_ord_id) or "",
+                "reason_bucket": self.order_reason_bucket(cl_ord_id),
                 "observed_windows": set(),
             }
         )
@@ -1269,7 +1543,7 @@ class BotState:
             return Decimal("0")
         return adverse_move / tick_size
 
-    def _record_markout_sample(self, *, side: str, window_ms: int, adverse_ticks: Decimal) -> None:
+    def _record_markout_sample(self, *, side: str, window_ms: int, adverse_ticks: Decimal, reason_bucket: str = "unknown") -> None:
         side_samples = self._fill_markout_samples.get(side)
         if side_samples is None:
             return
@@ -1279,3 +1553,11 @@ class BotState:
         samples.append(max(adverse_ticks, Decimal("0")))
         while len(samples) > MARKOUT_HISTORY_SIZE:
             samples.popleft()
+        bucket_samples = self._fill_markout_samples_by_reason.setdefault(
+            reason_bucket,
+            {bucket_window: deque() for bucket_window in MARKOUT_WINDOWS_MS},
+        )
+        bucket_window_samples = bucket_samples.setdefault(window_ms, deque())
+        bucket_window_samples.append(max(adverse_ticks, Decimal("0")))
+        while len(bucket_window_samples) > MARKOUT_HISTORY_SIZE:
+            bucket_window_samples.popleft()

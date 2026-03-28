@@ -183,3 +183,164 @@ def test_render_audit_summary_translates_strict_cycle_reasons(tmp_path):
 
     assert "原因=严格交替：本轮只挂卖单" in text
     assert "严格交替：本轮只挂买单 1" in text
+
+
+def test_render_audit_summary_shows_release_only_snapshot_details(tmp_path):
+    db_path = tmp_path / "audit.db"
+    snapshot_path = tmp_path / "state_snapshot.json"
+
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "instrument": {"inst_id": "USD1-USDC", "base_ccy": "USD1", "quote_ccy": "USDC"},
+                "book": {
+                    "bids": [{"price": "0.9994", "size": "1000"}],
+                    "asks": [{"price": "0.9995", "size": "1000"}],
+                },
+                "balances": {
+                    "USD1": {"total": "900"},
+                    "USDC": {"total": "800"},
+                },
+                "runtime_state": "QUOTING",
+                "runtime_reason": "release_external_sell_only",
+                "initial_nav_quote": "1699.45",
+                "observed_fill_count": 0,
+                "observed_fill_volume_quote": "0",
+                "initial_external_base_inventory": "1200",
+                "external_base_inventory_remaining": "900",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    config = BotConfig(mode="live")
+    config.exchange.name = "binance"
+    config.trading.inst_id = "USD1-USDC"
+    config.trading.base_ccy = "USD1"
+    config.trading.quote_ccy = "USDC"
+    config.strategy.release_only_mode = True
+    config.strategy.release_only_base_buffer = 150
+    config.telemetry.sqlite_path = str(db_path)
+    config.telemetry.state_path = str(snapshot_path)
+
+    text = render_audit_summary(config)
+
+    assert "释放模式:" in text
+    assert "初始外部库存=1200" in text
+    assert "当前剩余=900" in text
+    assert "已释放=300" in text
+    assert "保留量=150" in text
+    assert "当前可释放=750" in text
+
+
+def test_render_audit_summary_shows_release_fill_totals_in_run_section(tmp_path):
+    db_path = tmp_path / "audit.db"
+    snapshot_path = tmp_path / "state_snapshot.json"
+
+    store = SQLiteAuditStore(str(db_path))
+    store.open()
+    store.append_event(
+        ts_ms=1000,
+        event="decision",
+        payload={"decision": {"reason": "release_external_sell_only"}},
+        run_id="run-release",
+    )
+    store.append_event(
+        ts_ms=1100,
+        event="order_update",
+        payload={
+            "order": {"cl_ord_id": "sell-release", "side": "sell", "price": "0.9995", "filled_size": "500", "state": "filled"},
+            "reason": "release_external_long",
+            "reason_bucket": "release",
+        },
+        run_id="run-release",
+    )
+    store.close()
+
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "instrument": {"inst_id": "USD1-USDC", "base_ccy": "USD1", "quote_ccy": "USDC"},
+                "book": {
+                    "bids": [{"price": "0.9994", "size": "1000"}],
+                    "asks": [{"price": "0.9995", "size": "1000"}],
+                },
+                "balances": {
+                    "USD1": {"total": "900"},
+                    "USDC": {"total": "800"},
+                },
+                "runtime_state": "QUOTING",
+                "runtime_reason": "release_external_sell_only",
+                "initial_nav_quote": "1699.45",
+                "observed_fill_count": 1,
+                "observed_fill_volume_quote": "499.75",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    config = BotConfig(mode="live")
+    config.exchange.name = "binance"
+    config.trading.inst_id = "USD1-USDC"
+    config.trading.base_ccy = "USD1"
+    config.trading.quote_ccy = "USDC"
+    config.strategy.release_only_mode = True
+    config.telemetry.sqlite_path = str(db_path)
+    config.telemetry.state_path = str(snapshot_path)
+
+    text = render_audit_summary(config, run_id="run-release")
+
+    assert "释放成交=1笔/500USD1/499.75U" in text
+
+
+def test_render_audit_summary_shows_triangle_route_choice(tmp_path):
+    db_path = tmp_path / "audit.db"
+    snapshot_path = tmp_path / "state_snapshot.json"
+
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "instrument": {"inst_id": "USD1-USDT", "base_ccy": "USD1", "quote_ccy": "USDT"},
+                "book": {
+                    "bids": [{"price": "0.9995", "size": "1000"}],
+                    "asks": [{"price": "0.9996", "size": "1000"}],
+                },
+                "balances": {
+                    "USD1": {"total": "1200"},
+                    "USDT": {"total": "900"},
+                },
+                "runtime_state": "QUOTING",
+                "runtime_reason": "fill_rebalance_sell_only",
+                "initial_nav_quote": "2099.52",
+                "observed_fill_count": 0,
+                "observed_fill_volume_quote": "0",
+                "triangle_exit_route_choice": {
+                    "primary_route": "direct_sell_usd1usdt",
+                    "backup_route": "sell_usd1usdc_then_sell_usdcusdt",
+                    "direction": "sell",
+                    "primary_reference_price": "0.9996",
+                    "backup_reference_price": "0.99949986",
+                    "improvement_bp": "0.8",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    config = BotConfig(mode="live")
+    config.exchange.name = "binance"
+    config.trading.inst_id = "USD1-USDT"
+    config.trading.base_ccy = "USD1"
+    config.trading.quote_ccy = "USDT"
+    config.telemetry.sqlite_path = str(db_path)
+    config.telemetry.state_path = str(snapshot_path)
+
+    text = render_audit_summary(config)
+
+    assert "路由建议:" in text
+    assert "主路=direct_sell_usd1usdt" in text
+    assert "备路=sell_usd1usdc_then_sell_usdcusdt" in text
+    assert "方向=sell" in text

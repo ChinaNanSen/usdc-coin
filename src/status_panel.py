@@ -20,6 +20,8 @@ class TerminalStatusPanel:
         stream=None,
         live_allowed_instruments: tuple[str, ...] | list[str] | None = None,
         observe_only_instruments: tuple[str, ...] | list[str] | None = None,
+        release_only_mode: bool = False,
+        release_only_base_buffer: Decimal = Decimal("0"),
     ):
         self.config = config
         self.mode = mode
@@ -28,6 +30,8 @@ class TerminalStatusPanel:
         self._last_render_ms = 0
         self.live_allowed_instruments = normalize_instruments(live_allowed_instruments)
         self.observe_only_instruments = normalize_instruments(observe_only_instruments)
+        self.release_only_mode = release_only_mode
+        self.release_only_base_buffer = release_only_base_buffer
 
     def maybe_render(self, *, state: BotState, risk_status: RiskStatus, decision: QuoteDecision) -> None:
         if not self.config.status_panel_enabled:
@@ -100,22 +104,30 @@ class TerminalStatusPanel:
                 f"{self._fmt_balance(state, state.instrument.base_ccy if state.instrument else 'BASE')} | "
                 f"{self._fmt_balance(state, state.instrument.quote_ccy if state.instrument else 'QUOTE')}"
             ),
-            "盈亏 | " + " ".join(pnl_parts),
-            (
-                "策略 | "
-                f"库存占比={self._fmt_pct(inventory_ratio)} "
-                f"允许买单={self._fmt_bool(risk_status.allow_bid)} 允许卖单={self._fmt_bool(risk_status.allow_ask)} "
-                f"风控={self._translate_reason(risk_status.reason)}"
-            ),
-            (
-                "决策 | "
-                f"原因={self._translate_reason(decision.reason)} "
-                f"买单={self._fmt_intents(decision.bid_layers)} "
-                f"卖单={self._fmt_intents(decision.ask_layers)}"
-            ),
-            f"挂单 | {self._fmt_orders(state)}",
-            f"最近成交 | {self._fmt_trade(state)}",
         ]
+        if self.release_only_mode:
+            lines.append(self._fmt_release_status(state=state, decision=decision))
+        if state.triangle_route_diagnostics or state.triangle_exit_route_choice:
+            lines.append(self._fmt_triangle_route_status(state=state))
+        lines.extend(
+            [
+                "盈亏 | " + " ".join(pnl_parts),
+                (
+                    "策略 | "
+                    f"库存占比={self._fmt_pct(inventory_ratio)} "
+                    f"允许买单={self._fmt_bool(risk_status.allow_bid)} 允许卖单={self._fmt_bool(risk_status.allow_ask)} "
+                    f"风控={self._translate_reason(risk_status.reason)}"
+                ),
+                (
+                    "决策 | "
+                    f"原因={self._translate_reason(decision.reason)} "
+                    f"买单={self._fmt_intents(decision.bid_layers)} "
+                    f"卖单={self._fmt_intents(decision.ask_layers)}"
+                ),
+                f"挂单 | {self._fmt_orders(state)}",
+                f"最近成交 | {self._fmt_trade(state)}",
+            ]
+        )
         current_inst_id = state.instrument.inst_id if state.instrument else "-"
         if self.mode == "live" and current_inst_id != "-":
             market_gate = evaluate_market_gate(
@@ -128,6 +140,41 @@ class TerminalStatusPanel:
                 f"market_gate | current={current_inst_id} role={market_gate.role} live={self._fmt_bool(market_gate.live_allowed)}",
             )
         return "\n".join(lines)
+
+    def _fmt_release_status(self, *, state: BotState, decision: QuoteDecision) -> str:
+        buffer = max(self.release_only_base_buffer, Decimal("0"))
+        releasable = state.external_release_base_size(base_buffer=buffer)
+        action = "待机"
+        if decision.reason == "release_external_sell_only":
+            action = "释放中"
+        elif any(getattr(intent, "reason", "") == "release_external_long" for intent in decision.ask_layers):
+            action = "释放中"
+        return (
+            "释放 | "
+            f"模式={self._fmt_bool(self.release_only_mode)} "
+            f"外部库存剩余={self._fmt_dec(state.external_base_inventory_remaining)} "
+            f"保留量={self._fmt_dec(buffer)} "
+            f"可释放={self._fmt_dec(releasable)} "
+            f"当前动作={action}"
+        )
+
+    def _fmt_triangle_route_status(self, *, state: BotState) -> str:
+        diagnostics = state.triangle_route_diagnostics or {}
+        choice = state.triangle_exit_route_choice or {}
+        return (
+            "路由 | "
+            f"快照={diagnostics.get('snapshot_status') or '-'} "
+            f"快照年龄毫秒={diagnostics.get('snapshot_age_ms') if diagnostics.get('snapshot_age_ms') is not None else '-'} "
+            f"库存路由状态={diagnostics.get('route_status') or '-'} "
+            f"入口买入={diagnostics.get('entry_buy_gate_status') or '-'} "
+            f"入口原因={diagnostics.get('entry_buy_gate_reason') or '-'} "
+            f"主路={choice.get('primary_route') or '-'} "
+            f"备路={choice.get('backup_route') or '-'} "
+            f"方向={choice.get('direction') or '-'} "
+            f"主参考价={self._fmt_dec(choice.get('primary_reference_price'))} "
+            f"备参考价={self._fmt_dec(choice.get('backup_reference_price'))} "
+            f"改善bp={self._fmt_dec(choice.get('improvement_bp'))}"
+        )
 
     def _fmt_balance(self, state: BotState, ccy: str) -> str:
         balance = state.balances.get(ccy)
@@ -254,6 +301,8 @@ class TerminalStatusPanel:
             "inventory_high_ask_only": "库存偏高，只挂卖单",
             "fill_rebalance_buy_only": "成交后回补，只挂买单",
             "fill_rebalance_sell_only": "成交后回补，只挂卖单",
+            "release_external_sell_only": "释放模式：只挂卖单",
+            "release_only_idle": "释放模式待机",
             "strict_cycle_buy_only": "严格交替：本轮只挂买单",
             "strict_cycle_sell_only": "严格交替：本轮只挂卖单",
             "streams not ready": "流未就绪",

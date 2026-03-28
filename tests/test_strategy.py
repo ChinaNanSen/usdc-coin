@@ -8,6 +8,7 @@ from src.config import StrategyConfig, TradingConfig
 from src.models import Balance, BookLevel, BookSnapshot, InstrumentMeta, RiskStatus
 from src.state import BotState
 from src.strategy import MicroMakerStrategy
+from src.triangle_routing import build_triangle_quote_snapshot
 from src.utils import build_cl_ord_id
 
 
@@ -37,6 +38,38 @@ def build_state(base_balance: str, quote_balance: str, depth_size: str = "100000
         {
             "USDC": Balance(ccy="USDC", total=Decimal(base_balance), available=Decimal(base_balance)),
             "USDT": Balance(ccy="USDT", total=Decimal(quote_balance), available=Decimal(quote_balance)),
+        }
+    )
+    return state
+
+
+def build_state_for_inst(inst_id: str, base_balance: str, quote_balance: str, *, best_bid: str, best_ask: str, depth_size: str = "100000") -> BotState:
+    base_ccy, quote_ccy = inst_id.split("-")
+    state = BotState(managed_prefix="bot6", state_path="data/test_state.json")
+    state.set_instrument(
+        InstrumentMeta(
+            inst_id=inst_id,
+            inst_type="SPOT",
+            base_ccy=base_ccy,
+            quote_ccy=quote_ccy,
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("0.000001"),
+            min_size=Decimal("1"),
+            max_market_amount=Decimal("1000000"),
+            max_limit_amount=Decimal("20000000"),
+        )
+    )
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal(best_bid), size=Decimal(depth_size))],
+            asks=[BookLevel(price=Decimal(best_ask), size=Decimal(depth_size))],
+        )
+    )
+    state.set_balances(
+        {
+            base_ccy: Balance(ccy=base_ccy, total=Decimal(base_balance), available=Decimal(base_balance)),
+            quote_ccy: Balance(ccy=quote_ccy, total=Decimal(quote_balance), available=Decimal(quote_balance)),
         }
     )
     return state
@@ -83,6 +116,30 @@ def test_strategy_can_emit_two_layers_per_side_when_enabled():
 def test_strategy_join_second_layers_require_configured_edge():
     strategy = MicroMakerStrategy(
         StrategyConfig(secondary_entry_layer_min_edge_ticks=4),
+        TradingConfig(),
+        max_orders_per_side=2,
+    )
+    state = build_state("50000", "50000")
+    state.set_book(
+        BookSnapshot(
+            ts_ms=9999999999999,
+            bids=[BookLevel(price=Decimal("0.9998"), size=Decimal("100000"))],
+            asks=[BookLevel(price=Decimal("1.0000"), size=Decimal("100000"))],
+        )
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert len(decision.bid_layers) == 1
+    assert len(decision.ask_layers) == 1
+
+
+def test_strategy_disables_second_entry_layer_when_flag_is_off():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(secondary_layers_enabled=False),
         TradingConfig(),
         max_orders_per_side=2,
     )
@@ -214,6 +271,302 @@ def test_strategy_does_not_emit_second_entry_layer_when_spread_is_one_tick():
     assert decision.ask_layers[0].reason == "join_best_ask"
 
 
+def test_release_only_strategy_emits_ask_only_when_external_base_exceeds_buffer():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            release_only_mode=True,
+            release_only_base_buffer=Decimal("200"),
+        ),
+        TradingConfig(entry_base_size=Decimal("500"), quote_size=Decimal("500")),
+    )
+    state = build_state("1500", "500")
+    state.external_base_inventory_remaining = Decimal("1200")
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.reason == "release_external_sell_only"
+    assert decision.bid is None
+    assert decision.ask is not None
+    assert decision.ask.reason == "release_external_long"
+    assert decision.ask.base_size == Decimal("500")
+
+
+def test_release_only_strategy_stays_idle_below_external_base_buffer():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            release_only_mode=True,
+            release_only_base_buffer=Decimal("1200"),
+        ),
+        TradingConfig(entry_base_size=Decimal("500"), quote_size=Decimal("500")),
+    )
+    state = build_state("1500", "500")
+    state.external_base_inventory_remaining = Decimal("1100")
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.reason == "release_only_idle"
+    assert decision.bid is None
+    assert decision.ask is None
+
+
+def test_release_only_strategy_can_expand_sell_size_with_shared_inventory():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            release_only_mode=True,
+            release_only_base_buffer=Decimal("150"),
+        ),
+        TradingConfig(inst_id="USD1-USDC", base_ccy="USD1", quote_ccy="USDC", entry_base_size=Decimal("250"), quote_size=Decimal("250")),
+    )
+    state = build_state_for_inst("USD1-USDC", "400", "250", best_bid="0.9995", best_ask="0.9996")
+    state.external_base_inventory_remaining = Decimal("400")
+    state.shared_release_inventory_base = Decimal("350")
+    state.shared_release_inventory_improvement_bp = Decimal("0.30")
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.ask is not None
+    assert decision.ask.reason == "release_external_long"
+    assert decision.ask.base_size == Decimal("600")
+
+
+def test_release_only_strategy_ignores_shared_inventory_when_improvement_is_too_small():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            release_only_mode=True,
+            release_only_base_buffer=Decimal("150"),
+            release_only_shared_inventory_min_improvement_bp=Decimal("0.50"),
+        ),
+        TradingConfig(inst_id="USD1-USDC", base_ccy="USD1", quote_ccy="USDC", entry_base_size=Decimal("250"), quote_size=Decimal("250")),
+    )
+    state = build_state_for_inst("USD1-USDC", "400", "250", best_bid="0.9995", best_ask="0.9996")
+    state.external_base_inventory_remaining = Decimal("400")
+    state.shared_release_inventory_base = Decimal("350")
+    state.shared_release_inventory_improvement_bp = Decimal("0.10")
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.ask is not None
+    assert decision.ask.base_size == Decimal("250")
+
+
+def test_strategy_suppresses_direct_sell_rebalance_when_indirect_route_is_preferred():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            triangle_routing_enabled=True,
+            triangle_prefer_indirect_min_improvement_bp=Decimal("0.10"),
+            triangle_indirect_handoff_enabled=True,
+        ),
+        TradingConfig(inst_id="USD1-USDT", base_ccy="USD1", quote_ccy="USDT", entry_base_size=Decimal("800"), quote_size=Decimal("800")),
+    )
+    state = build_state_for_inst("USD1-USDT", "1200", "900", best_bid="0.9995", best_ask="0.9996")
+    state.live_position_lots.append(
+        state._parse_strategy_lot(
+            {"qty": "600", "price": "0.9994", "ts_ms": 1, "cl_ord_id": "lot1"}
+        )
+    )
+    state.set_triangle_exit_route_choice(
+        {
+            "primary_route": "sell_usd1usdc_then_sell_usdcusdt",
+            "backup_route": "direct_sell_usd1usdt",
+            "direction": "sell",
+            "primary_reference_price": Decimal("0.9997"),
+            "backup_reference_price": Decimal("0.9996"),
+            "improvement_bp": Decimal("0.30"),
+        }
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=False, allow_ask=True),
+    )
+
+    assert decision.ask is None
+    assert decision.reason == "route_indirect_release_only"
+
+
+def test_strategy_suppresses_direct_sell_rebalance_for_usdc_when_indirect_route_is_preferred():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            triangle_routing_enabled=True,
+            triangle_prefer_indirect_min_improvement_bp=Decimal("0.10"),
+            triangle_direct_sell_floor_enabled=True,
+        ),
+        TradingConfig(inst_id="USDC-USDT", base_ccy="USDC", quote_ccy="USDT", entry_base_size=Decimal("1000"), quote_size=Decimal("1000")),
+    )
+    state = build_state_for_inst("USDC-USDT", "3200", "3000", best_bid="1.0002", best_ask="1.0003")
+    state.live_position_lots.append(
+        state._parse_strategy_lot(
+            {"qty": "600", "price": "1.0001", "ts_ms": 1, "cl_ord_id": "lot1"}
+        )
+    )
+    state.set_triangle_exit_route_choice(
+        {
+            "primary_route": "buy_usd1usdc_then_sell_usd1usdt",
+            "backup_route": "direct_sell_usdcusdt",
+            "direction": "sell",
+            "primary_reference_price": Decimal("1.0005"),
+            "backup_reference_price": Decimal("1.0003"),
+            "improvement_bp": Decimal("0.20"),
+        }
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=False, allow_ask=True),
+    )
+
+    assert decision.ask is not None
+    assert decision.ask.reason == "rebalance_open_long"
+    assert decision.ask.price == Decimal("1.0005")
+
+
+def test_strategy_caps_direct_rebalance_buy_price_when_indirect_buy_is_cheaper():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            triangle_routing_enabled=True,
+            triangle_direct_buy_ceiling_enabled=True,
+        ),
+        TradingConfig(inst_id="USD1-USDT", base_ccy="USD1", quote_ccy="USDT", entry_base_size=Decimal("800"), quote_size=Decimal("800")),
+    )
+    state = build_state_for_inst("USD1-USDT", "1200", "900", best_bid="0.9994", best_ask="0.9995")
+    state.live_position_lots.append(
+        state._parse_strategy_lot(
+            {"qty": "-600", "price": "0.9998", "ts_ms": 1, "cl_ord_id": "lot1"}
+        )
+    )
+    state.set_triangle_exit_route_choice(
+        {
+            "primary_route": "buy_usdcusdt_then_buy_usd1usdc",
+            "backup_route": "direct_buy_usd1usdt",
+            "direction": "buy",
+            "primary_reference_price": Decimal("0.9992"),
+            "backup_reference_price": Decimal("0.9994"),
+            "improvement_bp": Decimal("0.20"),
+        }
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=False),
+    )
+
+    assert decision.bid is not None
+    assert decision.bid.reason == "rebalance_open_short"
+    assert decision.bid.price == Decimal("0.9992")
+
+
+def test_strategy_suppresses_direct_sell_rebalance_only_when_handoff_is_enabled():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            triangle_routing_enabled=True,
+            triangle_prefer_indirect_min_improvement_bp=Decimal("0.10"),
+            triangle_indirect_handoff_enabled=True,
+        ),
+        TradingConfig(inst_id="USD1-USDT", base_ccy="USD1", quote_ccy="USDT", entry_base_size=Decimal("800"), quote_size=Decimal("800")),
+    )
+    state = build_state_for_inst("USD1-USDT", "1200", "900", best_bid="0.9995", best_ask="0.9996")
+    state.live_position_lots.append(
+        state._parse_strategy_lot(
+            {"qty": "600", "price": "0.9994", "ts_ms": 1, "cl_ord_id": "lot1"}
+        )
+    )
+    state.set_triangle_exit_route_choice(
+        {
+            "primary_route": "sell_usd1usdc_then_sell_usdcusdt",
+            "backup_route": "direct_sell_usd1usdt",
+            "direction": "sell",
+            "primary_reference_price": Decimal("0.9997"),
+            "backup_reference_price": Decimal("0.9996"),
+            "improvement_bp": Decimal("0.30"),
+        }
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=False, allow_ask=True),
+    )
+
+    assert decision.ask is None
+    assert decision.reason == "route_indirect_release_only"
+
+
+def test_strategy_triangle_route_gate_blocks_low_quality_usd1_buy_entry():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            triangle_routing_enabled=True,
+            triangle_strict_dual_exit_edge_bp=Decimal("0.15"),
+            triangle_best_exit_edge_bp=Decimal("0.75"),
+            triangle_max_worst_exit_loss_bp=Decimal("0.10"),
+            triangle_indirect_leg_penalty_bp=Decimal("0.20"),
+        ),
+        TradingConfig(inst_id="USD1-USDT", base_ccy="USD1", quote_ccy="USDT", entry_base_size=Decimal("800"), quote_size=Decimal("800")),
+    )
+    state = build_state_for_inst("USD1-USDT", "1200", "1200", best_bid="0.9995", best_ask="0.9996")
+    state.set_triangle_route_snapshot(
+        build_triangle_quote_snapshot(
+            {
+                "USDC-USDT": {"bid": Decimal("1.0002"), "ask": Decimal("1.0003")},
+                "USD1-USDT": {"bid": Decimal("0.9995"), "ask": Decimal("0.9996")},
+                "USD1-USDC": {"bid": Decimal("0.9989"), "ask": Decimal("0.9990")},
+            },
+            checked_at_ms=9999999999999,
+        )
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is None
+    assert decision.ask is not None
+    assert decision.reason == "inventory_high_ask_only"
+
+
+def test_strategy_triangle_route_gate_allows_high_quality_usd1_buy_entry():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            triangle_routing_enabled=True,
+            triangle_strict_dual_exit_edge_bp=Decimal("0.15"),
+            triangle_best_exit_edge_bp=Decimal("0.75"),
+            triangle_max_worst_exit_loss_bp=Decimal("1.25"),
+            triangle_indirect_leg_penalty_bp=Decimal("0.20"),
+        ),
+        TradingConfig(inst_id="USD1-USDT", base_ccy="USD1", quote_ccy="USDT", entry_base_size=Decimal("800"), quote_size=Decimal("800")),
+    )
+    state = build_state_for_inst("USD1-USDT", "1200", "1200", best_bid="0.9995", best_ask="0.9996")
+    state.set_triangle_route_snapshot(
+        build_triangle_quote_snapshot(
+            {
+                "USDC-USDT": {"bid": Decimal("1.0002"), "ask": Decimal("1.0003")},
+                "USD1-USDT": {"bid": Decimal("0.9995"), "ask": Decimal("0.9996")},
+                "USD1-USDC": {"bid": Decimal("0.9993"), "ask": Decimal("0.9994")},
+            },
+            checked_at_ms=9999999999999,
+        )
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is not None
+    assert decision.ask is not None
+
+
 def test_strategy_does_not_scale_overlay_size_while_rebalancing_even_if_spread_is_favorable():
     strategy = MicroMakerStrategy(
         StrategyConfig(
@@ -293,6 +646,41 @@ def test_strategy_uses_bot_position_to_bias_secondary_side_even_when_account_inv
     assert decision.ask.base_size == Decimal("375.00000")
 
 
+def test_strategy_disables_secondary_rebalance_layer_when_flag_is_off():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(secondary_layers_enabled=False),
+        TradingConfig(entry_base_size=Decimal("5000"), quote_size=Decimal("5000")),
+    )
+    state = build_state("70000", "30000")
+    cl_ord_id = build_cl_ord_id("bot6", "sell")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": cl_ord_id,
+            "px": "0.9999",
+            "fillPx": "0.9999",
+            "sz": "2500",
+            "accFillSz": "2500",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.reason == "fill_rebalance_buy_only"
+    assert decision.bid is not None
+    assert decision.bid.reason == "rebalance_open_short"
+    assert decision.ask is None
+
+
 def test_strategy_strict_cycle_starts_with_buy_only():
     strategy = MicroMakerStrategy(StrategyConfig(strict_alternating_sides=True), TradingConfig(entry_base_size=Decimal("10000")))
     decision = strategy.decide(
@@ -367,6 +755,58 @@ def test_strategy_scales_down_buy_entry_when_recent_buy_markout_is_adverse():
     assert decision.bid is not None
     assert decision.ask is not None
     assert decision.bid.base_size == Decimal("5000")
+    assert decision.ask.base_size == Decimal("10000")
+
+
+def test_strategy_scales_down_entry_when_profit_density_is_weak():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            entry_profit_density_enabled=True,
+            entry_profit_density_soft_per10k=Decimal("0.15"),
+            entry_profit_density_hard_per10k=Decimal("0.05"),
+            entry_profit_density_soft_size_factor=Decimal("0.70"),
+            entry_profit_density_hard_size_factor=Decimal("0.40"),
+        ),
+        TradingConfig(entry_base_size=Decimal("10000")),
+    )
+    state = build_state("50000", "50000")
+    state.entry_profit_density_per10k = Decimal("0.04")
+    state.entry_profit_density_size_factor = Decimal("0.40")
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is not None
+    assert decision.ask is not None
+    assert decision.bid.base_size == Decimal("4000")
+    assert decision.ask.base_size == Decimal("4000")
+
+
+def test_strategy_keeps_entry_size_when_profit_density_is_healthy():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            entry_profit_density_enabled=True,
+            entry_profit_density_soft_per10k=Decimal("0.15"),
+            entry_profit_density_hard_per10k=Decimal("0.05"),
+            entry_profit_density_soft_size_factor=Decimal("0.70"),
+            entry_profit_density_hard_size_factor=Decimal("0.40"),
+        ),
+        TradingConfig(entry_base_size=Decimal("10000")),
+    )
+    state = build_state("50000", "50000")
+    state.entry_profit_density_per10k = Decimal("0.30")
+    state.entry_profit_density_size_factor = Decimal("1")
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is not None
+    assert decision.ask is not None
+    assert decision.bid.base_size == Decimal("10000")
     assert decision.ask.base_size == Decimal("10000")
 
 
@@ -1579,6 +2019,74 @@ def test_strategy_rebalance_sell_uses_profitable_fifo_tranche_before_full_positi
     assert decision.reason == "fill_rebalance_sell_only"
 
 
+def test_strategy_rebalance_sell_scales_down_when_rebalance_profit_density_is_weak():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            rebalance_min_profit_ticks=1,
+            rebalance_profit_density_enabled=True,
+            rebalance_profit_density_soft_size_factor=Decimal("0.50"),
+            rebalance_profit_density_soft_extra_ticks=1,
+        ),
+        TradingConfig(entry_base_size=Decimal("5000")),
+    )
+    state = build_state("50000", "50000")
+    state.live_position_lots.append(
+        state._parse_strategy_lot(
+            {"qty": "10000", "price": "0.9995", "ts_ms": 1, "cl_ord_id": "lot1"}
+        )
+    )
+    state.rebalance_profit_density_size_factor = Decimal("0.50")
+    state.rebalance_profit_density_extra_ticks = 1
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="reduce_only_inventory_high", allow_bid=False, allow_ask=True, runtime_state="REDUCE_ONLY"),
+    )
+
+    assert decision.ask is not None
+    assert decision.ask.base_size == Decimal("5000")
+
+
+def test_strategy_rebalance_buy_respects_route_aware_ceiling_and_extra_ticks():
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            rebalance_min_profit_ticks=1,
+            triangle_routing_enabled=True,
+            triangle_direct_buy_ceiling_enabled=True,
+            rebalance_profit_density_enabled=True,
+            rebalance_profit_density_soft_extra_ticks=1,
+        ),
+        TradingConfig(inst_id="USD1-USDT", base_ccy="USD1", quote_ccy="USDT", entry_base_size=Decimal("800"), quote_size=Decimal("800")),
+    )
+    state = build_state_for_inst("USD1-USDT", "1200", "900", best_bid="0.9994", best_ask="0.9995")
+    state.live_position_lots.append(
+        state._parse_strategy_lot(
+            {"qty": "-600", "price": "0.9998", "ts_ms": 1, "cl_ord_id": "lot1"}
+        )
+    )
+    state.set_triangle_exit_route_choice(
+        {
+            "primary_route": "buy_usdcusdt_then_buy_usd1usdc",
+            "backup_route": "direct_buy_usd1usdt",
+            "direction": "buy",
+            "primary_reference_price": Decimal("0.9992"),
+            "backup_reference_price": Decimal("0.9994"),
+            "improvement_bp": Decimal("0.20"),
+        }
+    )
+    state.rebalance_profit_density_size_factor = Decimal("1")
+    state.rebalance_profit_density_extra_ticks = 1
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=False),
+    )
+
+    assert decision.bid is not None
+    assert decision.bid.reason == "rebalance_open_short"
+    assert decision.bid.price == Decimal("0.9992")
+
+
 def test_strategy_rebalance_sell_uses_competitive_chunk_when_zero_profitable_prefix_after_reload(monkeypatch):
     monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_013_000)
     strategy = MicroMakerStrategy(
@@ -2545,3 +3053,126 @@ def test_strategy_ignores_sub_min_rebalance_dust_and_keeps_normal_ask():
     assert decision.ask.price == Decimal("1")
     assert decision.ask.base_size == Decimal("10000")
     assert decision.reason == "inventory_high_ask_only"
+
+
+def test_strategy_sell_drought_guard_suppresses_entry_buy_and_keeps_rebalance_sell(monkeypatch):
+    monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_061_000)
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            secondary_layers_enabled=False,
+            sell_drought_guard_enabled=True,
+            sell_drought_inventory_ratio_pct=Decimal("0.58"),
+            sell_drought_rebalance_window_seconds=60,
+        ),
+        TradingConfig(entry_base_size=Decimal("1000"), quote_size=Decimal("1000")),
+    )
+    state = build_state("18000", "7000")
+
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.set_order_reason(cl_ord_id=sell_id, reason="rebalance_open_long")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0001",
+            "fillPx": "1.0001",
+            "sz": "1000",
+            "accFillSz": "1000",
+            "state": "filled",
+            "cTime": "1700000001000",
+            "uTime": "1700000001000",
+        },
+        source="test",
+    )
+
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.set_order_reason(cl_ord_id=buy_id, reason="join_best_bid")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "0.9999",
+            "fillPx": "0.9999",
+            "sz": "2000",
+            "accFillSz": "2000",
+            "state": "filled",
+            "cTime": "1700000002000",
+            "uTime": "1700000002000",
+        },
+        source="test",
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is None
+    assert decision.ask is not None
+    assert decision.ask.reason == "rebalance_open_long"
+    assert decision.reason == "sell_drought_rebalance_sell_only"
+
+
+def test_strategy_sell_drought_guard_does_not_block_recent_rebalance_sell(monkeypatch):
+    monkeypatch.setattr("src.strategy.now_ms", lambda: 1_700_000_030_000)
+    strategy = MicroMakerStrategy(
+        StrategyConfig(
+            secondary_layers_enabled=False,
+            sell_drought_guard_enabled=True,
+            sell_drought_inventory_ratio_pct=Decimal("0.58"),
+            sell_drought_rebalance_window_seconds=60,
+        ),
+        TradingConfig(entry_base_size=Decimal("1000"), quote_size=Decimal("1000")),
+    )
+    state = build_state("18000", "7000")
+
+    sell_id = build_cl_ord_id("bot6", "sell")
+    state.set_order_reason(cl_ord_id=sell_id, reason="rebalance_open_long")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "s1",
+            "clOrdId": sell_id,
+            "px": "1.0001",
+            "fillPx": "1.0001",
+            "sz": "1000",
+            "accFillSz": "1000",
+            "state": "filled",
+            "cTime": "1700000001000",
+            "uTime": "1700000001000",
+        },
+        source="test",
+    )
+
+    buy_id = build_cl_ord_id("bot6", "buy")
+    state.set_order_reason(cl_ord_id=buy_id, reason="join_best_bid")
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "b1",
+            "clOrdId": buy_id,
+            "px": "0.9999",
+            "fillPx": "0.9999",
+            "sz": "2000",
+            "accFillSz": "2000",
+            "state": "filled",
+            "cTime": "1700000002000",
+            "uTime": "1700000002000",
+        },
+        source="test",
+    )
+
+    decision = strategy.decide(
+        state,
+        RiskStatus(ok=True, reason="ok", allow_bid=True, allow_ask=True),
+    )
+
+    assert decision.bid is not None
+    assert decision.bid.reason == "join_best_bid"
+    assert decision.ask is not None

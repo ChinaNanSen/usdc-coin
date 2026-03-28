@@ -268,6 +268,103 @@ def test_risk_pauses_when_bot_long_cannot_rebalance_sell_side():
     assert status.runtime_state == "PAUSED"
 
 
+def test_risk_enters_reduce_only_sell_when_startup_recovery_side_is_sell():
+    risk = RiskManager(RiskConfig(), TradingConfig(), mode="live")
+    state = make_state()
+    state.set_startup_recovery_side("sell")
+
+    status = risk.evaluate(state)
+
+    assert status.ok is True
+    assert status.runtime_state == "REDUCE_ONLY"
+    assert status.allow_bid is False
+    assert status.allow_ask is True
+
+
+def test_risk_enters_reduce_only_sell_when_hard_inventory_upper_hit_and_bot_is_long():
+    risk = RiskManager(
+        RiskConfig(
+            hard_inventory_upper_pct=Decimal("0.60"),
+            hard_inventory_lower_pct=Decimal("0.40"),
+        ),
+        TradingConfig(),
+        mode="shadow",
+    )
+    state = make_state()
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "buy",
+            "ordId": "1",
+            "clOrdId": "bot6mb-test-hard-upper",
+            "px": "1.0000",
+            "fillPx": "1.0000",
+            "sz": "5000",
+            "accFillSz": "5000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("65000"), available=Decimal("65000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("35000"), available=Decimal("35000")),
+        }
+    )
+
+    status = risk.evaluate(state)
+
+    assert status.ok is True
+    assert status.runtime_state == "REDUCE_ONLY"
+    assert status.reason == "reduce_only_inventory_high"
+    assert status.allow_bid is False
+    assert status.allow_ask is True
+
+
+def test_risk_enters_reduce_only_buy_when_hard_inventory_lower_hit_and_bot_is_short():
+    risk = RiskManager(
+        RiskConfig(
+            hard_inventory_upper_pct=Decimal("0.60"),
+            hard_inventory_lower_pct=Decimal("0.40"),
+        ),
+        TradingConfig(),
+        mode="shadow",
+    )
+    state = make_state()
+    state.apply_order_update(
+        {
+            "instId": "USDC-USDT",
+            "side": "sell",
+            "ordId": "1",
+            "clOrdId": "bot6ms-test-hard-lower",
+            "px": "1.0000",
+            "fillPx": "1.0000",
+            "sz": "5000",
+            "accFillSz": "5000",
+            "state": "filled",
+            "cTime": "1",
+            "uTime": "2",
+        },
+        source="test",
+    )
+    state.set_balances(
+        {
+            "USDC": Balance(ccy="USDC", total=Decimal("35000"), available=Decimal("35000")),
+            "USDT": Balance(ccy="USDT", total=Decimal("65000"), available=Decimal("65000")),
+        }
+    )
+
+    status = risk.evaluate(state)
+
+    assert status.ok is True
+    assert status.runtime_state == "REDUCE_ONLY"
+    assert status.reason == "reduce_only_inventory_low"
+    assert status.allow_bid is True
+    assert status.allow_ask is False
+
+
 def test_risk_stops_on_fee_gate():
     risk = RiskManager(RiskConfig(), TradingConfig(), mode="live")
     state = make_state()

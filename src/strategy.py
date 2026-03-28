@@ -5,6 +5,7 @@ from decimal import Decimal
 from .config import StrategyConfig, TradingConfig
 from .models import OrderIntent, QuoteDecision, RiskStatus
 from .state import BotState
+from .triangle_routing import compute_dual_exit_metrics
 from .utils import now_ms, passive_edge_ticks, quantize_down, quantize_up
 
 
@@ -38,6 +39,7 @@ class MicroMakerStrategy:
             rebalance_buy_base=rebalance_buy_base,
             rebalance_sell_base=rebalance_sell_base,
         )
+        rebalance_profit_ticks += self._rebalance_profit_density_extra_ticks(state=state)
         rebalance_mode = self._rebalance_mode(
             state=state,
             rebalance_buy_base=rebalance_buy_base,
@@ -54,6 +56,20 @@ class MicroMakerStrategy:
         ask_depth = self._visible_depth_notional(state.book.asks)
         if bid_depth < min_visible_depth or ask_depth < min_visible_depth:
             return QuoteDecision(reason=f"visible depth too thin: bid={bid_depth}, ask={ask_depth}")
+
+        if self.config.release_only_mode:
+            return self._decide_release_only(
+                state=state,
+                risk_status=risk_status,
+                spread_ticks=spread_ticks,
+                inventory_ratio=inventory_ratio,
+                fixed_entry_base_size=fixed_entry_base_size,
+                quote_size=quote_size,
+                rebalance_buy_base=rebalance_buy_base,
+                rebalance_profit_ticks=rebalance_profit_ticks,
+                rebalance_mode=rebalance_mode,
+                inventory_repair_steps=inventory_repair_steps,
+            )
 
         if self.config.strict_alternating_sides:
             return self._decide_strict_cycle(
@@ -74,6 +90,11 @@ class MicroMakerStrategy:
         ask_quote_size = quote_size
         bid_base_size = fixed_entry_base_size
         ask_base_size = fixed_entry_base_size
+        sell_drought_guard_active = self._sell_drought_guard_active(
+            state=state,
+            inventory_ratio=inventory_ratio,
+            rebalance_sell_base=rebalance_sell_base,
+        )
         favorable_size_multiplier = self._favorable_size_multiplier(
             spread_ticks=spread_ticks,
             rebalance_buy_base=rebalance_buy_base,
@@ -116,8 +137,13 @@ class MicroMakerStrategy:
         ask = None
         bid_toxic_cooldown = state.is_toxic_flow_side_cooling_down("buy")
         ask_toxic_cooldown = state.is_toxic_flow_side_cooling_down("sell")
-        if risk_status.allow_bid:
+        suppress_direct_sell_for_route = rebalance_sell_base > 0 and self._triangle_prefers_indirect_sell(state=state)
+        if risk_status.allow_bid and not suppress_direct_sell_for_route:
             if rebalance_buy_base > 0:
+                rebalance_buy_base = quantize_down(
+                    rebalance_buy_base * self._rebalance_profit_density_factor(state=state),
+                    state.instrument.lot_size,
+                )
                 bid_base_size, bid_price = self._rebalance_buy_target(
                     state=state,
                     rebalance_buy_base=rebalance_buy_base,
@@ -133,7 +159,7 @@ class MicroMakerStrategy:
                         reason="rebalance_open_short",
                         base_size=bid_base_size,
                     )
-            elif rebalance_sell_base > 0 and not bid_toxic_cooldown:
+            elif rebalance_sell_base > 0 and not bid_toxic_cooldown and self.config.secondary_layers_enabled:
                 bid = self._secondary_rebalance_bid_intent(
                     state=state,
                     base_size=bid_base_size,
@@ -141,12 +167,12 @@ class MicroMakerStrategy:
                     rebalance_mode=rebalance_mode,
                     inventory_repair_steps=inventory_repair_steps,
                 )
-            elif not bid_toxic_cooldown:
+            elif not bid_toxic_cooldown and not sell_drought_guard_active:
                 entry_base_size, entry_quote_size = self._apply_entry_size_factor(
                     state=state,
                     base_size=bid_base_size,
                     quote_notional=bid_quote_size,
-                    factor=self._entry_markout_penalty_factor(state=state, side="buy"),
+                    factor=self._entry_markout_penalty_factor(state=state, side="buy") * self._entry_profit_density_factor(state=state),
                 )
                 bid_price = self._entry_bid_price(
                     state=state,
@@ -154,18 +180,23 @@ class MicroMakerStrategy:
                     skew_low=skew_low,
                     skew_high=skew_high,
                 )
-                hard_buy_cap = self._buy_price_cap(state=state)
-                if hard_buy_cap is not None:
-                    bid_price = min(bid_price, hard_buy_cap)
-                bid = self._entry_intent(
-                    side="buy",
-                    price=bid_price,
-                    base_size=entry_base_size,
-                    quote_notional=entry_quote_size,
-                    reason="join_best_bid",
-                )
-        if risk_status.allow_ask:
+                if self._triangle_route_allows_entry_buy(state=state, price=bid_price):
+                    hard_buy_cap = self._buy_price_cap(state=state)
+                    if hard_buy_cap is not None:
+                        bid_price = min(bid_price, hard_buy_cap)
+                    bid = self._entry_intent(
+                        side="buy",
+                        price=bid_price,
+                        base_size=entry_base_size,
+                        quote_notional=entry_quote_size,
+                        reason="join_best_bid",
+                    )
+        if risk_status.allow_ask and not suppress_direct_sell_for_route:
             if rebalance_sell_base > 0:
+                rebalance_sell_base = quantize_down(
+                    rebalance_sell_base * self._rebalance_profit_density_factor(state=state),
+                    state.instrument.lot_size,
+                )
                 ask_base_size, ask_price = self._rebalance_sell_target(
                     state=state,
                     rebalance_sell_base=rebalance_sell_base,
@@ -181,7 +212,7 @@ class MicroMakerStrategy:
                         reason="rebalance_open_long",
                         base_size=ask_base_size,
                     )
-            elif rebalance_buy_base > 0 and not ask_toxic_cooldown:
+            elif rebalance_buy_base > 0 and not ask_toxic_cooldown and self.config.secondary_layers_enabled:
                 ask = self._secondary_rebalance_ask_intent(
                     state=state,
                     base_size=ask_base_size,
@@ -189,12 +220,12 @@ class MicroMakerStrategy:
                     rebalance_mode=rebalance_mode,
                     inventory_repair_steps=inventory_repair_steps,
                 )
-            elif not ask_toxic_cooldown:
+            elif not ask_toxic_cooldown and rebalance_buy_base <= 0:
                 entry_base_size, entry_quote_size = self._apply_entry_size_factor(
                     state=state,
                     base_size=ask_base_size,
                     quote_notional=ask_quote_size,
-                    factor=self._entry_markout_penalty_factor(state=state, side="sell"),
+                    factor=self._entry_markout_penalty_factor(state=state, side="sell") * self._entry_profit_density_factor(state=state),
                 )
                 ask_price = self._entry_ask_price(
                     state=state,
@@ -225,9 +256,15 @@ class MicroMakerStrategy:
         elif bid and not ask:
             reason = "fill_rebalance_buy_only" if rebalance_buy_base > 0 else "inventory_low_bid_only"
         elif ask and not bid:
-            reason = "fill_rebalance_sell_only" if rebalance_sell_base > 0 else "inventory_high_ask_only"
+            if sell_drought_guard_active:
+                reason = "sell_drought_rebalance_sell_only" if rebalance_sell_base > 0 else "sell_drought_ask_only"
+            else:
+                reason = "fill_rebalance_sell_only" if rebalance_sell_base > 0 else "inventory_high_ask_only"
         elif not bid and not ask:
-            reason = risk_status.reason
+            if suppress_direct_sell_for_route:
+                reason = "route_indirect_release_only"
+            else:
+                reason = risk_status.reason
 
         return QuoteDecision(
             reason=reason,
@@ -236,6 +273,169 @@ class MicroMakerStrategy:
             inventory_ratio=inventory_ratio,
             spread_ticks=spread_ticks,
         )
+
+    def _decide_release_only(
+        self,
+        *,
+        state: BotState,
+        risk_status: RiskStatus,
+        spread_ticks: Decimal,
+        inventory_ratio: Decimal | None,
+        fixed_entry_base_size: Decimal | None,
+        quote_size: Decimal,
+        rebalance_buy_base: Decimal,
+        rebalance_profit_ticks: int,
+        rebalance_mode: str,
+        inventory_repair_steps: int,
+    ) -> QuoteDecision:
+        if rebalance_buy_base > 0 and risk_status.allow_bid:
+            bid_base_size, bid_price = self._rebalance_buy_target(
+                state=state,
+                rebalance_buy_base=rebalance_buy_base,
+                profit_ticks=rebalance_profit_ticks,
+                rebalance_mode=rebalance_mode,
+                inventory_repair_steps=inventory_repair_steps,
+            )
+            if bid_base_size >= state.instrument.min_size:
+                bid = OrderIntent(
+                    side="buy",
+                    price=bid_price,
+                    quote_notional=bid_base_size * bid_price,
+                    reason="rebalance_open_short",
+                    base_size=bid_base_size,
+                )
+                return QuoteDecision(
+                    reason="fill_rebalance_buy_only",
+                    bid=bid,
+                    inventory_ratio=inventory_ratio,
+                    spread_ticks=spread_ticks,
+                )
+
+        if not risk_status.allow_ask:
+            return QuoteDecision(reason=risk_status.reason, inventory_ratio=inventory_ratio, spread_ticks=spread_ticks)
+
+        own_release_base = state.external_release_base_size(base_buffer=self.config.release_only_base_buffer)
+        shared_release_base = Decimal("0")
+        if (
+            state.shared_release_inventory_base >= self.config.release_only_shared_inventory_min_base
+            and state.shared_release_inventory_improvement_bp >= self.config.release_only_shared_inventory_min_improvement_bp
+        ):
+            shared_release_base = state.shared_release_inventory_base
+        releaseable_base = own_release_base + shared_release_base
+        if releaseable_base < state.instrument.min_size:
+            return QuoteDecision(reason="release_only_idle", inventory_ratio=inventory_ratio, spread_ticks=spread_ticks)
+
+        target_base_size = fixed_entry_base_size
+        if target_base_size is None and state.book.mid and state.book.mid > 0:
+            target_base_size = quantize_down(quote_size / state.book.mid, state.instrument.lot_size)
+        if target_base_size is None or target_base_size <= 0:
+            target_base_size = releaseable_base
+        elif shared_release_base > 0:
+            target_base_size = max(target_base_size, releaseable_base)
+        ask_base_size = quantize_down(min(releaseable_base, target_base_size), state.instrument.lot_size)
+        if ask_base_size < state.instrument.min_size:
+            return QuoteDecision(reason="release_only_idle", inventory_ratio=inventory_ratio, spread_ticks=spread_ticks)
+
+        ask_price = state.book.best_ask.price
+        sell_price_floor = self._sell_price_floor(state=state)
+        if sell_price_floor is not None:
+            ask_price = max(ask_price, sell_price_floor)
+        ask = OrderIntent(
+            side="sell",
+            price=ask_price,
+            quote_notional=ask_base_size * ask_price,
+            reason="release_external_long",
+            base_size=ask_base_size,
+        )
+        return QuoteDecision(
+            reason="release_external_sell_only",
+            ask=ask,
+            inventory_ratio=inventory_ratio,
+            spread_ticks=spread_ticks,
+        )
+
+    def _triangle_route_allows_entry_buy(self, *, state: BotState, price: Decimal | None) -> bool:
+        if not self.config.triangle_routing_enabled:
+            return True
+        if price is None or price <= 0:
+            return False
+        snapshot = state.triangle_route_snapshot
+        if not isinstance(snapshot, dict):
+            return True
+        checked_at_ms = int(snapshot.get("checked_at_ms") or 0)
+        if checked_at_ms > 0 and now_ms() - checked_at_ms > max(self.config.triangle_snapshot_stale_ms, 0):
+            return True
+        metrics = compute_dual_exit_metrics(
+            inst_id=self.trading.inst_id,
+            entry_buy_price=price,
+            snapshot=snapshot,
+            indirect_leg_penalty_bp=self.config.triangle_indirect_leg_penalty_bp,
+        )
+        if metrics is None:
+            return True
+        strict_ok = metrics["strict_dual_exit_edge_bp"] >= self.config.triangle_strict_dual_exit_edge_bp
+        best_ok = (
+            metrics["best_exit_edge_bp"] >= self.config.triangle_best_exit_edge_bp
+            and metrics["strict_dual_exit_edge_bp"] >= -self.config.triangle_max_worst_exit_loss_bp
+        )
+        return strict_ok or best_ok
+
+    def _triangle_prefers_indirect_sell(self, *, state: BotState) -> bool:
+        if not self.config.triangle_routing_enabled or not self.config.triangle_indirect_handoff_enabled:
+            return False
+        choice = state.triangle_exit_route_choice
+        if not isinstance(choice, dict):
+            return False
+        primary_route = str(choice.get("primary_route") or "")
+        direction = str(choice.get("direction") or "")
+        improvement_bp = Decimal(str(choice.get("improvement_bp") or "0"))
+        if direction != "sell":
+            return False
+        if not primary_route or primary_route.startswith("direct_"):
+            return False
+        return improvement_bp >= self.config.triangle_prefer_indirect_min_improvement_bp
+
+    def _triangle_direct_sell_floor(self, *, state: BotState) -> Decimal | None:
+        if not self.config.triangle_routing_enabled or not self.config.triangle_direct_sell_floor_enabled:
+            return None
+        if self.config.triangle_indirect_handoff_enabled:
+            return None
+        choice = state.triangle_exit_route_choice
+        if not isinstance(choice, dict):
+            return None
+        primary_route = str(choice.get("primary_route") or "")
+        direction = str(choice.get("direction") or "")
+        improvement_bp = Decimal(str(choice.get("improvement_bp") or "0"))
+        if direction != "sell":
+            return None
+        if not primary_route or primary_route.startswith("direct_"):
+            return None
+        if improvement_bp < self.config.triangle_prefer_indirect_min_improvement_bp:
+            return None
+        reference = Decimal(str(choice.get("primary_reference_price") or "0"))
+        if reference <= 0:
+            return None
+        return reference
+
+    def _triangle_direct_buy_ceiling(self, *, state: BotState) -> Decimal | None:
+        if not self.config.triangle_routing_enabled or not self.config.triangle_direct_buy_ceiling_enabled:
+            return None
+        choice = state.triangle_exit_route_choice
+        if not isinstance(choice, dict):
+            return None
+        primary_route = str(choice.get("primary_route") or "")
+        direction = str(choice.get("direction") or "")
+        improvement_bp = Decimal(str(choice.get("improvement_bp") or "0"))
+        if direction != "buy":
+            return None
+        if not primary_route or primary_route.startswith("direct_"):
+            return None
+        if improvement_bp < self.config.triangle_prefer_indirect_min_improvement_bp:
+            return None
+        reference = Decimal(str(choice.get("primary_reference_price") or "0"))
+        if reference <= 0:
+            return None
+        return reference
 
     def _inventory_skew_profile(self, *, inventory_ratio: Decimal) -> tuple[bool, bool, Decimal]:
         soft_lower = min(self.config.inventory_soft_lower_pct, self.config.inventory_target_pct)
@@ -311,6 +511,48 @@ class MicroMakerStrategy:
             return base_size, quote_notional
         return scaled_base_size, scaled_quote_notional
 
+    def _entry_profit_density_factor(self, *, state: BotState) -> Decimal:
+        if not self.config.entry_profit_density_enabled:
+            return Decimal("1")
+        return min(max(state.entry_profit_density_size_factor, Decimal("0")), Decimal("1"))
+
+    def _sell_drought_guard_active(
+        self,
+        *,
+        state: BotState,
+        inventory_ratio: Decimal | None,
+        rebalance_sell_base: Decimal,
+    ) -> bool:
+        if not self.config.sell_drought_guard_enabled:
+            return False
+        if rebalance_sell_base <= 0:
+            return False
+        if state.strategy_position_base() <= 0:
+            return False
+        if inventory_ratio is None or inventory_ratio < self.config.sell_drought_inventory_ratio_pct:
+            return False
+        window_ms = int(max(self.config.sell_drought_rebalance_window_seconds, 0) * 1000)
+        if window_ms <= 0:
+            return False
+        fill_age_ms = state.managed_fill_age_ms(
+            side="sell",
+            reason_bucket="rebalance",
+            reference_ms=now_ms(),
+        )
+        if fill_age_ms is None:
+            return False
+        return fill_age_ms >= window_ms
+
+    def _rebalance_profit_density_factor(self, *, state: BotState) -> Decimal:
+        if not self.config.rebalance_profit_density_enabled:
+            return Decimal("1")
+        return min(max(state.rebalance_profit_density_size_factor, Decimal("0")), Decimal("1"))
+
+    def _rebalance_profit_density_extra_ticks(self, *, state: BotState) -> int:
+        if not self.config.rebalance_profit_density_enabled:
+            return 0
+        return max(state.rebalance_profit_density_extra_ticks, 0)
+
     def _bot_position_skew_profile(
         self,
         *,
@@ -365,6 +607,10 @@ class MicroMakerStrategy:
 
         if target_side == "buy" and risk_status.allow_bid:
             if rebalance_buy_base > 0:
+                rebalance_buy_base = quantize_down(
+                    rebalance_buy_base * self._rebalance_profit_density_factor(state=state),
+                    state.instrument.lot_size,
+                )
                 bid_base_size, bid_price = self._rebalance_buy_target(
                     state=state,
                     rebalance_buy_base=rebalance_buy_base,
@@ -385,22 +631,29 @@ class MicroMakerStrategy:
                     state=state,
                     base_size=fixed_entry_base_size,
                     quote_notional=quote_size,
-                    factor=self._entry_markout_penalty_factor(state=state, side="buy"),
+                    factor=self._entry_markout_penalty_factor(state=state, side="buy") * self._entry_profit_density_factor(state=state),
                 )
                 bid_price = state.book.best_bid.price
-                hard_buy_cap = self._buy_price_cap(state=state)
-                if hard_buy_cap is not None:
-                    bid_price = min(bid_price, hard_buy_cap)
-                bid = self._entry_intent(
-                    side="buy",
-                    price=bid_price,
-                    base_size=entry_base_size,
-                    quote_notional=entry_quote_size,
-                    reason="join_best_bid",
-                )
+                if self._triangle_route_allows_entry_buy(state=state, price=bid_price):
+                    hard_buy_cap = self._buy_price_cap(state=state)
+                    if hard_buy_cap is not None:
+                        bid_price = min(bid_price, hard_buy_cap)
+                    bid = self._entry_intent(
+                        side="buy",
+                        price=bid_price,
+                        base_size=entry_base_size,
+                        quote_notional=entry_quote_size,
+                        reason="join_best_bid",
+                    )
 
-        if target_side == "sell" and risk_status.allow_ask:
+        suppress_direct_sell_for_route = rebalance_sell_base > 0 and self._triangle_prefers_indirect_sell(state=state)
+
+        if target_side == "sell" and risk_status.allow_ask and not suppress_direct_sell_for_route:
             if rebalance_sell_base > 0:
+                rebalance_sell_base = quantize_down(
+                    rebalance_sell_base * self._rebalance_profit_density_factor(state=state),
+                    state.instrument.lot_size,
+                )
                 ask_base_size, ask_price = self._rebalance_sell_target(
                     state=state,
                     rebalance_sell_base=rebalance_sell_base,
@@ -421,7 +674,7 @@ class MicroMakerStrategy:
                     state=state,
                     base_size=fixed_entry_base_size,
                     quote_notional=quote_size,
-                    factor=self._entry_markout_penalty_factor(state=state, side="sell"),
+                    factor=self._entry_markout_penalty_factor(state=state, side="sell") * self._entry_profit_density_factor(state=state),
                 )
                 ask_price = state.book.best_ask.price
                 sell_price_floor = self._sell_price_floor(state=state)
@@ -440,7 +693,10 @@ class MicroMakerStrategy:
         elif ask:
             reason = "fill_rebalance_sell_only" if rebalance_sell_base > 0 else "strict_cycle_sell_only"
         else:
-            reason = risk_status.reason
+            if suppress_direct_sell_for_route:
+                reason = "route_indirect_release_only"
+            else:
+                reason = risk_status.reason
         return QuoteDecision(reason=reason, bid=bid, ask=ask, inventory_ratio=inventory_ratio, spread_ticks=spread_ticks)
 
     def _strict_target_side(
@@ -554,6 +810,7 @@ class MicroMakerStrategy:
             tick_size=state.instrument.tick_size,
             profit_ticks=profit_ticks,
         )
+        bid_base_size = min(bid_base_size, rebalance_buy_base)
         if bid_base_size >= state.instrument.min_size:
             bid_price = self._rebalance_bid_price(
                 state=state,
@@ -617,6 +874,7 @@ class MicroMakerStrategy:
             tick_size=state.instrument.tick_size,
             profit_ticks=profit_ticks,
         )
+        ask_base_size = min(ask_base_size, rebalance_sell_base)
         if ask_base_size >= state.instrument.min_size:
             ask_price = self._rebalance_ask_price(
                 state=state,
@@ -678,6 +936,9 @@ class MicroMakerStrategy:
         hard_buy_cap = self._buy_price_cap(state=state)
         if hard_buy_cap is not None:
             bid_price = min(bid_price, hard_buy_cap)
+        route_ceiling = self._triangle_direct_buy_ceiling(state=state)
+        if route_ceiling is not None:
+            bid_price = min(bid_price, route_ceiling)
         return quantize_down(bid_price, state.instrument.tick_size)
 
     def _rebalance_ask_market_price(
@@ -694,6 +955,9 @@ class MicroMakerStrategy:
             inventory_repair_steps=inventory_repair_steps,
             allow_inside_spread=profit_ticks <= 0,
         )
+        route_floor = self._triangle_direct_sell_floor(state=state)
+        if route_floor is not None:
+            ask_price = max(ask_price, route_floor)
         return quantize_up(ask_price, state.instrument.tick_size)
 
     def _entry_bid_price(
@@ -872,7 +1136,7 @@ class MicroMakerStrategy:
         if primary is None:
             return ()
         layers = [primary]
-        if self.max_orders_per_side > 1:
+        if self.max_orders_per_side > 1 and self.config.secondary_layers_enabled:
             secondary = self._secondary_entry_layer(primary=primary, state=state)
             if secondary is not None:
                 layers.append(secondary)
